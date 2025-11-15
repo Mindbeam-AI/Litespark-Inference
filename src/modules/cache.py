@@ -1,0 +1,44 @@
+# -*- coding: utf-8 -*-
+
+import torch
+from typing import List, Optional, Tuple
+
+
+class RecurrentCache:
+    """Cache for recurrent states in HGRN model"""
+
+    def __init__(self):
+        self.states: List[Optional[torch.Tensor]] = []
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Get sequence length from cache"""
+        if layer_idx < len(self.states) and self.states[layer_idx] is not None:
+            return self.states[layer_idx].shape[-2]  # Assuming shape is [..., seq_len, hidden_size]
+        return 0
+
+    def get_max_length(self) -> Optional[int]:
+        """Get maximum sequence length across all layers"""
+        max_len = 0
+        for state in self.states:
+            if state is not None:
+                max_len = max(max_len, state.shape[-2])
+        return max_len if max_len > 0 else None
+
+    def update(self, layer_idx: int, state: torch.Tensor) -> torch.Tensor:
+        """Update cache with new state"""
+        # Extend states list if needed
+        while len(self.states) <= layer_idx:
+            self.states.append(None)
+
+        self.states[layer_idx] = state
+        return state
+
+    def get(self, layer_idx: int) -> Optional[torch.Tensor]:
+        """Get state for specific layer"""
+        if layer_idx < len(self.states):
+            return self.states[layer_idx]
+        return None
+
+    def clear(self):
+        """Clear all cached states"""
+        self.states.clear()

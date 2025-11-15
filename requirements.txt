@@ -1,0 +1,18 @@
+# Core ML/DL packages
+torch>=2.0
+transformers
+datasets
+
+# Tensor operations and utilities
+einops
+triton>=2.2
+
+# Training utilities
+tqdm
+
+# AWS integration (for SageMaker and S3)
+boto3
+sagemaker
+
+# HuggingFace integration
+huggingface_hub

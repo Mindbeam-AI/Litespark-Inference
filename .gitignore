@@ -1,0 +1,49 @@
+# Jupyter Notebooks
+v2.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+
+# Model checkpoints and cache
+hf_cache/
+hgrn_bit_step*/
+SlimPajama-*/
+
+# Large datasets
+*.arrow
+
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pth
+*.pt
+checkpoint_*.pt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
