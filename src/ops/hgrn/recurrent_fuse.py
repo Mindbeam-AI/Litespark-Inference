@@ -11,23 +11,23 @@ import triton.language as tl
 from ...utils import contiguous
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BD': 32}, num_warps=1),
-#         triton.Config({'BD': 32}, num_warps=2),
-#         triton.Config({'BD': 32}, num_warps=4),
-#         triton.Config({'BD': 32}, num_warps=8),
-#         triton.Config({'BD': 64}, num_warps=1),
-#         triton.Config({'BD': 64}, num_warps=2),
-#         triton.Config({'BD': 64}, num_warps=4),
-#         triton.Config({'BD': 64}, num_warps=8),
-#         triton.Config({'BD': 128}, num_warps=1),
-#         triton.Config({'BD': 128}, num_warps=2),
-#         triton.Config({'BD': 128}, num_warps=4),
-#         triton.Config({'BD': 128}, num_warps=8),
-#     ],
-#     key=['D']
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({'BD': 32}, num_warps=1),
+        triton.Config({'BD': 32}, num_warps=2),
+        triton.Config({'BD': 32}, num_warps=4),
+        triton.Config({'BD': 32}, num_warps=8),
+        triton.Config({'BD': 64}, num_warps=1),
+        triton.Config({'BD': 64}, num_warps=2),
+        triton.Config({'BD': 64}, num_warps=4),
+        triton.Config({'BD': 64}, num_warps=8),
+        triton.Config({'BD': 128}, num_warps=1),
+        triton.Config({'BD': 128}, num_warps=2),
+        triton.Config({'BD': 128}, num_warps=4),
+        triton.Config({'BD': 128}, num_warps=8),
+    ],
+    key=['D']
+)
 @triton.jit
 def fused_recurrent_hgrn_fwd_kernel(
     x,
@@ -68,23 +68,23 @@ def fused_recurrent_hgrn_fwd_kernel(
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask)
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BD': 32}, num_warps=1),
-#         triton.Config({'BD': 32}, num_warps=2),
-#         triton.Config({'BD': 32}, num_warps=4),
-#         triton.Config({'BD': 32}, num_warps=8),
-#         triton.Config({'BD': 64}, num_warps=1),
-#         triton.Config({'BD': 64}, num_warps=2),
-#         triton.Config({'BD': 64}, num_warps=4),
-#         triton.Config({'BD': 64}, num_warps=8),
-#         triton.Config({'BD': 128}, num_warps=1),
-#         triton.Config({'BD': 128}, num_warps=2),
-#         triton.Config({'BD': 128}, num_warps=4),
-#         triton.Config({'BD': 128}, num_warps=8),
-#     ],
-#     key=['D']
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({'BD': 32}, num_warps=1),
+        triton.Config({'BD': 32}, num_warps=2),
+        triton.Config({'BD': 32}, num_warps=4),
+        triton.Config({'BD': 32}, num_warps=8),
+        triton.Config({'BD': 64}, num_warps=1),
+        triton.Config({'BD': 64}, num_warps=2),
+        triton.Config({'BD': 64}, num_warps=4),
+        triton.Config({'BD': 64}, num_warps=8),
+        triton.Config({'BD': 128}, num_warps=1),
+        triton.Config({'BD': 128}, num_warps=2),
+        triton.Config({'BD': 128}, num_warps=4),
+        triton.Config({'BD': 128}, num_warps=8),
+    ],
+    key=['D']
+)
 @triton.jit
 def fused_recurrent_hgrn_bwd_kernel(
     g,

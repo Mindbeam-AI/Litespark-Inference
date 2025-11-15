@@ -46,15 +46,17 @@ def weight_quant(w):
     return u
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=1),
-#         triton.Config({}, num_warps=2),
-#         triton.Config({}, num_warps=4),
-#         triton.Config({}, num_warps=8),
-#     ],
-#     key=["N", "HAS_RESIDUAL", "STORE_RESIDUAL_OUT", "IS_RMS_NORM", "HAS_WEIGHT", "HAS_BIAS"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+        triton.Config({}, num_warps=32),
+    ],
+    key=["N", "HAS_RESIDUAL", "STORE_RESIDUAL_OUT", "IS_RMS_NORM", "HAS_BIAS"],
+)
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 # @triton.heuristics({"HAS_RESIDUAL": lambda args: args["RESIDUAL"] is not None})
 @triton.jit
@@ -122,8 +124,7 @@ def _layer_norm_fwd_quant_kernel(
     # Aply quantization to the output
     scale = 127.0 / tl.maximum(tl.max(tl.abs(y), 0), 1e-5)
     # Quantize and then de-quantize the tensor
-    y_scaled = y * scale
-    y = tl.floor(y_scaled + 0.5)  # Manual rounding using floor(x + 0.5)
+    y = tl.math.round(y * scale)
     y = tl.maximum(tl.minimum(y, 127), -128) / scale
 
     # Write output
@@ -189,15 +190,17 @@ def _layer_norm_fwd_quant(
     return y, mean, rstd, residual_out if residual_out is not None else x
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=1),
-#         triton.Config({}, num_warps=2),
-#         triton.Config({}, num_warps=4),
-#         triton.Config({}, num_warps=8),
-#     ],
-#     key=["N", "HAS_DRESIDUAL", "STORE_DRESIDUAL", "IS_RMS_NORM", "HAS_WEIGHT", "HAS_BIAS"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+        triton.Config({}, num_warps=32),
+    ],
+    key=["N", "HAS_DRESIDUAL", "STORE_DRESIDUAL", "IS_RMS_NORM", "HAS_BIAS"],
+)
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 # @triton.heuristics({"HAS_DRESIDUAL": lambda args: args["DRESIDUAL"] is not None})
 # @triton.heuristics({"STORE_DRESIDUAL": lambda args: args["DRESIDUAL_IN"] is not None})
@@ -274,8 +277,7 @@ def _layer_norm_bwd_kernel(
             # Aply quantization to the output
             scale = 127.0 / tl.maximum(tl.max(tl.abs(y), 0), 1e-5)
             # Quantize and then de-quantize the tensor
-            y_scaled = y * scale
-            y = tl.floor(y_scaled + 0.5)  # Manual rounding using floor(x + 0.5)
+            y = tl.math.round(y * scale)
             y = tl.maximum(tl.minimum(y, 127), -128) / scale
 
             tl.store(Y + cols, y, mask=mask)
