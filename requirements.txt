@@ -1,14 +1,20 @@
 # Core ML/DL packages
-torch>=2.0
-transformers
-datasets
+torch>=2.0,<2.5
+transformers>=4.30.0
+datasets>=2.14.0
 
 # Tensor operations and utilities
-einops
-triton>=2.2
+einops>=0.6.1
+triton>=2.2.0
 
 # Training utilities
-tqdm
+tqdm>=4.65.0
+numpy>=1.24.0
+safetensors>=0.3.0
+packaging
+
+# Distributed training (optional but recommended)
+accelerate>=0.20.0
 
 # AWS integration (for SageMaker and S3)
 boto3
@@ -16,3 +22,7 @@ sagemaker
 
 # HuggingFace integration
 huggingface_hub
+
+# Optional: Logging and experiment tracking
+# wandb  # Uncomment if you want W&B logging
+# tensorboard  # Uncomment for TensorBoard logging
