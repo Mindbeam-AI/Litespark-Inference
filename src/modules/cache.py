@@ -10,6 +10,19 @@ class RecurrentCache:
     def __init__(self):
         self.states: List[Optional[torch.Tensor]] = []
 
+    @classmethod
+    def from_legacy_cache(cls, past_key_values, seq_len: Optional[int] = None):
+        """
+        Convert legacy cache format to RecurrentCache.
+        For compatibility with transformers API.
+        """
+        cache = cls()
+        if past_key_values is not None:
+            # If it's already a list of states, use them directly
+            if isinstance(past_key_values, (list, tuple)):
+                cache.states = list(past_key_values)
+        return cache
+
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Get sequence length from cache"""
         if layer_idx < len(self.states) and self.states[layer_idx] is not None:
