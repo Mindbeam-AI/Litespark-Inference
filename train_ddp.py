@@ -60,7 +60,8 @@ class PajamaDataset(Dataset):
                 with open(file_path, 'rb') as f:
                     f.seek(offset_in_file * 2)
                     data = f.read(self.seq_length * 2)
-                    tokens = torch.frombuffer(data, dtype=torch.int16).long()
+                    # Clone to make writable tensor (fixes PyTorch warning)
+                    tokens = torch.frombuffer(data, dtype=torch.int16).long().clone()
                     # Pad if necessary
                     if len(tokens) < self.seq_length:
                         tokens = torch.cat([tokens, torch.zeros(self.seq_length - len(tokens), dtype=torch.long)])
