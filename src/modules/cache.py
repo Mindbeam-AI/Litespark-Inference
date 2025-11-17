@@ -37,11 +37,21 @@ class RecurrentCache:
                 max_len = max(max_len, state.shape[-2])
         return max_len if max_len > 0 else None
 
-    def update(self, layer_idx: int, state: torch.Tensor) -> torch.Tensor:
-        """Update cache with new state"""
+    def update(self, state: torch.Tensor, layer_idx: int, seq_len: Optional[int] = None) -> torch.Tensor:
+        """Update cache with new state
+
+        Args:
+            state: The state tensor (can be a tuple)
+            layer_idx: Index of the layer
+            seq_len: Optional sequence length (for compatibility, not used)
+        """
         # Extend states list if needed
         while len(self.states) <= layer_idx:
             self.states.append(None)
+
+        # Handle tuple states (unpack first element)
+        if isinstance(state, tuple):
+            state = state[0]
 
         self.states[layer_idx] = state
         return state
@@ -62,7 +72,7 @@ class RecurrentCache:
 
     def __setitem__(self, layer_idx: int, state: torch.Tensor):
         """Make cache subscriptable: cache[layer_idx] = state"""
-        self.update(layer_idx, state)
+        self.update(state, layer_idx)
 
     def __len__(self) -> int:
         """Return number of cached layers"""
