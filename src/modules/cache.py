@@ -55,3 +55,15 @@ class RecurrentCache:
     def clear(self):
         """Clear all cached states"""
         self.states.clear()
+
+    def __getitem__(self, layer_idx: int) -> Optional[torch.Tensor]:
+        """Make cache subscriptable: cache[layer_idx]"""
+        return self.get(layer_idx)
+
+    def __setitem__(self, layer_idx: int, state: torch.Tensor):
+        """Make cache subscriptable: cache[layer_idx] = state"""
+        self.update(layer_idx, state)
+
+    def __len__(self) -> int:
+        """Return number of cached layers"""
+        return len(self.states)
