@@ -23,6 +23,13 @@ class RecurrentCache:
                 cache.states = list(past_key_values)
         return cache
 
+    def to_legacy_cache(self):
+        """
+        Convert RecurrentCache to legacy cache format (list of states).
+        For compatibility with transformers API.
+        """
+        return tuple(self.states) if self.states else None
+
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Get sequence length from cache"""
         if layer_idx < len(self.states) and self.states[layer_idx] is not None:
