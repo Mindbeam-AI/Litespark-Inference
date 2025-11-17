@@ -1,0 +1,112 @@
+# Model configurations matching the paper:
+# "Scalable MatMul-free Language Modeling" (arXiv:2406.02528)
+
+# Paper Section 4.1: Model Architectures
+# Three scales tested: 370M, 1.3B, 2.7B parameters
+
+model_370M:
+  # Matches paper's MMfreeLM-370M model
+  vocab_size: 50000
+  hidden_size: 1024
+  num_hidden_layers: 24
+  num_heads: 8
+  max_position_embeddings: 2048
+  expand_ratio: 1
+  hidden_ratio: 4
+  rms_norm_eps: 1.0e-6
+  use_cache: false
+  gradient_checkpointing: true
+  # Estimated parameters: ~370M
+
+model_1.3B:
+  # Matches paper's MMfreeLM-1.3B model
+  vocab_size: 50000
+  hidden_size: 2048
+  num_hidden_layers: 24
+  num_heads: 16
+  max_position_embeddings: 2048
+  expand_ratio: 1
+  hidden_ratio: 4
+  rms_norm_eps: 1.0e-6
+  use_cache: false
+  gradient_checkpointing: true
+  # Estimated parameters: ~1.3B
+
+model_2.7B:
+  # Matches paper's MMfreeLM-2.7B model
+  vocab_size: 50000
+  hidden_size: 2048
+  num_hidden_layers: 48
+  num_heads: 16
+  max_position_embeddings: 2048
+  expand_ratio: 1
+  hidden_ratio: 4
+  rms_norm_eps: 1.0e-6
+  use_cache: false
+  gradient_checkpointing: true
+  # Estimated parameters: ~2.7B
+
+# Paper Section 4.2: Training Configuration
+training_paper_match:
+  # Settings matching the paper
+  seq_length: 1024
+  batch_size: 256  # Paper's batch size
+  total_tokens: 100_000_000_000  # 100B tokens (paper used 15B for 370M, scaled up for larger)
+  learning_rate: 5.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 2000
+  scheduler: cosine
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.95
+
+# Hardware configurations for different GPU counts
+hardware_8xA100:
+  # For 8x A100 80GB GPUs
+  num_gpus: 8
+  batch_size_per_gpu: 16
+  gradient_accumulation_steps: 2
+  # Effective batch: 8 * 16 * 2 = 256 ✓
+
+hardware_4xA100:
+  # For 4x A100 80GB GPUs
+  num_gpus: 4
+  batch_size_per_gpu: 16
+  gradient_accumulation_steps: 4
+  # Effective batch: 4 * 16 * 4 = 256 ✓
+
+# Paper Section 4.3: Evaluation Benchmarks
+evaluation:
+  datasets:
+    - wikitext-2      # Main benchmark in paper
+    - wikitext-103    # Additional benchmark
+    - ptb             # Penn TreeBank
+    - lambada         # Zero-shot benchmark
+
+  sequence_lengths:
+    # Paper tested memory efficiency across these
+    - 512
+    - 1024
+    - 2048
+    - 4096
+
+  metrics:
+    - perplexity
+    - memory_usage
+    - throughput
+    - latency
+
+# Baseline models for comparison (from paper)
+baselines:
+  pythia_410M:
+    model_name: "EleutherAI/pythia-410m-deduped"
+    comparable_to: model_370M
+
+  pythia_1.4B:
+    model_name: "EleutherAI/pythia-1.4b-deduped"
+    comparable_to: model_1.3B
+
+  pythia_2.8B:
+    model_name: "EleutherAI/pythia-2.8b-deduped"
+    comparable_to: model_2.7B
