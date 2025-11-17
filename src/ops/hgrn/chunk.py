@@ -55,8 +55,8 @@ def chunk_hgrn_fwd_kernel_h(
     T: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
-    BD: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr
+    USE_INITIAL_STATE: tl.constexpr,
+    BD: tl.constexpr  # Auto-tuned parameter
 ):
     i_d, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -142,7 +142,7 @@ def chunk_hgrn_bwd_kernel_h(
     T: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
-    BD: tl.constexpr
+    BD: tl.constexpr  # Auto-tuned parameter
 ):
     i_d, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -226,7 +226,8 @@ class ChunkHGRNFunction(torch.autograd.Function):
     @contiguous
     def forward(ctx, x, g, initial_state=None, output_final_state=False):
         B, H, T, D = x.shape
-        BT, BD = 128, min(64, triton.next_power_of_2(D))
+        BT = 128
+        BD = min(64, triton.next_power_of_2(D))  # Max block size for grid calculation
         num_warps = 8 if BD == 64 else 4
 
         gc = torch.empty_like(g, dtype=torch.float)
@@ -235,7 +236,7 @@ class ChunkHGRNFunction(torch.autograd.Function):
         chunk_hgrn_fwd_kernel_h[grid](
             x, g, gc, o, initial_state,
             T=T, D=D,
-            BT=BT, BD=BD,
+            BT=BT,
             USE_INITIAL_STATE=initial_state is not None
         )
         grid = (triton.cdiv(D, BD), B * H)
@@ -258,7 +259,8 @@ class ChunkHGRNFunction(torch.autograd.Function):
     def backward(ctx, do, dht=None):
         g, o, initial_state = ctx.saved_tensors
         B, H, T, D = do.shape
-        BT, BD = 128, min(64, triton.next_power_of_2(D))
+        BT = 128
+        BD = min(64, triton.next_power_of_2(D))  # Max block size for grid calculation
         num_warps = 8 if BD == 64 else 4
 
         gc = torch.empty_like(g, dtype=torch.float)
@@ -268,7 +270,7 @@ class ChunkHGRNFunction(torch.autograd.Function):
         chunk_hgrn_bwd_kernel_h[grid](
             g, gc, dx, do,
             T=T, D=D,
-            BT=BT, BD=BD
+            BT=BT
         )
         grid = (triton.cdiv(D, BD), B * H)
         chunk_hgrn_bwd_kernel_o[grid](

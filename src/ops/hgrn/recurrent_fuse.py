@@ -37,9 +37,9 @@ def fused_recurrent_hgrn_fwd_kernel(
     ht,
     T: tl.constexpr,
     D: tl.constexpr,
-    BD: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr
+    STORE_FINAL_STATE: tl.constexpr,
+    BD: tl.constexpr,  # Auto-tuned parameter (supplied by autotuner)
 ):
     i_d, i_bh = tl.program_id(0), tl.program_id(1)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -95,8 +95,8 @@ def fused_recurrent_hgrn_bwd_kernel(
     h0,
     T: tl.constexpr,
     D: tl.constexpr,
-    BD: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr
+    USE_INITIAL_STATE: tl.constexpr,
+    BD: tl.constexpr,  # Auto-tuned parameter (supplied by autotuner)
 ):
     i_d, i_bh = tl.program_id(0), tl.program_id(1)
     o_d = i_d * BD + tl.arange(0, BD)
@@ -145,13 +145,14 @@ class FusedRecurrentHGRNFunction(torch.autograd.Function):
             final_state = x.new_empty(B, H, D)
 
         o = torch.empty_like(x)
-        BD = 64  # Default block size
+        BD = 128  # Max block size for grid calculation
         grid = (triton.cdiv(D, BD), B * H)
         fused_recurrent_hgrn_fwd_kernel[grid](
             x, g, o, initial_state, final_state,
-            T=T, D=D, BD=BD,
+            T=T, D=D,
             USE_INITIAL_STATE=initial_state is not None,
-            STORE_FINAL_STATE=final_state is not None
+            STORE_FINAL_STATE=final_state is not None,
+            # BD is auto-tuned, not passed explicitly
         )
         ctx.save_for_backward(g, o, initial_state)
         return o, final_state
@@ -164,12 +165,13 @@ class FusedRecurrentHGRNFunction(torch.autograd.Function):
 
         dx = torch.empty_like(o)
         dg = torch.empty_like(g)
-        BD = 64  # Default block size
+        BD = 128  # Max block size for grid calculation
         grid = (triton.cdiv(D, BD), B * H)
         fused_recurrent_hgrn_bwd_kernel[grid](
             g, o, dx, dg, do, initial_state,
-            T=T, D=D, BD=BD,
+            T=T, D=D,
             USE_INITIAL_STATE=initial_state is not None,
+            # BD is auto-tuned, not passed explicitly
         )
 
         return dx, dg, None, None
