@@ -24,7 +24,6 @@ TOTAL_STEPS=10000
 LEARNING_RATE=3e-4     # Lower for largest model
 WEIGHT_DECAY=0.1
 MAX_GRAD_NORM=1.0
-WARMUP_STEPS=2000
 
 # Logging
 LOG_INTERVAL=100
@@ -56,7 +55,6 @@ python train_ddp.py \
   --learning_rate ${LEARNING_RATE} \
   --weight_decay ${WEIGHT_DECAY} \
   --max_grad_norm ${MAX_GRAD_NORM} \
-  --warmup_steps ${WARMUP_STEPS} \
   --log_interval ${LOG_INTERVAL} \
   --save_interval ${SAVE_INTERVAL}
 
