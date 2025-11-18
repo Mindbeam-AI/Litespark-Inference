@@ -17,9 +17,9 @@ NUM_LAYERS=24
 NUM_HEADS=16
 SEQ_LENGTH=1024
 
-# Training hyperparameters (matches paper Section 4.2)
-BATCH_SIZE_PER_GPU=8   # Reduced for larger model
-GRAD_ACCUM_STEPS=4     # Effective batch = 8 * 8 * 4 = 256
+# Training hyperparameters (adjusted for 80GB GPUs)
+BATCH_SIZE_PER_GPU=2   # Conservative for 1.3B model on 80GB
+GRAD_ACCUM_STEPS=16    # Effective batch = 8 * 2 * 16 = 256 ✓
 TOTAL_STEPS=10000
 LEARNING_RATE=4e-4     # Slightly lower for larger model
 WEIGHT_DECAY=0.1
