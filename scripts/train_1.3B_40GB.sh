@@ -14,9 +14,9 @@ NUM_GPUS=8
 HIDDEN_SIZE=2048
 NUM_LAYERS=24
 NUM_HEADS=16
-SEQ_LENGTH=512   # Reduced for 40GB GPUs (paper uses 1024, will note in analysis)
+SEQ_LENGTH=256   # Further reduced for 40GB GPUs (paper uses 1024, will note in analysis)
 
-# Training hyperparameters - highly conservative for 40GB GPUs
+# Training hyperparameters - extremely conservative for 40GB GPUs
 BATCH_SIZE_PER_GPU=1   # Minimum to fit in memory
 GRAD_ACCUM_STEPS=32    # Effective batch = 8 * 1 * 32 = 256 ✓
 TOTAL_STEPS=10000
