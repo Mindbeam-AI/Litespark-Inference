@@ -17,8 +17,8 @@ NUM_HEADS=16
 SEQ_LENGTH=1024  # Matches paper ✓
 
 # Training hyperparameters - optimized for 40GB GPUs
-BATCH_SIZE_PER_GPU=2   # Should use ~10-12GB per GPU
-GRAD_ACCUM_STEPS=16    # Effective batch = 8 * 2 * 16 = 256 ✓
+BATCH_SIZE_PER_GPU=1   # Needed for 1.3B model (large activations)
+GRAD_ACCUM_STEPS=32    # Effective batch = 8 * 1 * 32 = 256 ✓
 TOTAL_STEPS=10000
 LEARNING_RATE=4e-4     # Slightly lower for larger model
 WEIGHT_DECAY=0.1
