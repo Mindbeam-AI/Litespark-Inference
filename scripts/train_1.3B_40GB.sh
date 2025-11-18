@@ -14,10 +14,10 @@ NUM_GPUS=8
 HIDDEN_SIZE=2048
 NUM_LAYERS=24
 NUM_HEADS=16
-SEQ_LENGTH=512  # Reduced for 40GB GPUs (1.3B model is ~4x larger than 370M)
+SEQ_LENGTH=1024  # Matches paper ✓
 
-# Training hyperparameters - conservative for 40GB GPUs
-BATCH_SIZE_PER_GPU=2   # Conservative for larger model
+# Training hyperparameters - optimized for 40GB GPUs
+BATCH_SIZE_PER_GPU=2   # Should use ~10-12GB per GPU
 GRAD_ACCUM_STEPS=16    # Effective batch = 8 * 2 * 16 = 256 ✓
 TOTAL_STEPS=10000
 LEARNING_RATE=4e-4     # Slightly lower for larger model
