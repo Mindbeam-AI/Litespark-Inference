@@ -16,9 +16,9 @@ NUM_LAYERS=24
 NUM_HEADS=16
 SEQ_LENGTH=512   # Reduced for 40GB GPUs (paper uses 1024, will note in analysis)
 
-# Training hyperparameters - optimized for 40GB GPUs
-BATCH_SIZE_PER_GPU=2   # Balanced for memory
-GRAD_ACCUM_STEPS=16    # Effective batch = 8 * 2 * 16 = 256 ✓
+# Training hyperparameters - highly conservative for 40GB GPUs
+BATCH_SIZE_PER_GPU=1   # Minimum to fit in memory
+GRAD_ACCUM_STEPS=32    # Effective batch = 8 * 1 * 32 = 256 ✓
 TOTAL_STEPS=10000
 LEARNING_RATE=4e-4     # Slightly lower for larger model
 WEIGHT_DECAY=0.1
