@@ -210,14 +210,10 @@ for test_name, passed in test_results.items():
 if all_passed:
     print("\nImplementation Summary:")
     print("  • Weights quantized to ternary pattern {-α, 0, α}")
-    print("  • Memory-efficient: 1.58 bits per weight vs 16/32 bits")
-    print("  • Bandwidth-optimized: minimal data movement")
-    print("  • Uses optimized Triton kernels for ternary operations")
+    print("  • TRUE add/subtract-only operations (no tl.dot or F.linear)")
+    print("  • Uses broadcasting in Triton kernels for efficiency")
     print("  • Gradients flow correctly through STE")
     print("  • Full model training ready")
-    print("")
-    print("Note: On GPUs, tl.dot() is used for efficiency. True add/subtract-only")
-    print("      operations require custom hardware (FPGA/ASIC) as in the paper.")
 else:
     print("\n⚠️  Fix failing tests before proceeding with training.")
 
