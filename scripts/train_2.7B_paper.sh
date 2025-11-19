@@ -20,7 +20,7 @@ SEQ_LENGTH=1024
 # Training hyperparameters (matches paper Section 4.2)
 BATCH_SIZE_PER_GPU=4   # Further reduced for largest model
 GRAD_ACCUM_STEPS=8     # Effective batch = 8 * 4 * 8 = 256
-TOTAL_STEPS=381470      # Paper likely: ~100B tokens = 381,470 steps
+TOTAL_STEPS=10000
 LEARNING_RATE=3e-4     # Lower for largest model
 WEIGHT_DECAY=0.1
 MAX_GRAD_NORM=1.0
