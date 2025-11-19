@@ -70,6 +70,9 @@ def matmul_free_kernel(
         # The key insight: w ∈ {-α, 0, α} means w/α ∈ {-1, 0, 1}
         # So w * x = α * (sign(w) * x) = α * (add/subtract based on sign)
 
+        # Cast weights to match input dtype for tl.dot
+        w = w.to(x.dtype)
+
         # For MatMul-Free: we use the fact that w is already ternary-scaled
         # tl.dot with ternary weights becomes optimized to add/subtract at compile time
         acc = tl.dot(x, tl.trans(w))
