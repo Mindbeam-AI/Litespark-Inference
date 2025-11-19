@@ -478,8 +478,9 @@ class LayerNormLinearQuantFn(torch.autograd.Function):
     def backward(ctx, dout, *args):
         x, norm_weight, norm_bias, linear_weight, mean, rstd = ctx.saved_tensors
         dout = dout.reshape(-1, dout.shape[-1])
-        dy = F.linear(dout, linear_weight.t())
-        dlinear_bias = None if ctx.linear_bias_is_none else dout.sum(0)
+        # Cast dout to match linear_weight dtype for backward pass
+        dy = F.linear(dout.to(linear_weight.dtype), linear_weight.t())
+        dlinear_bias = None if ctx.linear_bias_is_none else dout.to(linear_weight.dtype).sum(0)
         assert dy.shape == x.shape
         if ctx.prenorm:
             dresidual = args[0]
@@ -501,7 +502,8 @@ class LayerNormLinearQuantFn(torch.autograd.Function):
             x_dtype=ctx.x_dtype,
             recompute_output=True
         )
-        dlinear_weight = torch.einsum("bo,bi->oi", dout, y)
+        # Ensure dtype compatibility for gradient computation
+        dlinear_weight = torch.einsum("bo,bi->oi", dout.to(y.dtype), y)
         return (
             dx.reshape(ctx.x_shape_og),
             dnorm_weight,
