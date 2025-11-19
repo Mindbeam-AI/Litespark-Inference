@@ -20,7 +20,7 @@ SEQ_LENGTH=1024
 # Training hyperparameters (matches paper Section 4.2)
 BATCH_SIZE_PER_GPU=2   # Reduced for larger model
 GRAD_ACCUM_STEPS=16     # Effective batch = 8 * 2 * 16 = 256
-TOTAL_STEPS=10000
+TOTAL_STEPS=22888      # Match dataset: 6B tokens / (256 batch × 1024 seq) = ~22,888 steps
 LEARNING_RATE=4e-4     # Slightly lower for larger model
 WEIGHT_DECAY=0.1
 MAX_GRAD_NORM=1.0

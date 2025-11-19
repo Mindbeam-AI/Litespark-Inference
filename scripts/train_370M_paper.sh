@@ -20,7 +20,7 @@ SEQ_LENGTH=1024
 # Training hyperparameters (matches paper Section 4.2)
 BATCH_SIZE_PER_GPU=4   # Tested: works with 1.97GB in autotuning test
 GRAD_ACCUM_STEPS=8     # Effective batch = 8 * 4 * 8 = 256 ✓
-TOTAL_STEPS=10000
+TOTAL_STEPS=22888      # Match dataset: 6B tokens / (256 batch × 1024 seq) = ~22,888 steps
 LEARNING_RATE=5e-4
 WEIGHT_DECAY=0.1
 MAX_GRAD_NORM=1.0
