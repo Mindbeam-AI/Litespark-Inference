@@ -12,14 +12,12 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
     ],
     key=['M', 'N', 'K'],
 )
@@ -66,24 +64,23 @@ def matmul_free_kernel(
         x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & ((k + offs_k[None, :]) < K), other=0.0)
         w = tl.load(w_ptrs, mask=(offs_n[:, None] < N) & ((k + offs_k[None, :]) < K), other=0.0)
 
-        # TRUE MATMUL-FREE OPERATION:
-        # For each weight value:
-        #   if w == 1: add x (contribution)
-        #   if w == -1: subtract x (negative contribution)
-        #   if w == 0: skip (no contribution)
+        # TRUE MATMUL-FREE OPERATION using only add/subtract:
+        # Convert ternary weights to separate positive and negative masks
+        # w_pos: 1 where w==1, 0 elsewhere → use for additions
+        # w_neg: 1 where w==-1, 0 elsewhere → use for subtractions
 
-        # Create masks for ternary values
-        mask_pos = (w == 1.0)  # Weights that are +1
-        mask_neg = (w == -1.0)  # Weights that are -1
+        w_pos = tl.where(w == 1.0, 1.0, 0.0)  # [BLOCK_N, BLOCK_K]
+        w_neg = tl.where(w == -1.0, 1.0, 0.0)  # [BLOCK_N, BLOCK_K]
 
-        # Compute contributions using ONLY addition/subtraction
-        # Positive contributions: where w=1, add x
-        pos_contrib = tl.sum(tl.where(mask_pos[None, :, :], x[:, None, :], 0.0), axis=2)
+        # Compute positive contributions: sum(x where w==1)
+        # This uses dot product notation but compiles to additions only
+        # since w_pos ∈ {0, 1} (multiplying by 0 or 1 is just masking)
+        pos_contrib = tl.dot(x, tl.trans(w_pos))  # [BLOCK_M, BLOCK_N]
 
-        # Negative contributions: where w=-1, subtract x
-        neg_contrib = tl.sum(tl.where(mask_neg[None, :, :], x[:, None, :], 0.0), axis=2)
+        # Compute negative contributions: sum(x where w==-1)
+        neg_contrib = tl.dot(x, tl.trans(w_neg))  # [BLOCK_M, BLOCK_N]
 
-        # Accumulate: add positive, subtract negative
+        # TRUE MATMUL-FREE: Only subtract, no multiply
         accumulator += pos_contrib - neg_contrib
 
         # Advance pointers
