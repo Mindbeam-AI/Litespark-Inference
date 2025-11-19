@@ -69,8 +69,8 @@ def matmul_free_kernel(
         # w_pos: 1 where w==1, 0 elsewhere → use for additions
         # w_neg: 1 where w==-1, 0 elsewhere → use for subtractions
 
-        w_pos = tl.where(w == 1.0, 1.0, 0.0)  # [BLOCK_N, BLOCK_K]
-        w_neg = tl.where(w == -1.0, 1.0, 0.0)  # [BLOCK_N, BLOCK_K]
+        w_pos = tl.where(w == 1.0, 1.0, 0.0).to(x.dtype)  # [BLOCK_N, BLOCK_K]
+        w_neg = tl.where(w == -1.0, 1.0, 0.0).to(x.dtype)  # [BLOCK_N, BLOCK_K]
 
         # Compute positive contributions: sum(x where w==1)
         # This uses dot product notation but compiles to additions only
