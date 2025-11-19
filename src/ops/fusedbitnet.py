@@ -10,6 +10,7 @@ import triton.language as tl
 
 from ..modules import RMSNorm
 from ..utils import contiguous
+from .matmul_free_linear import matmul_free_linear
 
 
 def activation_quant(x):
@@ -459,7 +460,8 @@ class LayerNormLinearQuantFn(torch.autograd.Function):
         dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
         linear_weight = weight_quant(linear_weight).to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
-        out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
+        # TRUE MATMUL-FREE: Use add/subtract operations instead of F.linear
+        out = matmul_free_linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
         # We don't store y, will be recomputed in the backward pass to save memory
         ctx.save_for_backward(residual_out, norm_weight, norm_bias, linear_weight, mean, rstd)
         ctx.x_shape_og = x_shape_og
@@ -579,8 +581,8 @@ class BitLinear(nn.Linear):
         # Uses Straight-Through Estimator (STE) trick with .detach() for gradient flow
         x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
         w_quant = w + (weight_quant(w) - w).detach()
-        # Perform linear operation with quantized values
-        y = F.linear(x_quant, w_quant)
+        # TRUE MATMUL-FREE: Use add/subtract operations instead of F.linear
+        y = matmul_free_linear(x_quant, w_quant, self.bias)
 
         return y
 
