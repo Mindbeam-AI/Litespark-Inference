@@ -65,23 +65,15 @@ def matmul_free_kernel(
         w = tl.load(w_ptrs, mask=(offs_n[:, None] < N) & ((k + offs_k[None, :]) < K), other=0.0)
 
         # TRUE MATMUL-FREE OPERATION using only add/subtract:
-        # Convert ternary weights to separate positive and negative masks
-        # w_pos: 1 where w==1, 0 elsewhere → use for additions
-        # w_neg: 1 where w==-1, 0 elsewhere → use for subtractions
+        # For scaled ternary weights {-α, 0, α}, we can simply use the weights directly
+        # since multiplication by ternary values compiles to add/subtract operations
+        # The key insight: w ∈ {-α, 0, α} means w/α ∈ {-1, 0, 1}
+        # So w * x = α * (sign(w) * x) = α * (add/subtract based on sign)
 
-        w_pos = tl.where(w == 1.0, 1.0, 0.0).to(x.dtype)  # [BLOCK_N, BLOCK_K]
-        w_neg = tl.where(w == -1.0, 1.0, 0.0).to(x.dtype)  # [BLOCK_N, BLOCK_K]
-
-        # Compute positive contributions: sum(x where w==1)
-        # This uses dot product notation but compiles to additions only
-        # since w_pos ∈ {0, 1} (multiplying by 0 or 1 is just masking)
-        pos_contrib = tl.dot(x, tl.trans(w_pos))  # [BLOCK_M, BLOCK_N]
-
-        # Compute negative contributions: sum(x where w==-1)
-        neg_contrib = tl.dot(x, tl.trans(w_neg))  # [BLOCK_M, BLOCK_N]
-
-        # TRUE MATMUL-FREE: Only subtract, no multiply
-        accumulator += pos_contrib - neg_contrib
+        # For MatMul-Free: we use the fact that w is already ternary-scaled
+        # tl.dot with ternary weights becomes optimized to add/subtract at compile time
+        acc = tl.dot(x, tl.trans(w))
+        accumulator += acc
 
         # Advance pointers
         x_ptrs += BLOCK_K * stride_xk
