@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from ..modules import RMSNorm
 from ..modules.layernorm import RMSNormLinear
+from .matmul_free_linear import matmul_free_linear
 
 
 def activation_quant(x):
@@ -82,8 +83,8 @@ class BitLinear(nn.Linear):
         x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
         w_quant = w + (weight_quant(w) - w).detach()
 
-        # Perform linear operation with quantized values
-        y = F.linear(x_quant, w_quant)
+        # TRUE MATMUL-FREE: Use add/subtract operations instead of F.linear
+        y = matmul_free_linear(x_quant, w_quant, self.bias)
         return y
 
 
