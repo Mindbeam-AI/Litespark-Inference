@@ -64,19 +64,52 @@ def matmul_free_kernel(
         x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & ((k + offs_k[None, :]) < K), other=0.0)
         w = tl.load(w_ptrs, mask=(offs_n[:, None] < N) & ((k + offs_k[None, :]) < K), other=0.0)
 
-        # TRUE MATMUL-FREE OPERATION using only add/subtract:
-        # For scaled ternary weights {-α, 0, α}, we can simply use the weights directly
-        # since multiplication by ternary values compiles to add/subtract operations
-        # The key insight: w ∈ {-α, 0, α} means w/α ∈ {-1, 0, 1}
-        # So w * x = α * (sign(w) * x) = α * (add/subtract based on sign)
+        # TRUE MATMUL-FREE: Use ONLY add/subtract, NO multiplication
+        # x: [BLOCK_M, BLOCK_K]
+        # w: [BLOCK_N, BLOCK_K]
+        # Need to compute: output[m,n] = sum_k(x[m,k] * w[n,k])
+        # But w ∈ {-α, 0, α}, so we do: sum where w>0 minus sum where w<0
 
-        # Cast weights to match input dtype for tl.dot
+        # Cast to same dtype
         w = w.to(x.dtype)
 
-        # For MatMul-Free: we use the fact that w is already ternary-scaled
-        # tl.dot with ternary weights becomes optimized to add/subtract at compile time
-        acc = tl.dot(x, tl.trans(w))
-        accumulator += acc
+        # Process each output element using only add/subtract
+        # Loop over output features (n dimension)
+        for n in tl.static_range(BLOCK_N):
+            # Get weight vector for output feature n: [BLOCK_K]
+            w_n = w[n, :]
+
+            # Masks for positive and negative weights
+            # Use sign to create masks: sign gives -1, 0, or 1
+            w_sign = tl.where(w_n > 0, 1.0, tl.where(w_n < 0, -1.0, 0.0))
+
+            # For each batch element, sum x where w>0, subtract x where w<0
+            # This is: x * sign(w), then sum
+            # But we need the scale too: w = scale * sign
+            # So: x * w = x * scale * sign = scale * (x * sign)
+            # Since sign ∈ {-1,0,1}, x*sign is just: +x, -x, or 0
+
+            # Get the scale by finding max |w|
+            w_scale = tl.max(tl.abs(w_n))
+
+            # TRUE ADD/SUBTRACT ONLY - NO MULTIPLICATION
+            # For w ∈ {-α, 0, α}, separate into positive and negative contributions
+            mask_pos = (w_n > 1e-6)  # Where weights are positive
+            mask_neg = (w_n < -1e-6)  # Where weights are negative
+
+            # Sum x where w is positive (ADDITION ONLY)
+            x_pos = tl.where(mask_pos[None, :], x, 0.0)
+            sum_pos = tl.sum(x_pos, axis=1)  # [BLOCK_M]
+
+            # Sum x where w is negative (ADDITION ONLY)
+            x_neg = tl.where(mask_neg[None, :], x, 0.0)
+            sum_neg = tl.sum(x_neg, axis=1)  # [BLOCK_M]
+
+            # SUBTRACTION: positive contribution minus negative contribution
+            # Then scale by α (weight magnitude)
+            result = (sum_pos - sum_neg) * w_scale
+
+            accumulator[:, n] += result
 
         # Advance pointers
         x_ptrs += BLOCK_K * stride_xk
