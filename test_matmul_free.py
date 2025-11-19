@@ -15,6 +15,18 @@ print("=" * 80)
 print("TESTING TRUE MATMUL-FREE IMPLEMENTATION")
 print("=" * 80)
 
+# Track test results
+test_results = {
+    'ternary_weights': False,
+    'kernel_forward': False,
+    'manual_match': False,
+    'layer_forward': False,
+    'layer_backward': False,
+    'model_forward': False,
+    'model_backward': False,
+    'benchmark': False,
+}
+
 # Test 1: Basic matmul-free kernel
 print("\n[Test 1] Basic MatMul-Free Kernel")
 print("-" * 80)
@@ -37,12 +49,14 @@ print(f"Input shape: {x.shape}")
 print(f"Weight shape: {w.shape}")
 print(f"Unique weight values: {unique_vals.cpu().numpy()}")
 print(f"✓ Weights are ternary {{-α, 0, α}}: {is_ternary}")
+test_results['ternary_weights'] = is_ternary
 
 # Test matmul-free forward
 try:
     y = matmul_free_forward(x, w_ternary)
     print(f"Output shape: {y.shape}")
     print(f"✓ MatMul-free kernel executed successfully!")
+    test_results['kernel_forward'] = True
 except Exception as e:
     print(f"✗ Error: {e}")
     import traceback
@@ -76,8 +90,10 @@ for i in range(2):  # batch
         y_manual[i, j] = pos_sum - neg_sum
 
 diff = (y_matmulfree - y_manual).abs().max()
+match = diff < 0.01
 print(f"Max difference between MatMul-free and manual add/subtract: {diff:.6f}")
-print(f"✓ Results match manual add/subtract computation (diff < 0.01): {diff < 0.01}")
+print(f"✓ Results match manual add/subtract computation (diff < 0.01): {match}")
+test_results['manual_match'] = match
 
 # Test 3: FusedBitLinear with MatMul-Free
 print("\n[Test 3] FusedBitLinear Layer (Full Model Component)")
@@ -95,12 +111,14 @@ try:
     print(f"Input shape: {x_input.shape}")
     print(f"Output shape: {y_output.shape}")
     print(f"✓ FusedBitLinear forward pass successful!")
+    test_results['layer_forward'] = True
 
     # Check gradients
     loss = y_output.sum()
     loss.backward()
     print(f"✓ Backward pass successful!")
     print(f"Weight gradient shape: {layer.weight.grad.shape}")
+    test_results['layer_backward'] = True
 except Exception as e:
     print(f"✗ Error: {e}")
     import traceback
@@ -129,10 +147,12 @@ try:
     print(f"Logits shape: {outputs.logits.shape}")
     print(f"Loss: {outputs.loss.item():.4f}")
     print(f"✓ Full model forward pass successful!")
+    test_results['model_forward'] = True
 
     # Backward pass
     outputs.loss.backward()
     print(f"✓ Full model backward pass successful!")
+    test_results['model_backward'] = True
 except Exception as e:
     print(f"✗ Error: {e}")
     import traceback
@@ -170,17 +190,35 @@ print(f"Matrix size: [{batch * seq_len}, {hidden}] x [{hidden}, {hidden}]")
 print(f"Average time: {avg_time:.2f} ms")
 print(f"Throughput: {throughput:.2f} GFLOPS-equivalent")
 print(f"✓ Performance benchmark complete!")
+test_results['benchmark'] = True
 
+# Generate summary based on actual test results
 print("\n" + "=" * 80)
-print("SUMMARY: MATMUL-FREE IMPLEMENTATION STATUS")
+all_passed = all(test_results.values())
+if all_passed:
+    print("✅ ALL TESTS PASSED - IMPLEMENTATION VERIFIED")
+else:
+    print("⚠️  SOME TESTS FAILED - SEE DETAILS ABOVE")
 print("=" * 80)
-print("✓ Weights quantized to ternary pattern {-α, 0, α}")
-print("✓ Memory-efficient: 1.58 bits per weight vs 16/32 bits")
-print("✓ Bandwidth-optimized: minimal data movement")
-print("✓ Uses optimized Triton kernels for ternary operations")
-print("✓ Gradients flow correctly through STE")
-print("✓ Full model training ready")
-print("")
-print("Note: On GPUs, tl.dot() is used for efficiency. True add/subtract-only")
-print("      operations require custom hardware (FPGA/ASIC) as in the paper.")
+
+# Detailed results
+print("\nTest Results:")
+for test_name, passed in test_results.items():
+    status = "✓ PASS" if passed else "✗ FAIL"
+    print(f"  {status}: {test_name}")
+
+if all_passed:
+    print("\nImplementation Summary:")
+    print("  • Weights quantized to ternary pattern {-α, 0, α}")
+    print("  • Memory-efficient: 1.58 bits per weight vs 16/32 bits")
+    print("  • Bandwidth-optimized: minimal data movement")
+    print("  • Uses optimized Triton kernels for ternary operations")
+    print("  • Gradients flow correctly through STE")
+    print("  • Full model training ready")
+    print("")
+    print("Note: On GPUs, tl.dot() is used for efficiency. True add/subtract-only")
+    print("      operations require custom hardware (FPGA/ASIC) as in the paper.")
+else:
+    print("\n⚠️  Fix failing tests before proceeding with training.")
+
 print("=" * 80)
