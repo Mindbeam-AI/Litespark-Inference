@@ -60,43 +60,59 @@ class PaperTrainingBenchmark:
         }
     
     def create_matmul_free_model(self, size='1.3B', use_fused=True, model_path=None):
-        """Create MatMul-free model matching paper specs"""
-        if size == '370M':
-            config = HGRNBitConfig(
-                vocab_size=50000,
-                hidden_size=1024,
-                num_hidden_layers=24,
-                num_heads=8,
-                max_position_embeddings=2048,
-            )
-        elif size == '1.3B':
-            config = HGRNBitConfig(
-                vocab_size=50000,
-                hidden_size=2048,
-                num_hidden_layers=24,
-                num_heads=16,
-                max_position_embeddings=2048,
-            )
-        else:
-            raise ValueError(f"Unsupported size: {size}")
-        
-        # Load trained model if path provided
+        """Create MatMul-free model using actual trained model configuration"""
+
+        # Load trained model if path provided - use actual config
         if model_path and Path(model_path).exists():
+            print(f"📂 Loading trained model from {model_path}")
             if Path(model_path).is_dir():
+                # Load from HuggingFace format directory
                 model = HGRNBitForCausalLM.from_pretrained(model_path)
+                config = model.config
             else:
+                # Load from checkpoint file
                 checkpoint = torch.load(model_path, map_location='cpu')
+                config = checkpoint.get('config')
+                if config is None:
+                    raise ValueError(f"No config found in checkpoint {model_path}")
                 model = HGRNBitForCausalLM(config)
                 model.load_state_dict(checkpoint['model_state_dict'])
         else:
+            # Fallback: create model with default config (only if no trained model available)
+            print(f"⚠️  No trained model path provided, creating fresh {size} model with default config")
+            if size == '370M':
+                config = HGRNBitConfig(
+                    vocab_size=32000,  # Use original repo default
+                    hidden_size=1024,
+                    num_hidden_layers=24,
+                    num_heads=1,       # Use original repo default
+                    max_position_embeddings=2048,
+                )
+            elif size == '1.3B':
+                config = HGRNBitConfig(
+                    vocab_size=32000,  # Use original repo default
+                    hidden_size=2048,
+                    num_hidden_layers=24,
+                    num_heads=1,       # Use original repo default
+                    max_position_embeddings=2048,
+                )
+            else:
+                raise ValueError(f"Unsupported size: {size}")
+
             model = HGRNBitForCausalLM(config)
-        
+
         model = model.to(self.device)
-        
+
         # Replace with vanilla BitLinear if needed
         if not use_fused:
             self._replace_fused_with_vanilla(model)
-        
+
+        # Print actual model configuration for verification
+        param_count = sum(p.numel() for p in model.parameters())
+        print(f"📈 Model config: vocab_size={config.vocab_size}, hidden_size={config.hidden_size}, "
+              f"num_layers={config.num_hidden_layers}, num_heads={getattr(config, 'num_heads', 1)}")
+        print(f"📊 Total parameters: {param_count/1e9:.2f}B")
+
         return model, config
     
     def load_pythia_model(self, size='1.4b'):

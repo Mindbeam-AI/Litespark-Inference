@@ -8,6 +8,7 @@ import torch
 import json
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 from paper_training_efficiency_benchmark import PaperTrainingBenchmark
 
 def analyze_current_results():
@@ -64,42 +65,49 @@ def analyze_current_results():
     print(f"   The paper's advantage is in memory efficiency and scaling, not raw speed.")
 
 def test_higher_batch_sizes():
-    """Test higher batch sizes to reach batch size 28"""
+    """Test higher batch sizes to reach batch size 28 using actual trained model"""
     print(f"\n🚀 TESTING HIGHER BATCH SIZES TO REPRODUCE FIGURE 3")
     print("=" * 80)
-    
+
     benchmark = PaperTrainingBenchmark()
-    
+
     # Try to test batch size 28 specifically
     batch_sizes_to_test = [16, 20, 24, 28, 32]
-    
-    print(f"🔥 Testing Fused BitLinear at higher batch sizes...")
-    
+
+    print(f"🔥 Testing Fused BitLinear at higher batch sizes with actual trained model...")
+
     try:
-        fused_model, config = benchmark.create_matmul_free_model('1.3B', use_fused=True)
-        
+        # Use actual trained model path if available
+        model_path = 'checkpoints/1.3B_paper_match/final_model/'
+        if not Path(model_path).exists():
+            print(f"⚠️  Trained model not found at {model_path}, using default config")
+            model_path = None
+
+        fused_model, config = benchmark.create_matmul_free_model('1.3B', use_fused=True, model_path=model_path)
+
         for batch_size in batch_sizes_to_test:
             try:
                 print(f"  📦 Testing batch size {batch_size}...", end=" ")
                 time_per_iter, memory_gb = benchmark.benchmark_training_iteration(fused_model, batch_size)
                 print(f"⏱️  {time_per_iter:.3f}s/iter, 💾 {memory_gb:.1f}GB")
-                
+
                 if batch_size == 28:
                     print(f"  🎯 BATCH SIZE 28 RESULT:")
                     print(f"     Time: {time_per_iter:.3f}s (Paper: 1.21s)")
                     print(f"     Memory: {memory_gb:.1f}GB (Paper: 32GB)")
-                
+                    print(f"     Your model config: vocab_size={config.vocab_size}, num_heads={getattr(config, 'num_heads', 1)}")
+
             except torch.cuda.OutOfMemoryError:
                 print("❌ OOM")
-                print(f"  💡 Try reducing model size or using gradient checkpointing")
+                print(f"  💡 Your model config may be larger than paper's - check vocab_size and num_heads")
                 break
             except Exception as e:
                 print(f"❌ Error: {e}")
                 break
-        
+
         del fused_model
         torch.cuda.empty_cache()
-        
+
     except Exception as e:
         print(f"❌ Failed to test higher batch sizes: {e}")
 
