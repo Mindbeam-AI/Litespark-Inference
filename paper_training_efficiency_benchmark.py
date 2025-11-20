@@ -58,10 +58,8 @@ class PaperTrainingBenchmark:
             'figure3c_resource_efficiency': {
                 'matmul_free_370m': {'model_size': 0.37, 'inference_memory': 0, 'inference_latency': 0},
                 'matmul_free_1_3b': {'model_size': 1.3, 'inference_memory': 0, 'inference_latency': 0},
-                'matmul_free_2_7b': {'model_size': 2.7, 'inference_memory': 0, 'inference_latency': 0},
                 'transformer_plus_370m': {'model_size': 0.37, 'inference_memory': 0, 'inference_latency': 0},
-                'transformer_plus_1_3b': {'model_size': 1.3, 'inference_memory': 0, 'inference_latency': 0},
-                'transformer_plus_2_7b': {'model_size': 2.7, 'inference_memory': 0, 'inference_latency': 0}
+                'transformer_plus_1_3b': {'model_size': 1.3, 'inference_memory': 0, 'inference_latency': 0}
             }
         }
     
@@ -230,7 +228,7 @@ class PaperTrainingBenchmark:
 
         return avg_time_per_iteration, peak_memory_gb
     
-    def run_figure3_complete_reproduction(self, model_path_370m=None, model_path_1_3b=None, model_path_2_7b=None, batch_sizes=[1, 2, 4, 8, 16, 28]):
+    def run_figure3_complete_reproduction(self, model_path_370m=None, model_path_1_3b=None, batch_sizes=[1, 2, 4, 8, 16, 28]):
         """
         Reproduce complete Figure 3 from the paper with exact same models:
         (a) Computational Latency vs. Batch Size - Fused vs Vanilla BitLinear
@@ -247,7 +245,7 @@ class PaperTrainingBenchmark:
         self._run_figure3ab_training_efficiency(model_path_1_3b, batch_sizes)
 
         # Figure 3(c): Resource efficiency across model sizes
-        self._run_figure3c_resource_efficiency(model_path_370m, model_path_1_3b, model_path_2_7b)
+        self._run_figure3c_resource_efficiency(model_path_370m, model_path_1_3b)
 
     def _run_figure3ab_training_efficiency(self, model_path_1_3b, batch_sizes):
         """Run Figure 3(a-b): Training efficiency tests"""
@@ -275,7 +273,7 @@ class PaperTrainingBenchmark:
         del vanilla_model
         torch.cuda.empty_cache()
 
-    def _run_figure3c_resource_efficiency(self, model_path_370m, model_path_1_3b, model_path_2_7b):
+    def _run_figure3c_resource_efficiency(self, model_path_370m, model_path_1_3b):
         """Run Figure 3(c): Resource efficiency analysis across model sizes"""
         print("\n📊 FIGURE 3(C): RESOURCE EFFICIENCY ANALYSIS")
         print("📋 Paper setup: batch_size=1, seq_length=2048, inference mode")
@@ -283,8 +281,7 @@ class PaperTrainingBenchmark:
 
         model_configs = [
             ('370M', model_path_370m, 'matmul_free_370m'),
-            ('1.3B', model_path_1_3b, 'matmul_free_1_3b'),
-            ('2.7B', model_path_2_7b, 'matmul_free_2_7b')
+            ('1.3B', model_path_1_3b, 'matmul_free_1_3b')
         ]
 
         for size, model_path, result_key in model_configs:
@@ -343,16 +340,7 @@ class PaperTrainingBenchmark:
                 max_position_embeddings=2048,
                 rms_norm_eps=1e-6,
             )
-        elif size == '2.7B':
-            config = LlamaConfig(
-                vocab_size=32000,  # Match paper
-                hidden_size=2560,
-                intermediate_size=10240,  # 4 * hidden_size
-                num_hidden_layers=32,
-                num_attention_heads=20,
-                max_position_embeddings=2048,
-                rms_norm_eps=1e-6,
-            )
+
         else:
             raise ValueError(f"Unsupported size: {size}")
 
@@ -363,8 +351,7 @@ class PaperTrainingBenchmark:
         """Test Transformer++ models (paper's baseline)"""
         transformer_configs = [
             ('370M', 'transformer_plus_370m'),
-            ('1.3B', 'transformer_plus_1_3b'),
-            ('2.7B', 'transformer_plus_2_7b')
+            ('1.3B', 'transformer_plus_1_3b')
         ]
 
         for size, result_key in transformer_configs:
@@ -394,8 +381,7 @@ class PaperTrainingBenchmark:
         """Test Pythia models for additional comparison"""
         pythia_configs = [
             ('410m', 0.41, 'pythia_410m'),
-            ('1.4b', 1.4, 'pythia_1_4b'),
-            ('2.8b', 2.8, 'pythia_2_8b')
+            ('1.4b', 1.4, 'pythia_1_4b')
         ]
 
         for pythia_size, model_size_b, result_key in pythia_configs:
@@ -686,7 +672,7 @@ def main():
     parser = argparse.ArgumentParser(description='Complete Figure 3 Reproduction - Exact Paper Implementation')
     parser.add_argument('--model_370m', type=str, help='Path to trained 370M MatMul-free model')
     parser.add_argument('--model_1_3b', type=str, help='Path to trained 1.3B MatMul-free model')
-    parser.add_argument('--model_2_7b', type=str, help='Path to trained 2.7B MatMul-free model')
+
     parser.add_argument('--batch_sizes', nargs='+', type=int, default=[1, 2, 4, 8, 16, 28],
                        help='Batch sizes to test for Figure 3(a-b) (default: 1 2 4 8 16 28)')
     parser.add_argument('--figure3ab_only', action='store_true', help='Run only Figure 3(a-b) training efficiency tests')
@@ -699,14 +685,14 @@ def main():
 
     if args.figure3c_only:
         # Only run Figure 3(c) resource efficiency
-        benchmark._run_figure3c_resource_efficiency(args.model_370m, args.model_1_3b, args.model_2_7b)
+        benchmark._run_figure3c_resource_efficiency(args.model_370m, args.model_1_3b)
     elif args.figure3ab_only:
         # Only run Figure 3(a-b) training efficiency
         benchmark._run_figure3ab_training_efficiency(args.model_1_3b, args.batch_sizes)
     else:
         # Run complete Figure 3 reproduction
         benchmark.run_figure3_complete_reproduction(
-            args.model_370m, args.model_1_3b, args.model_2_7b, args.batch_sizes
+            args.model_370m, args.model_1_3b, args.batch_sizes
         )
 
     benchmark.save_results(args.output)
