@@ -338,41 +338,41 @@ class PaperTrainingBenchmark:
         print(f"💾 Results saved to {output_file}")
 
     def plot_results(self, save_plots=True):
-        """Create plots matching paper's Figure 3(a-b)"""
+        """Create plots exactly matching paper's Figure 3(a-b)"""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
-        # Plot 1: Training Time vs Batch Size (Figure 3a)
+        # Figure 3(a): Computational Latency vs. Batch Size (EXACT paper title)
         fused_data = self.results['paper_reproduction']['fused_bitlinear']
         vanilla_data = self.results['paper_reproduction']['vanilla_bitlinear']
 
         if fused_data['batch_sizes']:
-            ax1.plot(fused_data['batch_sizes'], fused_data['times'], 'o-', label='Fused BitLinear', linewidth=2)
+            ax1.plot(fused_data['batch_sizes'], fused_data['times'], 'o-', label='Fused BitLinear', linewidth=2, markersize=6)
         if vanilla_data['batch_sizes']:
-            ax1.plot(vanilla_data['batch_sizes'], vanilla_data['times'], 's-', label='Vanilla BitLinear', linewidth=2)
+            ax1.plot(vanilla_data['batch_sizes'], vanilla_data['times'], 's-', label='Vanilla BitLinear', linewidth=2, markersize=6)
 
         ax1.set_xlabel('Batch Size')
-        ax1.set_ylabel('Training Time (s/iteration)')
-        ax1.set_title('Training Time vs Batch Size\n(Reproducing Paper Figure 3a)')
+        ax1.set_ylabel('Computational Latency (s/iteration)')  # Match paper's y-axis label
+        ax1.set_title('(a) Computational Latency vs. Batch Size')  # EXACT paper title
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
-        # Plot 2: Memory Usage vs Batch Size (Figure 3b)
+        # Figure 3(b): Memory Utilization vs. Batch Size (EXACT paper title)
         if fused_data['batch_sizes']:
-            ax2.plot(fused_data['batch_sizes'], fused_data['memory'], 'o-', label='Fused BitLinear', linewidth=2)
+            ax2.plot(fused_data['batch_sizes'], fused_data['memory'], 'o-', label='Fused BitLinear', linewidth=2, markersize=6)
         if vanilla_data['batch_sizes']:
-            ax2.plot(vanilla_data['batch_sizes'], vanilla_data['memory'], 's-', label='Vanilla BitLinear', linewidth=2)
+            ax2.plot(vanilla_data['batch_sizes'], vanilla_data['memory'], 's-', label='Vanilla BitLinear', linewidth=2, markersize=6)
 
         ax2.set_xlabel('Batch Size')
-        ax2.set_ylabel('Peak Memory (GB)')
-        ax2.set_title('Memory Usage vs Batch Size\n(Reproducing Paper Figure 3b)')
+        ax2.set_ylabel('Memory Utilization (GB)')  # Match paper's y-axis label
+        ax2.set_title('(b) Memory Utilization vs. Batch Size')  # EXACT paper title
         ax2.legend()
         ax2.grid(True, alpha=0.3)
 
         plt.tight_layout()
 
         if save_plots:
-            plt.savefig('paper_reproduction_plots.png', dpi=300, bbox_inches='tight')
-            print("📊 Plots saved to paper_reproduction_plots.png")
+            plt.savefig('figure3_ab_exact_reproduction.png', dpi=300, bbox_inches='tight')
+            print("📊 Figure 3(a-b) exact reproduction saved to figure3_ab_exact_reproduction.png")
 
         plt.show()
 
