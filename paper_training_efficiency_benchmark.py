@@ -315,6 +315,10 @@ class PaperTrainingBenchmark:
         print("\n📝 Testing Transformer++ models (paper's baseline)")
         self._benchmark_transformer_plus_models()
 
+        # Also test Pythia models for additional comparison
+        print("\n📝 Testing Pythia models for additional comparison")
+        self._benchmark_pythia_models()
+
     def create_transformer_plus_model(self, size='1.3B'):
         """Create Transformer++ model (paper's baseline) with same architecture as MatMul-free but standard layers"""
         from transformers import LlamaConfig, LlamaForCausalLM
@@ -385,6 +389,42 @@ class PaperTrainingBenchmark:
 
             except Exception as e:
                 print(f"❌ Failed to test Transformer++ {size}: {e}")
+
+    def _benchmark_pythia_models(self):
+        """Test Pythia models for additional comparison"""
+        pythia_configs = [
+            ('410m', 0.41, 'pythia_410m'),
+            ('1.4b', 1.4, 'pythia_1_4b'),
+            ('2.8b', 2.8, 'pythia_2_8b')
+        ]
+
+        for pythia_size, model_size_b, result_key in pythia_configs:
+            try:
+                print(f"\n🐍 Testing Pythia-{pythia_size}")
+                model, tokenizer = self.load_pythia_model(pythia_size)
+                if model is not None:
+                    param_count = sum(p.numel() for p in model.parameters())
+                    print(f"📈 Pythia Model: {param_count/1e9:.2f}B parameters")
+
+                    # Inference benchmark: batch_size=1, seq_length=2048
+                    time_per_iter, memory_gb = self.benchmark_inference_iteration(model, batch_size=1, seq_length=2048)
+
+                    # Add to results with separate key
+                    if result_key not in self.results['figure3c_resource_efficiency']:
+                        self.results['figure3c_resource_efficiency'][result_key] = {
+                            'model_size': model_size_b, 'inference_memory': 0, 'inference_latency': 0
+                        }
+
+                    self.results['figure3c_resource_efficiency'][result_key]['inference_memory'] = memory_gb
+                    self.results['figure3c_resource_efficiency'][result_key]['inference_latency'] = time_per_iter
+
+                    print(f"📊 Inference: {time_per_iter:.3f}s/iter, 💾 {memory_gb:.1f}GB")
+
+                    del model
+                    torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"❌ Failed to test Pythia-{pythia_size}: {e}")
 
     def run_pythia_comparison(self, model_path_370m=None, model_path_1_3b=None, batch_sizes=[1, 2, 4, 8, 16]):
         """Compare MatMul-free models with Pythia baselines"""
@@ -567,10 +607,15 @@ class PaperTrainingBenchmark:
         matmul_free_memory = []
         matmul_free_latency = []
 
-        # Extract data for Transformer++ (Pythia proxy)
+        # Extract data for Transformer++
         transformer_sizes = []
         transformer_memory = []
         transformer_latency = []
+
+        # Extract data for Pythia
+        pythia_sizes = []
+        pythia_memory = []
+        pythia_latency = []
 
         for key, data in resource_data.items():
             if data['inference_memory'] > 0:  # Only plot if we have data
@@ -582,25 +627,42 @@ class PaperTrainingBenchmark:
                     transformer_sizes.append(data['model_size'])
                     transformer_memory.append(data['inference_memory'])
                     transformer_latency.append(data['inference_latency'])
+                elif 'pythia' in key:
+                    pythia_sizes.append(data['model_size'])
+                    pythia_memory.append(data['inference_memory'])
+                    pythia_latency.append(data['inference_latency'])
 
         # Create twin axis for latency
         ax2 = ax.twinx()
 
         # Plot memory (left y-axis)
+        lines = []
         if matmul_free_sizes:
             line1 = ax.plot(matmul_free_sizes, matmul_free_memory, 'o-',
                            label='MatMul-free LM (Memory)', linewidth=2, markersize=6, color='blue')
+            lines.extend(line1)
         if transformer_sizes:
             line2 = ax.plot(transformer_sizes, transformer_memory, 's-',
                            label='Transformer++ (Memory)', linewidth=2, markersize=6, color='red')
+            lines.extend(line2)
+        if pythia_sizes:
+            line3 = ax.plot(pythia_sizes, pythia_memory, 'd-',
+                           label='Pythia (Memory)', linewidth=2, markersize=6, color='green')
+            lines.extend(line3)
 
         # Plot latency (right y-axis)
         if matmul_free_sizes:
-            line3 = ax2.plot(matmul_free_sizes, matmul_free_latency, '^--',
+            line4 = ax2.plot(matmul_free_sizes, matmul_free_latency, '^--',
                             label='MatMul-free LM (Latency)', linewidth=2, markersize=6, color='darkblue')
+            lines.extend(line4)
         if transformer_sizes:
-            line4 = ax2.plot(transformer_sizes, transformer_latency, 'v--',
+            line5 = ax2.plot(transformer_sizes, transformer_latency, 'v--',
                             label='Transformer++ (Latency)', linewidth=2, markersize=6, color='darkred')
+            lines.extend(line5)
+        if pythia_sizes:
+            line6 = ax2.plot(pythia_sizes, pythia_latency, '<--',
+                            label='Pythia (Latency)', linewidth=2, markersize=6, color='darkgreen')
+            lines.extend(line6)
 
         ax.set_xlabel('Model Size (B parameters)')
         ax.set_ylabel('GPU Memory Consumption (GB)', color='black')
@@ -608,21 +670,13 @@ class PaperTrainingBenchmark:
         ax.set_title('(c) Resource Efficiency Analysis:\nGPU memory consumption and inference latency comparison across model sizes')
 
         # Combine legends
-        lines = []
-        labels = []
-        if matmul_free_sizes:
-            lines.extend([line1[0], line3[0]])
-            labels.extend(['MatMul-free LM (Memory)', 'MatMul-free LM (Latency)'])
-        if transformer_sizes:
-            lines.extend([line2[0], line4[0]])
-            labels.extend(['Transformer++ (Memory)', 'Transformer++ (Latency)'])
-
+        labels = [line.get_label() for line in lines]
         if lines:
             ax.legend(lines, labels, loc='upper left')
 
         ax.grid(True, alpha=0.3)
-        if matmul_free_sizes or transformer_sizes:
-            all_sizes = matmul_free_sizes + transformer_sizes
+        if matmul_free_sizes or transformer_sizes or pythia_sizes:
+            all_sizes = matmul_free_sizes + transformer_sizes + pythia_sizes
             ax.set_xscale('log')
             ax.set_xticks(sorted(set(all_sizes)))
             ax.set_xticklabels([f'{s:.1f}B' for s in sorted(set(all_sizes))])
