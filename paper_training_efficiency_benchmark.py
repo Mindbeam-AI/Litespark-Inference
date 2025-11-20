@@ -24,7 +24,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime
+import warnings
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Suppress HuggingFace warnings
+warnings.filterwarnings("ignore", message=".*GenerationMixin.*")
+warnings.filterwarnings("ignore", message=".*trust_remote_code.*")
 
 from src.models.hgrn_bit.configuration_hgrn_bit import HGRNBitConfig
 from src.models.hgrn_bit.modeling_hgrn_bit import HGRNBitForCausalLM

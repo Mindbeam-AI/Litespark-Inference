@@ -13,6 +13,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast)
 from transformers.modeling_utils import PreTrainedModel
+from transformers.generation.utils import GenerationMixin
 from transformers.utils import logging
 
 from ...layers.hgrn_bit import HGRNBitAttention
@@ -278,7 +279,7 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
         )
 
 
-class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
+class HGRNBitForCausalLM(HGRNBitPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):

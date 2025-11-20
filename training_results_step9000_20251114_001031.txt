@@ -1,0 +1,89 @@
+
+--- Page 1 ---
+Checkpoint Step 9,000 / 10,000
+Model Size ~257M parameters
+Dataset SlimPajama-6B
+Hardware 4x NVIDIA A10G
+Training Snapshot
+-53.5%
+Throughput vs. Baseline
+Higher is better
++104.1%
+Memory Overhead (seq=2048)
+Lower is better
+Key Performance Metrics
+512 1024 2048
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0Peak Memory (GB)
+2.51
+2.61
+2.93
+0.92
+1.13
+1.43
+Memory Usage Comparison
+MatMul-Free
+Baseline (Pythia-410M)
+MatMul-Free Baseline
+0
+10000
+20000
+30000
+40000
+50000
+60000T okens/Second
+28713
+61726
+Throughput Comparison (seq=1024, batch=4)
+MatMul-Free Model: Performance Analysis
+
+--- Page 2 ---
+0 2000 4000 6000 8000 10000
+Training Step
+5
+6
+7
+8
+9
+10
+11Cross-Entropy Loss
+Anomalous Spike
+Training Loss Trajectory
+Training Loss
+Checkpoint (Step 9000)
+500 750 1000 1250 1500 1750 2000
+Sequence Length
+1.0
+1.5
+2.0
+2.5
+3.0Peak Memory (GB)
+Memory Scaling
+MatMul-Free
+Baseline
+512 1024 2048
+Sequence Length
+0
+25
+50
+75
+100
+125
+150
+175Memory Overhead (%)
++171.4%
++131.6%
++104.1%
+Overhead vs. Baseline
+ - **Quantization:** Weights are 1.58-bit (T ernary: -1, 0, 1), Activations are 8-bit. -
+**Attention:** Standard Softmax attention is replaced with a Hierarchical Gated Recurrent Network
+(HGRN). - **Fused Kernels:** Triton is used to fuse LayerNorm, Linear, and Quantization operations,
+reducing overhead. - **Triton Autotuning:** Disabled in this fork due to compatibility issues, using
+fixed default kernel configurations.
+Implementation Notes
+Training Trajectory & Memory Analysis
