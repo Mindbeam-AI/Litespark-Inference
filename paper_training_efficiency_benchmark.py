@@ -311,40 +311,80 @@ class PaperTrainingBenchmark:
             else:
                 print(f"⚠️  {size} model not found at {model_path}")
 
-        # Note: We don't have Transformer++ models, so we'll use Pythia as proxy
-        print("\n📝 Note: Using Pythia models as Transformer++ proxy for comparison")
-        self._benchmark_transformer_plus_proxy()
+        # Test Transformer++ models (paper's baseline)
+        print("\n📝 Testing Transformer++ models (paper's baseline)")
+        self._benchmark_transformer_plus_models()
 
-    def _benchmark_transformer_plus_proxy(self):
-        """Use Pythia models as Transformer++ proxy for Figure 3(c)"""
-        pythia_configs = [
-            ('410m', 0.41, 'transformer_plus_370m'),  # Closest to 370M
-            ('1.4b', 1.4, 'transformer_plus_1_3b'),   # Closest to 1.3B
-            ('2.8b', 2.8, 'transformer_plus_2_7b')    # Closest to 2.7B
+    def create_transformer_plus_model(self, size='1.3B'):
+        """Create Transformer++ model (paper's baseline) with same architecture as MatMul-free but standard layers"""
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        if size == '370M':
+            config = LlamaConfig(
+                vocab_size=32000,  # Match paper
+                hidden_size=1024,
+                intermediate_size=4096,  # 4 * hidden_size
+                num_hidden_layers=24,
+                num_attention_heads=8,
+                max_position_embeddings=2048,
+                rms_norm_eps=1e-6,
+            )
+        elif size == '1.3B':
+            config = LlamaConfig(
+                vocab_size=32000,  # Match paper
+                hidden_size=2048,
+                intermediate_size=8192,  # 4 * hidden_size
+                num_hidden_layers=24,
+                num_attention_heads=16,
+                max_position_embeddings=2048,
+                rms_norm_eps=1e-6,
+            )
+        elif size == '2.7B':
+            config = LlamaConfig(
+                vocab_size=32000,  # Match paper
+                hidden_size=2560,
+                intermediate_size=10240,  # 4 * hidden_size
+                num_hidden_layers=32,
+                num_attention_heads=20,
+                max_position_embeddings=2048,
+                rms_norm_eps=1e-6,
+            )
+        else:
+            raise ValueError(f"Unsupported size: {size}")
+
+        model = LlamaForCausalLM(config).to(self.device)
+        return model, config
+
+    def _benchmark_transformer_plus_models(self):
+        """Test Transformer++ models (paper's baseline)"""
+        transformer_configs = [
+            ('370M', 'transformer_plus_370m'),
+            ('1.3B', 'transformer_plus_1_3b'),
+            ('2.7B', 'transformer_plus_2_7b')
         ]
 
-        for pythia_size, model_size_b, result_key in pythia_configs:
+        for size, result_key in transformer_configs:
             try:
-                print(f"\n🐍 Testing Pythia-{pythia_size} as Transformer++ {model_size_b:.1f}B proxy")
-                model, tokenizer = self.load_pythia_model(pythia_size)
-                if model is not None:
-                    param_count = sum(p.numel() for p in model.parameters())
-                    print(f"📈 Pythia Model: {param_count/1e9:.2f}B parameters")
+                print(f"\n🔥 Testing Transformer++ {size}")
+                model, config = self.create_transformer_plus_model(size)
+                param_count = sum(p.numel() for p in model.parameters())
+                print(f"📈 Transformer++ Model: {param_count/1e9:.2f}B parameters")
 
-                    # Inference benchmark: batch_size=1, seq_length=2048
-                    time_per_iter, memory_gb = self.benchmark_inference_iteration(model, batch_size=1, seq_length=2048)
+                # Inference benchmark: batch_size=1, seq_length=2048
+                time_per_iter, memory_gb = self.benchmark_inference_iteration(model, batch_size=1, seq_length=2048)
 
-                    self.results['figure3c_resource_efficiency'][result_key]['model_size'] = model_size_b
-                    self.results['figure3c_resource_efficiency'][result_key]['inference_memory'] = memory_gb
-                    self.results['figure3c_resource_efficiency'][result_key]['inference_latency'] = time_per_iter
+                model_size_b = float(size.replace('B', '').replace('M', 'e-3'))
+                self.results['figure3c_resource_efficiency'][result_key]['model_size'] = model_size_b
+                self.results['figure3c_resource_efficiency'][result_key]['inference_memory'] = memory_gb
+                self.results['figure3c_resource_efficiency'][result_key]['inference_latency'] = time_per_iter
 
-                    print(f"📊 Inference: {time_per_iter:.3f}s/iter, 💾 {memory_gb:.1f}GB")
+                print(f"📊 Inference: {time_per_iter:.3f}s/iter, 💾 {memory_gb:.1f}GB")
 
-                    del model
-                    torch.cuda.empty_cache()
+                del model
+                torch.cuda.empty_cache()
 
             except Exception as e:
-                print(f"❌ Failed to test Pythia-{pythia_size}: {e}")
+                print(f"❌ Failed to test Transformer++ {size}: {e}")
 
     def run_pythia_comparison(self, model_path_370m=None, model_path_1_3b=None, batch_sizes=[1, 2, 4, 8, 16]):
         """Compare MatMul-free models with Pythia baselines"""
