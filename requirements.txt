@@ -1,33 +1,84 @@
-# Core ML/DL packages
-# NOTE: Install PyTorch with CUDA support first using the appropriate command:
-# For CUDA 11.8: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-# For CUDA 12.1: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-# Then install the rest of the requirements with: pip install -r requirements.txt
+# CPU-Optimized MatMul-Free Requirements
+# This branch focuses on CPU-only operations, removing GPU dependencies
 
+# Core ML/DL packages (CPU-only versions)
+# Install PyTorch CPU-only version:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Essential packages for CPU operations
 transformers>=4.30.0
 datasets>=2.14.0
-
-# Tensor operations and utilities
-einops>=0.6.1
-triton>=2.2.0
-
-# Data handling
-# NOTE: Install pyarrow separately with: pip install pyarrow --only-binary=:all:
-# (pyarrow requires CMake 3.25+, which may not be available, so use pre-built wheels)
-
-# Training utilities
-tqdm>=4.65.0
 numpy>=1.24.0
+einops>=0.6.1
+
+# CPU-specific optimization libraries
+# OpenMP for parallel processing (usually comes with compiler)
+# Intel MKL (optional, for Intel CPUs)
+# mkl>=2023.0.0  # Uncomment for Intel CPU optimization
+
+# Apple Silicon specific (for macOS ARM64)
+# These are automatically available on Apple Silicon Macs
+
+# Compilation and extension building
+pybind11>=2.10.0  # For C++ extensions
+setuptools>=65.0.0
+wheel>=0.38.0
+
+# Data handling and utilities
 safetensors>=0.3.0
 packaging
-accelerate>=0.20.0
-
-# AWS integration (for S3 access if needed)
-# boto3>=1.26.0  # Uncomment if you need direct S3 access
+tqdm>=4.65.0
 
 # HuggingFace integration
 huggingface_hub>=0.15.0
 
-# Monitoring and logging
-tensorboard>=2.13.0
-wandb>=0.15.0
+# Configuration and YAML support
+pyyaml>=6.0
+omegaconf>=2.3.0  # For advanced config management
+
+# Benchmarking and profiling
+psutil>=5.9.0  # For system resource monitoring
+py-cpuinfo>=9.0.0  # For detailed CPU information detection
+
+# Optional: Advanced CPU profiling
+# perf>=0.1.0  # Linux perf integration
+# intel-vtune-profiler  # Intel VTune (Intel CPUs only)
+
+# Development and testing
+pytest>=7.0.0
+pytest-benchmark>=4.0.0  # For performance benchmarking
+black>=22.0.0  # Code formatting
+isort>=5.10.0  # Import sorting
+
+# Visualization (for benchmarking results)
+matplotlib>=3.6.0
+seaborn>=0.12.0
+
+# Memory profiling
+memory-profiler>=0.60.0
+pympler>=0.9  # Advanced memory analysis
+
+# Cross-platform compatibility
+# Windows: Visual Studio Build Tools required for C++ compilation
+# macOS: Xcode Command Line Tools required
+# Linux: GCC/Clang with OpenMP support required
+
+# Architecture-specific notes:
+# 
+# Intel/AMD x86_64:
+# - Requires AVX2 support for optimal performance
+# - AVX-512 support provides additional speedup
+# - OpenMP for multi-threading
+#
+# Apple Silicon (M1/M2/M3):
+# - Native ARM64 compilation
+# - NEON SIMD instructions
+# - Unified memory architecture optimizations
+#
+# ARM64 Linux:
+# - NEON SIMD support
+# - NUMA-aware threading for multi-socket systems
+#
+# Generic fallback:
+# - Pure C++ implementation without SIMD
+# - OpenMP for basic parallelization
