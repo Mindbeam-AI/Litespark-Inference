@@ -16,6 +16,9 @@ from pathlib import Path
 import psutil
 import platform
 from typing import Dict, List, Tuple
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.cpu_ops import get_cpu_info, detect_simd_support
 from src.cpu_ops.matmul_free_cpu import matmul_free_cpu, weight_quant_cpu

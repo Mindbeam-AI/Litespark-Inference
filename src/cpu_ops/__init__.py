@@ -22,6 +22,8 @@ from .simd import (
     SIMDCapabilities
 )
 
+from .setup_extensions import get_cpu_kernels
+
 __all__ = [
     'matmul_free_cpu',
     'get_cpu_info', 
@@ -29,7 +31,8 @@ __all__ = [
     'CPUMatMulFreeLinear',
     'detect_simd_support',
     'get_simd_width',
-    'SIMDCapabilities'
+    'SIMDCapabilities',
+    'get_cpu_kernels'
 ]
 
 # Version info

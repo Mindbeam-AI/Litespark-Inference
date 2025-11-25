@@ -11,6 +11,7 @@ import numpy as np
 import platform
 import os
 from typing import Optional, Tuple, Dict, Any
+from .simd import detect_simd_support
 
 # Try to import CPU-optimized kernels (C++ extensions)
 try:
@@ -33,31 +34,20 @@ def get_cpu_info() -> Dict[str, Any]:
         'cpu_count': os.cpu_count(),
     }
     
-    # Detect specific CPU features
-    if info['system'] == 'Darwin' and 'arm' in info['platform'].lower():
-        info['is_apple_silicon'] = True
-        info['simd_support'] = 'NEON'
-    elif 'x86' in info['platform'] or 'amd64' in info['platform']:
-        info['is_apple_silicon'] = False
-        # TODO: Detect AVX2/AVX-512 support
-        info['simd_support'] = 'AVX2'  # Default assumption
-    else:
-        info['is_apple_silicon'] = False
-        info['simd_support'] = 'generic'
-    
     return info
 
 
+from .simd import detect_simd_support
 def get_optimal_implementation() -> str:
     """Select the best CPU implementation based on hardware."""
-    cpu_info = get_cpu_info()
+    simd_caps = detect_simd_support()
     
     if not HAS_OPTIMIZED_KERNELS:
         return 'python_fallback'
     
-    if cpu_info['is_apple_silicon']:
+    if simd_caps.has_neon:
         return 'arm64_neon'
-    elif cpu_info['simd_support'] == 'AVX2':
+    elif simd_caps.has_avx2:
         return 'x86_64_avx2'
     else:
         return 'generic_cpp'
@@ -174,22 +164,24 @@ def matmul_free_cpu_optimized(x: torch.Tensor, w: torch.Tensor, bias: Optional[t
     # Call appropriate optimized kernel based on architecture
     impl = get_optimal_implementation()
 
+    bias_tensor = bias if bias is not None else torch.empty(0)
+
     if impl == 'arm64_neon':
         cpu_kernels.matmul_free_neon(
-            x_contig.data_ptr(), w_contig.data_ptr(), y.data_ptr(),
-            bias.data_ptr() if bias is not None else None,
+            x_contig, w_contig, y,
+            bias_tensor,
             M, N, K, num_threads
         )
     elif impl == 'x86_64_avx2':
         cpu_kernels.matmul_free_avx2(
-            x_contig.data_ptr(), w_contig.data_ptr(), y.data_ptr(),
-            bias.data_ptr() if bias is not None else None,
+            x_contig, w_contig, y,
+            bias_tensor,
             M, N, K, num_threads
         )
     else:  # generic_cpp
         cpu_kernels.matmul_free_generic(
-            x_contig.data_ptr(), w_contig.data_ptr(), y.data_ptr(),
-            bias.data_ptr() if bias is not None else None,
+            x_contig, w_contig, y,
+            bias_tensor,
             M, N, K, num_threads
         )
 
@@ -237,10 +229,6 @@ class CPUMatMulFreeLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
         
-        # Store CPU info for optimization
-        self.cpu_info = get_cpu_info()
-        self.implementation = get_optimal_implementation()
-        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Quantize weights to ternary values
         w_ternary = weight_quant_cpu(self.weight)
@@ -250,4 +238,4 @@ class CPUMatMulFreeLinear(nn.Module):
     
     def extra_repr(self) -> str:
         return f'in_features={self.in_features}, out_features={self.out_features}, ' \
-               f'bias={self.bias is not None}, implementation={self.implementation}'
+               f'bias={self.bias is not None}'

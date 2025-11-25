@@ -1,0 +1,139 @@
+{
+  "system_info": {
+    "cpu_info": {
+      "platform": "arm64",
+      "processor": "arm",
+      "system": "Darwin",
+      "architecture": "64bit",
+      "cpu_count": 10
+    },
+    "simd_capabilities": {
+      "architecture": "arm64",
+      "has_sse": false,
+      "has_avx": false,
+      "has_avx2": false,
+      "has_avx512": false,
+      "has_neon": true,
+      "vector_width": 4,
+      "optimal_block_size": 64
+    },
+    "memory_gb": 16.0,
+    "timestamp": "2025-11-24 13:51:10"
+  },
+  "benchmark_results": {
+    "model_sizes": {
+      "single_token": {
+        "dimensions": [
+          1,
+          1024,
+          1024
+        ],
+        "pytorch_time": 1.732420000001511e-05,
+        "pytorch_std": 1.2638632679071758e-06,
+        "matmul_free_time": 8.71766199999513e-05,
+        "matmul_free_std": 8.344486701774193e-06,
+        "speedup": 0.19872530043060613,
+        "pytorch_gflops": 121.05332425151931,
+        "matmul_free_gflops": 12.028179115003377,
+        "memory_reduction": 3.9767441860465116
+      },
+      "small_batch": {
+        "dimensions": [
+          32,
+          1024,
+          1024
+        ],
+        "pytorch_time": 0.00011241759999993661,
+        "pytorch_std": 3.714922927875049e-06,
+        "matmul_free_time": 0.0009352658400000636,
+        "matmul_free_std": 0.00011155528976244212,
+        "speedup": 0.12019855231741274,
+        "pytorch_gflops": 596.9604759400471,
+        "matmul_free_gflops": 35.87689249935368,
+        "memory_reduction": 3.4
+      },
+      "medium_batch": {
+        "dimensions": [
+          128,
+          1024,
+          1024
+        ],
+        "pytorch_time": 0.0002351141400000145,
+        "pytorch_std": 5.378638794446836e-06,
+        "matmul_free_time": 0.0019174784200000161,
+        "matmul_free_std": 8.298246919958752e-05,
+        "speedup": 0.12261631606785568,
+        "pytorch_gflops": 1141.7239983949219,
+        "matmul_free_gflops": 69.99699532472384,
+        "memory_reduction": 2.5
+      },
+      "large_batch": {
+        "dimensions": [
+          512,
+          1024,
+          1024
+        ],
+        "pytorch_time": 0.0007458840999999516,
+        "pytorch_std": 2.0313338497825524e-05,
+        "matmul_free_time": 0.007541856599999956,
+        "matmul_free_std": 0.00018955201695459715,
+        "speedup": 0.0988992683843864,
+        "pytorch_gflops": 1439.5558559299893,
+        "matmul_free_gflops": 71.18551047496754,
+        "memory_reduction": 1.6
+      },
+      "wide_layer": {
+        "dimensions": [
+          128,
+          4096,
+          1024
+        ],
+        "pytorch_time": 0.000921670019999965,
+        "pytorch_std": 3.054777146863909e-05,
+        "matmul_free_time": 0.011162447539999985,
+        "matmul_free_std": 0.001359472434993354,
+        "speedup": 0.08256881089001439,
+        "pytorch_gflops": 1164.9959320582443,
+        "matmul_free_gflops": 48.09616440087662,
+        "memory_reduction": 2.8461538461538463
+      },
+      "deep_layer": {
+        "dimensions": [
+          128,
+          1024,
+          4096
+        ],
+        "pytorch_time": 0.0009636450400000207,
+        "pytorch_std": 2.9926377842993714e-05,
+        "matmul_free_time": 0.010205299919999983,
+        "matmul_free_std": 0.000692153867382541,
+        "speedup": 0.0944259402030413,
+        "pytorch_gflops": 1114.2503509383257,
+        "matmul_free_gflops": 52.60706850446007,
+        "memory_reduction": 2.8461538461538463
+      },
+      "square_large": {
+        "dimensions": [
+          256,
+          2048,
+          2048
+        ],
+        "pytorch_time": 0.0014883315000000863,
+        "pytorch_std": 2.0144774635881965e-05,
+        "matmul_free_time": 0.019725443439999994,
+        "matmul_free_std": 0.0008138306434807025,
+        "speedup": 0.07545237218758753,
+        "pytorch_gflops": 1442.8799282954608,
+        "matmul_free_gflops": 54.43435668587435,
+        "memory_reduction": 2.5
+      }
+    },
+    "threading": {
+      "1_threads": 0.01355859584999992,
+      "2_threads": 0.007115750000000176,
+      "4_threads": 0.003902864550000196,
+      "5_threads": 0.003673879149999859,
+      "10_threads": 0.002768045850000167
+    }
+  }
+}
