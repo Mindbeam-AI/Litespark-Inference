@@ -1,6 +1,6 @@
 /*
  * AVX2-Optimized MatMul-Free Kernel for x86_64
- * 
+ *
  * Implements true MatMul-free operations using only addition/subtraction
  * for ternary weights {-1, 0, 1}, optimized with AVX2 instructions.
  */
@@ -9,111 +9,177 @@
 #include <cstring>
 #include <algorithm>
 #include <omp.h>
-
-extern "C" {
+#include <torch/extension.h>
 
 /**
- * AVX2-optimized MatMul-free kernel
- * 
+ * Horizontal sum of __m256 vector
+ */
+inline float hsum_avx(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(sum);
+    __m128 sums = _mm_add_ps(sum, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_cvtss_f32(sums);
+}
+
+/**
+ * AVX2-optimized MatMul-free kernel with output blocking
+ *
  * Computes: y[m,n] = sum(x[m,k] where w[n,k]==1) - sum(x[m,k] where w[n,k]==-1)
- * 
- * @param x Input matrix [M, K] (row-major)
- * @param w Ternary weight matrix [N, K] (row-major, values in {-1, 0, 1})
- * @param y Output matrix [M, N] (row-major)
- * @param bias Optional bias vector [N]
+ *
+ * Key optimizations:
+ * - 16-way output blocking (optimal for AVX2's 8-wide SIMD)
+ * - _mm256_blendv_ps for hardware predication
+ * - Prefetching for memory latency hiding
+ * - Sequential memory access patterns
+ *
+ * @param x_tensor Input matrix [M, K] (row-major)
+ * @param w_tensor Ternary weight matrix [N, K] (row-major, values in {-1, 0, 1})
+ * @param y_tensor Output matrix [M, N] (row-major)
+ * @param bias_tensor Optional bias vector [N]
  * @param M Number of input rows
  * @param N Number of output features
  * @param K Number of input features
  * @param num_threads Number of OpenMP threads to use
  */
 void matmul_free_avx2(
-    const float* x,
-    const float* w,
-    float* y,
-    const float* bias,
+    torch::Tensor x_tensor,
+    torch::Tensor w_tensor,
+    torch::Tensor y_tensor,
+    torch::Tensor bias_tensor,
     int M, int N, int K,
     int num_threads
 ) {
-    // Set number of threads
+    const float* x = x_tensor.data_ptr<float>();
+    const float* w = w_tensor.data_ptr<float>();
+    float* y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    // AVX2: 8-wide SIMD, 16-way output blocking (2x NEON's 12-way)
+    const int K_SIMD = 8;
+    const int K_SIMD_END = (K / K_SIMD) * K_SIMD;
+    const int N_BLOCK = 16;  // Process 16 outputs together
+    const int K_PREFETCH = 64;  // Prefetch distance
+
     omp_set_num_threads(num_threads);
-    
-    // Process 8 output features at a time (AVX2 width)
-    const int N_BLOCK = 8;
-    const int K_BLOCK = 32;  // Process K in blocks for better cache usage
-    
-    #pragma omp parallel for
+
+    // Parallelize over output rows with dynamic scheduling
+    #pragma omp parallel for schedule(dynamic, 8)
     for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n += N_BLOCK) {
-            // Handle remaining features if N is not divisible by N_BLOCK
-            int n_end = std::min(n + N_BLOCK, N);
-            int n_width = n_end - n;
-            
-            // Initialize accumulators for positive and negative sums
-            __m256 sum_pos[1] = {_mm256_setzero_ps()};
-            __m256 sum_neg[1] = {_mm256_setzero_ps()};
-            
-            // Process K dimension in blocks
-            for (int k = 0; k < K; k += K_BLOCK) {
-                int k_end = std::min(k + K_BLOCK, K);
-                
-                for (int kk = k; kk < k_end; kk++) {
-                    // Load input value (broadcast to all lanes)
-                    __m256 x_val = _mm256_set1_ps(x[m * K + kk]);
-                    
-                    // Load weights for current output features
-                    __m256 w_vals;
-                    if (n_width == N_BLOCK) {
-                        w_vals = _mm256_loadu_ps(&w[n * K + kk * N + n]);
-                    } else {
-                        // Handle partial load for remaining features
-                        float w_temp[8] = {0};
-                        for (int i = 0; i < n_width; i++) {
-                            w_temp[i] = w[(n + i) * K + kk];
-                        }
-                        w_vals = _mm256_loadu_ps(w_temp);
+        const float* x_row = x + m * K;
+        float* y_row = y + m * N;
+
+        // Process N_BLOCK outputs together for better instruction-level parallelism
+        int n = 0;
+        for (; n <= N - N_BLOCK; n += N_BLOCK) {
+            // 16 separate positive/negative accumulators (32 total)
+            __m256 sum_pos[N_BLOCK], sum_neg[N_BLOCK];
+            for (int i = 0; i < N_BLOCK; i++) {
+                sum_pos[i] = _mm256_setzero_ps();
+                sum_neg[i] = _mm256_setzero_ps();
+            }
+
+            __m256 zero = _mm256_setzero_ps();
+
+            // SIMD loop over K dimension
+            for (int k = 0; k < K_SIMD_END; k += K_SIMD) {
+                // Load input once per K iteration
+                __m256 x_vals = _mm256_loadu_ps(x_row + k);
+
+                // Prefetch future data
+                if (k + K_PREFETCH < K) {
+                    _mm_prefetch((const char*)(x_row + k + K_PREFETCH), _MM_HINT_T0);
+                }
+
+                // Process all N_BLOCK outputs with this input
+                for (int i = 0; i < N_BLOCK; i++) {
+                    const float* w_row = w + (n + i) * K;
+
+                    // Prefetch weight data
+                    if (k + K_PREFETCH < K) {
+                        _mm_prefetch((const char*)(w_row + k + K_PREFETCH), _MM_HINT_T0);
                     }
-                    
+
+                    // Load 8 weight values
+                    __m256 w_vals = _mm256_loadu_ps(w_row + k);
+
                     // Create masks for positive and negative weights
-                    __m256 zero = _mm256_setzero_ps();
-                    __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);
-                    __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);
-                    
-                    // Accumulate: add where weight > 0, subtract where weight < 0
-                    sum_pos[0] = _mm256_fmadd_ps(_mm256_and_ps(mask_pos, x_val), 
-                                                _mm256_set1_ps(1.0f), sum_pos[0]);
-                    sum_neg[0] = _mm256_fmadd_ps(_mm256_and_ps(mask_neg, x_val), 
-                                                _mm256_set1_ps(1.0f), sum_neg[0]);
+                    __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);  // w > 0
+                    __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);  // w < 0
+
+                    // TRUE matmul-free: conditional accumulation with hardware predication
+                    // _mm256_blendv_ps(a, b, mask): select b if mask bit is set, else a
+                    sum_pos[i] = _mm256_add_ps(sum_pos[i], _mm256_blendv_ps(zero, x_vals, mask_pos));
+                    sum_neg[i] = _mm256_add_ps(sum_neg[i], _mm256_blendv_ps(zero, x_vals, mask_neg));
                 }
             }
-            
-            // Compute final result: sum_pos - sum_neg
-            __m256 result = _mm256_sub_ps(sum_pos[0], sum_neg[0]);
-            
-            // Add bias if provided
-            if (bias != nullptr) {
-                __m256 bias_vals;
-                if (n_width == N_BLOCK) {
-                    bias_vals = _mm256_loadu_ps(&bias[n]);
-                } else {
-                    float bias_temp[8] = {0};
-                    for (int i = 0; i < n_width; i++) {
-                        bias_temp[i] = bias[n + i];
+
+            // Reduce and write results for this block
+            for (int i = 0; i < N_BLOCK; i++) {
+                float sum_p = hsum_avx(sum_pos[i]);
+                float sum_n = hsum_avx(sum_neg[i]);
+
+                // Handle scalar tail
+                for (int k = K_SIMD_END; k < K; k++) {
+                    float x_val = x_row[k];
+                    float w_val = w[(n + i) * K + k];
+
+                    if (w_val > 0.0f) {
+                        sum_p += x_val;
+                    } else if (w_val < 0.0f) {
+                        sum_n += x_val;
                     }
-                    bias_vals = _mm256_loadu_ps(bias_temp);
                 }
-                result = _mm256_add_ps(result, bias_vals);
+
+                float result = sum_p - sum_n;
+                if (bias != nullptr) {
+                    result += bias[n + i];
+                }
+                y_row[n + i] = result;
             }
-            
-            // Store result
-            if (n_width == N_BLOCK) {
-                _mm256_storeu_ps(&y[m * N + n], result);
-            } else {
-                float result_temp[8];
-                _mm256_storeu_ps(result_temp, result);
-                for (int i = 0; i < n_width; i++) {
-                    y[m * N + n + i] = result_temp[i];
+        }
+
+        // Handle remaining outputs (scalar tail)
+        for (; n < N; n++) {
+            const float* w_row = w + n * K;
+
+            __m256 sum_pos_vec = _mm256_setzero_ps();
+            __m256 sum_neg_vec = _mm256_setzero_ps();
+            __m256 zero = _mm256_setzero_ps();
+
+            for (int k = 0; k < K_SIMD_END; k += K_SIMD) {
+                __m256 x_vals = _mm256_loadu_ps(x_row + k);
+                __m256 w_vals = _mm256_loadu_ps(w_row + k);
+
+                __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);
+                __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);
+
+                sum_pos_vec = _mm256_add_ps(sum_pos_vec, _mm256_blendv_ps(zero, x_vals, mask_pos));
+                sum_neg_vec = _mm256_add_ps(sum_neg_vec, _mm256_blendv_ps(zero, x_vals, mask_neg));
+            }
+
+            float sum_pos = hsum_avx(sum_pos_vec);
+            float sum_neg = hsum_avx(sum_neg_vec);
+
+            for (int k = K_SIMD_END; k < K; k++) {
+                float x_val = x_row[k];
+                float w_val = w_row[k];
+
+                if (w_val > 0.0f) {
+                    sum_pos += x_val;
+                } else if (w_val < 0.0f) {
+                    sum_neg += x_val;
                 }
             }
+
+            float result = sum_pos - sum_neg;
+            if (bias != nullptr) {
+                result += bias[n];
+            }
+            y_row[n] = result;
         }
     }
 }
@@ -128,4 +194,7 @@ bool has_avx2_support() {
     return (cpuinfo[1] & (1 << 5)) != 0;  // Check AVX2 bit
 }
 
-} // extern "C"
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_free_avx2", &matmul_free_avx2, "AVX2-optimized MatMul-free kernel");
+    m.def("has_avx2_support", &has_avx2_support, "Check if AVX2 is supported");
+}

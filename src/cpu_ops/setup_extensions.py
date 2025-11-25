@@ -19,33 +19,39 @@ KERNELS_DIR = CURRENT_DIR / "kernels"
 
 def get_compiler_flags():
     """Get appropriate compiler flags for the current platform."""
-    flags = ['-O3', '-fopenmp']
-    
+    flags = ['-O3']
+
     system = platform.system()
     machine = platform.machine().lower()
-    
+
+    simd_caps = detect_simd_support()
+    if simd_caps.architecture == 'x86_64' and simd_caps.has_avx2:
+        flags.append('-DHAS_AVX2_SUPPORT')
+    elif simd_caps.architecture == 'arm64' and simd_caps.has_neon:
+        flags.append('-DHAS_NEON_SUPPORT')
+
     if system == 'Darwin':
-        # macOS specific flags
-        flags.extend(['-std=c++14', '-mmacosx-version-min=10.9'])
-        
+        # macOS specific flags - use Xpreprocessor for OpenMP with clang
+        flags.extend(['-Xpreprocessor', '-fopenmp', '-std=c++17', '-mmacosx-version-min=10.9'])
+
         if 'arm' in machine:
             # Apple Silicon
             flags.extend(['-mcpu=apple-m1', '-mtune=native'])
         else:
             # Intel Mac
             flags.extend(['-march=native', '-mtune=native'])
-            
+
     elif system == 'Linux':
-        # Linux specific flags
-        flags.extend(['-std=c++14', '-fPIC'])
-        
+        # Linux specific flags - standard OpenMP flag
+        flags.extend(['-fopenmp', '-std=c++17', '-fPIC'])
+
         if 'x86' in machine or 'amd64' in machine:
             # x86_64 Linux
             flags.extend(['-march=native', '-mtune=native'])
         elif 'arm' in machine or 'aarch64' in machine:
             # ARM64 Linux
             flags.extend(['-mcpu=native', '-mtune=native'])
-            
+
     return flags
 
 
@@ -73,18 +79,18 @@ def get_source_files():
 
 def get_linker_flags():
     """Get appropriate linker flags for the current platform."""
-    flags = ['-fopenmp']
-    
     system = platform.system()
-    
+
     if system == 'Darwin':
-        # macOS: Use libomp from Homebrew if available
-        flags.extend(['-L/opt/homebrew/lib', '-L/usr/local/lib'])
-        
+        # macOS: Link against libomp from Homebrew
+        flags = ['-L/opt/homebrew/lib', '-L/usr/local/lib', '-lomp']
+
     elif system == 'Linux':
         # Linux: Standard OpenMP linking
-        flags.extend(['-lgomp'])
-        
+        flags = ['-fopenmp', '-lgomp']
+    else:
+        flags = []
+
     return flags
 
 

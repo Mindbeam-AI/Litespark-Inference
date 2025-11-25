@@ -14,14 +14,14 @@ This branch focuses exclusively on CPU-optimized implementations of MatMul-free 
 
 ## 🏗️ Architecture Support
 
-| Platform | ISA | SIMD | Status | Performance Gain |
-|----------|-----|------|--------|------------------|
-| Intel x86_64 | AVX2 | 8-wide | ✅ Ready | 2-3x speedup |
-| Intel x86_64 | AVX-512 | 16-wide | 🟡 Planned | 3-5x speedup |
-| Apple Silicon | ARM64+NEON | 4-wide | ✅ Ready | 2-4x speedup |
-| AMD x86_64 | AVX2 | 8-wide | ✅ Ready | 2-3x speedup |
-| ARM64 Linux | NEON | 4-wide | ✅ Ready | 1.5-2x speedup |
-| Generic | Fallback | Scalar | ✅ Ready | 1.2-1.5x speedup |
+| Platform | ISA | SIMD | Status | Expected GFLOPS | Notes |
+|----------|-----|------|--------|-----------------|-------|
+| macOS M1/M2/M3 | ARM64+NEON | 4-wide | ✅ **Tested** | **126 GFLOPS** | Optimized with 12-way blocking |
+| Intel x86_64 | AVX2 | 8-wide | ✅ **Optimized** | 200-250 GFLOPS | Needs x86_64 testing |
+| AMD x86_64 | AVX2 | 8-wide | ✅ **Optimized** | 200-250 GFLOPS | Same kernel as Intel |
+| Intel x86_64 | AVX-512 | 16-wide | 🟡 Planned | 400-500 GFLOPS | Future implementation |
+| ARM64 Linux | NEON | 4-wide | ✅ **Ready** | 150-200 GFLOPS | Needs Graviton testing |
+| Generic | Fallback | Scalar | ✅ Ready | ~10 GFLOPS | Fallback only |
 
 ## 🚀 Quick Start
 
@@ -62,21 +62,31 @@ python scripts/inference_cpu.py --model cpu_small_370M
 
 ## 📊 Performance Benchmarks
 
-### Apple Silicon M2 Pro (Example)
+### Apple Silicon M1 Pro (Measured)
 
-| Operation | PyTorch CPU | MatMul-Free CPU | Speedup | Memory |
-|-----------|-------------|-----------------|---------|---------|
-| Single Token | 2.1ms | 0.8ms | **2.6x** | **4.2x less** |
-| Batch 32 | 15.3ms | 6.2ms | **2.5x** | **4.1x less** |
-| Batch 128 | 58.7ms | 22.1ms | **2.7x** | **4.0x less** |
+**MatMul-Free Performance:** 126 GFLOPS (10 threads, N_BLOCK=12)
 
-### Intel i7-12700K (Example)
+| Matrix Size | PyTorch (AMX) | MatMul-Free (NEON) | Relative |
+|-------------|---------------|-------------------|----------|
+| 128×1024×1024 | 1,100 GFLOPS | 126 GFLOPS | 0.11x |
+| 256×1024×1024 | 1,200 GFLOPS | 126 GFLOPS | 0.11x |
+| 512×1024×1024 | 1,300 GFLOPS | 126 GFLOPS | 0.10x |
 
-| Operation | PyTorch CPU | MatMul-Free CPU | Speedup | Memory |
-|-----------|-------------|-----------------|---------|---------|
-| Single Token | 3.2ms | 1.1ms | **2.9x** | **4.3x less** |
-| Batch 32 | 22.1ms | 8.7ms | **2.5x** | **4.2x less** |
-| Batch 128 | 84.3ms | 31.2ms | **2.7x** | **4.1x less** |
+**Memory Savings:** 2.5-4x (unpacked ternary) or 16x (2-bit packed)
+
+**Why 0.1x?** Apple's AMX coprocessor gives PyTorch 10x advantage - unavoidable hardware limit.
+
+### x86_64 Intel/AMD (Expected)
+
+**Expected MatMul-Free Performance:** 200-250 GFLOPS (AVX2, 16-way blocking)
+
+| Matrix Size | PyTorch (MKL) | MatMul-Free (AVX2) | Relative |
+|-------------|---------------|-------------------|----------|
+| 128×1024×1024 | 1,200 GFLOPS | ~200 GFLOPS | 0.17x |
+| 256×1024×1024 | 1,300 GFLOPS | ~220 GFLOPS | 0.17x |
+| 512×1024×1024 | 1,400 GFLOPS | ~240 GFLOPS | 0.17x |
+
+**Status:** Kernel optimized, needs x86_64 testing (run `test_avx2_optimization.py`)
 
 ## 🔧 Configuration
 
@@ -110,19 +120,37 @@ max_threads: "auto"         # auto, number, or "all"
 numa_aware: true           # Enable NUMA awareness
 ```
 
-## 🧪 Benchmarking
+## 🧪 Benchmarking & Testing
 
-Run comprehensive benchmarks on your system:
+### Test Your Platform
 
+**macOS Apple Silicon:**
 ```bash
-# Full benchmark suite
+# Full benchmark (ARM64 NEON)
 python scripts/benchmark_cpu.py
 
-# Quick benchmark
-python scripts/benchmark_cpu.py --quick
-
-# Results saved to benchmark_results/
+# Expected: ~126 GFLOPS
 ```
+
+**Linux/Windows x86_64:**
+```bash
+# Test AVX2 optimization
+python test_avx2_optimization.py
+
+# Expected: ~200-250 GFLOPS
+```
+
+**Memory optimization analysis:**
+```bash
+# Compare unpacked vs 2-bit packed
+python benchmark_memory_optimized.py
+
+# Shows memory/performance trade-offs
+```
+
+### Results
+
+Benchmark results are saved to `benchmark_results/` directory with detailed JSON output.
 
 ## 🏛️ Architecture Details
 
@@ -138,48 +166,67 @@ Our MatMul-free approach:
 y[i,j] = Σ(x[i,k] where w[j,k]==1) - Σ(x[i,k] where w[j,k]==-1)  # Only add/subtract!
 ```
 
-### SIMD Optimization Example (AVX2)
+### SIMD Optimization Example (AVX2 - 16-way blocking)
 
 ```cpp
-// Process 8 outputs simultaneously
-__m256 sum_pos = _mm256_setzero_ps();
-__m256 sum_neg = _mm256_setzero_ps();
+const int N_BLOCK = 16;  // Process 16 outputs together
 
-for (int k = 0; k < K; k++) {
-    __m256 x_val = _mm256_set1_ps(x[k]);
-    __m256 w_vals = _mm256_loadu_ps(&weights[k]);
-    
-    __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);
-    __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);
-    
-    sum_pos = _mm256_fmadd_ps(_mm256_and_ps(mask_pos, x_val), ones, sum_pos);
-    sum_neg = _mm256_fmadd_ps(_mm256_and_ps(mask_neg, x_val), ones, sum_neg);
+for (int n = 0; n <= N - N_BLOCK; n += N_BLOCK) {
+    __m256 sum_pos[N_BLOCK], sum_neg[N_BLOCK];
+
+    for (int k = 0; k < K; k += 8) {
+        __m256 x_vals = _mm256_loadu_ps(x_row + k);  // Load once
+
+        for (int i = 0; i < N_BLOCK; i++) {
+            __m256 w_vals = _mm256_loadu_ps(w + (n+i)*K + k);
+
+            // Create masks for ternary weights
+            __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);
+            __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);
+
+            // TRUE matmul-free: hardware predication (no multiplication!)
+            sum_pos[i] = _mm256_add_ps(sum_pos[i],
+                _mm256_blendv_ps(zero, x_vals, mask_pos));
+            sum_neg[i] = _mm256_add_ps(sum_neg[i],
+                _mm256_blendv_ps(zero, x_vals, mask_neg));
+        }
+    }
 }
-
-__m256 result = _mm256_sub_ps(sum_pos, sum_neg);
 ```
+
+**Key Points:**
+- **16-way output blocking** for better instruction-level parallelism
+- **`_mm256_blendv_ps`** for hardware predication (like ARM's `vbslq_f32`)
+- **TRUE matmul-free:** Only add/subtract, no multiplication!
+- **Expected:** 200-250 GFLOPS on modern x86_64 CPUs
 
 ## 🔬 Development Status
 
 ### ✅ Completed
-- [x] CPU-optimized MatMul-free kernels
-- [x] Cross-platform SIMD detection
-- [x] AVX2 and NEON implementations
-- [x] Automatic hardware optimization
-- [x] Comprehensive benchmarking suite
-- [x] Memory usage optimization
+- [x] **ARM64 NEON kernel** - 126 GFLOPS (macOS M1/M2/M3)
+- [x] **x86_64 AVX2 kernel** - Expected 200-250 GFLOPS (needs testing)
+- [x] **Output blocking optimization** - N_BLOCK=12 (ARM), N_BLOCK=16 (AVX2)
+- [x] **Hardware predication** - `vbslq_f32` (NEON), `_mm256_blendv_ps` (AVX2)
+- [x] **OpenMP threading** - Near-linear scaling (5x with 10 threads)
+- [x] **Cross-platform SIMD detection**
+- [x] **Comprehensive benchmarking suite**
+- [x] **Memory optimization analysis** - 2.5-16x savings
 
-### 🟡 In Progress
-- [ ] CPU-optimized model classes
-- [ ] Pre-trained model conversion
-- [ ] Advanced threading strategies
-- [ ] AVX-512 implementation
+### 🟡 Ready for Testing
+- [ ] **AVX2 on Intel/AMD servers** - Run `test_avx2_optimization.py`
+- [ ] **NEON on ARM64 Linux** - Test on AWS Graviton
+- [ ] **Windows x86_64** - Test AVX2 on Windows
 
-### 🔮 Planned
-- [ ] Metal Performance Shaders (Apple)
-- [ ] Intel MKL integration
-- [ ] ARM SVE support (future ARM CPUs)
-- [ ] WebAssembly compilation
+### 🔮 Future Priorities
+- [ ] **AVX-512 implementation** - 400-500 GFLOPS potential
+- [ ] **ARM SVE/SVE2** - Scalable vector extensions
+- [ ] **GPU implementations** - CUDA/Metal
+- [ ] **Specialized hardware** - FPGA/ASIC research
+
+### 📚 Documentation
+- [x] **OPTIMIZATION_RESULTS.md** - macOS ARM64 results
+- [x] **AVX2_OPTIMIZATION.md** - x86_64 optimization guide
+- [x] **ARCHITECTURE_ROADMAP.md** - Multi-platform strategy
 
 ## 🤝 Contributing
 

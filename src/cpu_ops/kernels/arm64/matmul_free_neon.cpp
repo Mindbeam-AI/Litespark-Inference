@@ -1,152 +1,141 @@
 /*
- * NEON-Optimized MatMul-Free Kernel for ARM64 (Apple Silicon)
- * 
- * Implements true MatMul-free operations using only addition/subtraction
- * for ternary weights {-1, 0, 1}, optimized with ARM NEON instructions.
+ * Optimized NEON MatMul-Free Kernel
+ *
+ * TRUE MatMul-free with optimal 12-way blocking
+ * Array-based for clean code (compiler unrolls automatically)
  */
 
 #include <arm_neon.h>
 #include <cstring>
 #include <algorithm>
+#include <torch/extension.h>
 #include <omp.h>
 
-extern "C" {
+#define PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
 
-/**
- * NEON-optimized MatMul-free kernel for ARM64
- * 
- * Computes: y[m,n] = sum(x[m,k] where w[n,k]==1) - sum(x[m,k] where w[n,k]==-1)
- * 
- * @param x Input matrix [M, K] (row-major)
- * @param w Ternary weight matrix [N, K] (row-major, values in {-1, 0, 1})
- * @param y Output matrix [M, N] (row-major)
- * @param bias Optional bias vector [N]
- * @param M Number of input rows
- * @param N Number of output features
- * @param K Number of input features
- * @param num_threads Number of threads to use
- */
 void matmul_free_neon(
-    const float* x,
-    const float* w,
-    float* y,
-    const float* bias,
+    torch::Tensor x_tensor,
+    torch::Tensor w_tensor,
+    torch::Tensor y_tensor,
+    torch::Tensor bias_tensor,
     int M, int N, int K,
     int num_threads
 ) {
-    // Process 4 output features at a time (NEON width)
-    const int N_BLOCK = 4;
-    const int K_BLOCK = 32;  // Process K in blocks for better cache usage
-    
-    #pragma omp parallel for num_threads(num_threads)
+    const float* x = x_tensor.data_ptr<float>();
+    const float* w = w_tensor.data_ptr<float>();
+    float* y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_SIMD = 4;
+    const int K_SIMD_END = (K / K_SIMD) * K_SIMD;
+    const int N_BLOCK = 12;  // Optimal blocking
+    const int K_PREFETCH = 64;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(dynamic, 8)
     for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n += N_BLOCK) {
-            // Handle remaining features if N is not divisible by N_BLOCK
-            int n_end = std::min(n + N_BLOCK, N);
-            int n_width = n_end - n;
-            
-            // Initialize accumulators for positive and negative sums
+        const float* x_row = x + m * K;
+        float* y_row = y + m * N;
+
+        // Process N_BLOCK outputs together
+        int n = 0;
+        for (; n <= N - N_BLOCK; n += N_BLOCK) {
+            // N_BLOCK separate pos/neg accumulators
+            float32x4_t sum_pos[N_BLOCK], sum_neg[N_BLOCK];
+            for (int i = 0; i < N_BLOCK; i++) {
+                sum_pos[i] = vdupq_n_f32(0.0f);
+                sum_neg[i] = vdupq_n_f32(0.0f);
+            }
+            float32x4_t zero = vdupq_n_f32(0.0f);
+
+            // Main SIMD loop with prefetching
+            for (int k = 0; k < K_SIMD_END; k += K_SIMD) {
+                // Prefetch future data
+                if (k + K_PREFETCH < K) {
+                    PREFETCH(x_row + k + K_PREFETCH);
+                    for (int i = 0; i < N_BLOCK; i += 4) {
+                        PREFETCH(w + (n + i) * K + k + K_PREFETCH);
+                    }
+                }
+
+                // Load input (shared across all outputs)
+                float32x4_t x_vals = vld1q_f32(x_row + k);
+
+                // Process all N_BLOCK outputs
+                for (int i = 0; i < N_BLOCK; i++) {
+                    float32x4_t w_vals = vld1q_f32(w + (n + i) * K + k);
+
+                    // Create masks - TRUE matmul-free!
+                    uint32x4_t mask_pos = vcgtq_f32(w_vals, zero);
+                    uint32x4_t mask_neg = vcltq_f32(w_vals, zero);
+
+                    // Conditional accumulate (hardware predication)
+                    sum_pos[i] = vaddq_f32(sum_pos[i], vbslq_f32(mask_pos, x_vals, zero));
+                    sum_neg[i] = vaddq_f32(sum_neg[i], vbslq_f32(mask_neg, x_vals, zero));
+                }
+            }
+
+            // Horizontal reduction
+            float results[N_BLOCK];
+            for (int i = 0; i < N_BLOCK; i++) {
+                results[i] = vaddvq_f32(sum_pos[i]) - vaddvq_f32(sum_neg[i]);
+            }
+
+            // Scalar tail
+            for (int k = K_SIMD_END; k < K; k++) {
+                float x_val = x_row[k];
+                for (int i = 0; i < N_BLOCK; i++) {
+                    float w_val = w[(n + i) * K + k];
+                    if (w_val > 0.0f) results[i] += x_val;
+                    else if (w_val < 0.0f) results[i] -= x_val;
+                }
+            }
+
+            // Add bias and store
+            for (int i = 0; i < N_BLOCK; i++) {
+                if (bias != nullptr) {
+                    results[i] += bias[n + i];
+                }
+                y_row[n + i] = results[i];
+            }
+        }
+
+        // Handle remaining outputs (same pattern)
+        for (; n < N; n++) {
             float32x4_t sum_pos = vdupq_n_f32(0.0f);
             float32x4_t sum_neg = vdupq_n_f32(0.0f);
-            
-            // Process K dimension in blocks
-            for (int k = 0; k < K; k += K_BLOCK) {
-                int k_end = std::min(k + K_BLOCK, K);
-                
-                for (int kk = k; kk < k_end; kk++) {
-                    // Load input value (broadcast to all lanes)
-                    float32x4_t x_val = vdupq_n_f32(x[m * K + kk]);
-                    
-                    // Load weights for current output features
-                    float32x4_t w_vals;
-                    if (n_width == N_BLOCK) {
-                        // Load 4 weights directly
-                        float w_temp[4];
-                        for (int i = 0; i < 4; i++) {
-                            w_temp[i] = w[(n + i) * K + kk];
-                        }
-                        w_vals = vld1q_f32(w_temp);
-                    } else {
-                        // Handle partial load for remaining features
-                        float w_temp[4] = {0};
-                        for (int i = 0; i < n_width; i++) {
-                            w_temp[i] = w[(n + i) * K + kk];
-                        }
-                        w_vals = vld1q_f32(w_temp);
-                    }
-                    
-                    // Create masks for positive and negative weights
-                    float32x4_t zero = vdupq_n_f32(0.0f);
-                    uint32x4_t mask_pos = vcgtq_f32(w_vals, zero);  // w > 0
-                    uint32x4_t mask_neg = vcltq_f32(w_vals, zero);  // w < 0
-                    
-                    // Apply masks and accumulate
-                    float32x4_t x_pos = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(x_val), mask_pos));
-                    float32x4_t x_neg = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(x_val), mask_neg));
-                    
-                    sum_pos = vaddq_f32(sum_pos, x_pos);
-                    sum_neg = vaddq_f32(sum_neg, x_neg);
-                }
+            float32x4_t zero = vdupq_n_f32(0.0f);
+
+            for (int k = 0; k < K_SIMD_END; k += K_SIMD) {
+                float32x4_t x_vals = vld1q_f32(x_row + k);
+                float32x4_t w_vals = vld1q_f32(w + n * K + k);
+
+                uint32x4_t mask_pos = vcgtq_f32(w_vals, zero);
+                uint32x4_t mask_neg = vcltq_f32(w_vals, zero);
+
+                sum_pos = vaddq_f32(sum_pos, vbslq_f32(mask_pos, x_vals, zero));
+                sum_neg = vaddq_f32(sum_neg, vbslq_f32(mask_neg, x_vals, zero));
             }
-            
-            // Compute final result: sum_pos - sum_neg
-            float32x4_t result = vsubq_f32(sum_pos, sum_neg);
-            
-            // Add bias if provided
+
+            float result = vaddvq_f32(sum_pos) - vaddvq_f32(sum_neg);
+
+            for (int k = K_SIMD_END; k < K; k++) {
+                float x_val = x_row[k];
+                float w_val = w[n * K + k];
+                if (w_val > 0.0f) result += x_val;
+                else if (w_val < 0.0f) result -= x_val;
+            }
+
             if (bias != nullptr) {
-                float32x4_t bias_vals;
-                if (n_width == N_BLOCK) {
-                    bias_vals = vld1q_f32(&bias[n]);
-                } else {
-                    float bias_temp[4] = {0};
-                    for (int i = 0; i < n_width; i++) {
-                        bias_temp[i] = bias[n + i];
-                    }
-                    bias_vals = vld1q_f32(bias_temp);
-                }
-                result = vaddq_f32(result, bias_vals);
+                result += bias[n];
             }
-            
-            // Store result
-            if (n_width == N_BLOCK) {
-                vst1q_f32(&y[m * N + n], result);
-            } else {
-                float result_temp[4];
-                vst1q_f32(result_temp, result);
-                for (int i = 0; i < n_width; i++) {
-                    y[m * N + n + i] = result_temp[i];
-                }
-            }
+
+            y_row[n] = result;
         }
     }
 }
 
-/**
- * Check if NEON is supported (always true on ARM64)
- */
 bool has_neon_support() {
-    return true;  // NEON is mandatory on ARM64
+    return true;
 }
-
-/**
- * Apple Silicon specific optimizations
- * Uses the fact that M1/M2/M3 have very wide execution units
- */
-void matmul_free_apple_silicon(
-    const float* x,
-    const float* w,
-    float* y,
-    const float* bias,
-    int M, int N, int K,
-    int num_threads
-) {
-    // Apple Silicon has very wide execution units, so we can be more aggressive
-    // with parallelization and use larger block sizes
-    const int N_BLOCK = 8;  // Process more features at once
-    const int K_BLOCK = 64; // Larger K blocks for better cache usage
-    
-    // Use the same NEON kernel but with optimized parameters
-    matmul_free_neon(x, w, y, bias, M, N, K, num_threads);
-}
-
-} // extern "C"
