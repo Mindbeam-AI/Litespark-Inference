@@ -1,0 +1,79 @@
+Compiling CPU kernels from: ['/Users/mauriziomorri/Desktop/matmulMM-cpu/src/cpu_ops/kernels/arm64/matmul_free_neon.cpp', '/Users/mauriziomorri/Desktop/matmulMM-cpu/src/cpu_ops/kernels/generic/matmul_free_generic.cpp']
+ninja: no work to do.
+✅ CPU kernels compiled successfully!
+🚀 Starting comprehensive CPU benchmark...
+Architecture: arm64
+Vector width: 4
+
+Benchmarking single_token: 1x1024 @ 1024x1024
+  Testing PyTorch F.linear (1x1024 @ 1024x1024)...
+  Testing MatMul-free CPU (1x1024 @ 1024x1024)...
+  PyTorch: 0.01ms (151.7 GFLOPS)
+  MatMul-free: 0.18ms (5.8 GFLOPS)
+  Speedup: 0.08x
+  Memory reduction: 4.0x
+
+Benchmarking small_batch: 32x1024 @ 1024x1024
+  Testing PyTorch F.linear (32x1024 @ 1024x1024)...
+  Testing MatMul-free CPU (32x1024 @ 1024x1024)...
+  PyTorch: 0.11ms (615.3 GFLOPS)
+  MatMul-free: 1.45ms (23.1 GFLOPS)
+  Speedup: 0.08x
+  Memory reduction: 3.4x
+
+Benchmarking medium_batch: 128x1024 @ 1024x1024
+  Testing PyTorch F.linear (128x1024 @ 1024x1024)...
+  Testing MatMul-free CPU (128x1024 @ 1024x1024)...
+  PyTorch: 0.24ms (1136.6 GFLOPS)
+  MatMul-free: 5.66ms (23.7 GFLOPS)
+  Speedup: 0.04x
+  Memory reduction: 2.5x
+
+Benchmarking large_batch: 512x1024 @ 1024x1024
+  Testing PyTorch F.linear (512x1024 @ 1024x1024)...
+  Testing MatMul-free CPU (512x1024 @ 1024x1024)...
+  PyTorch: 0.74ms (1443.8 GFLOPS)
+  MatMul-free: 22.65ms (23.7 GFLOPS)
+  Speedup: 0.03x
+  Memory reduction: 1.6x
+
+Benchmarking wide_layer: 128x1024 @ 1024x4096
+  Testing PyTorch F.linear (128x1024 @ 1024x4096)...
+  Testing MatMul-free CPU (128x1024 @ 1024x4096)...
+  PyTorch: 0.92ms (1170.4 GFLOPS)
+  MatMul-free: 22.62ms (23.7 GFLOPS)
+  Speedup: 0.04x
+  Memory reduction: 2.8x
+
+Benchmarking deep_layer: 128x4096 @ 4096x1024
+  Testing PyTorch F.linear (128x4096 @ 4096x1024)...
+  Testing MatMul-free CPU (128x4096 @ 4096x1024)...
+  PyTorch: 0.97ms (1108.6 GFLOPS)
+  MatMul-free: 25.03ms (21.4 GFLOPS)
+  Speedup: 0.04x
+  Memory reduction: 2.8x
+
+Benchmarking square_large: 256x2048 @ 2048x2048
+  Testing PyTorch F.linear (256x2048 @ 2048x2048)...
+  Testing MatMul-free CPU (256x2048 @ 2048x2048)...
+  PyTorch: 1.49ms (1438.5 GFLOPS)
+  MatMul-free: 48.48ms (22.1 GFLOPS)
+  Speedup: 0.03x
+  Memory reduction: 2.5x
+
+Benchmarking threading performance...
+  Testing with 1 threads...
+    Average time: 40.64ms
+  Testing with 2 threads...
+    Average time: 20.68ms
+  Testing with 4 threads...
+    Average time: 11.25ms
+  Testing with 5 threads...
+    Average time: 10.34ms
+  Testing with 10 threads...
+    Average time: 6.27ms
+
+✅ Results saved to: benchmark_results/cpu_benchmark_arm64_20251124_134540.json
+📊 Plot saved to: benchmark_results/cpu_benchmark_arm64.png
+
+🎉 Benchmark completed!

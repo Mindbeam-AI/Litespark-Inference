@@ -38,8 +38,24 @@ def get_cpu_info() -> Dict[str, Any]:
 
 
 from .simd import detect_simd_support
-def get_optimal_implementation() -> str:
-    """Select the best CPU implementation based on hardware."""
+def get_cpu_info() -> Dict[str, Any]:
+    """Get detailed CPU information for optimization selection."""
+    info = {
+        'platform': platform.machine(),
+        'processor': platform.processor(),
+        'system': platform.system(),
+        'architecture': platform.architecture()[0],
+        'cpu_count': os.cpu_count(),
+    }
+    
+    return info
+
+
+def get_optimal_implementation(force_kernel: Optional[str] = None) -> str:
+    """Select the best CPU implementation based on hardware or a forced override."""
+    if force_kernel:
+        return force_kernel
+
     simd_caps = detect_simd_support()
     
     if not HAS_OPTIMIZED_KERNELS:
@@ -132,7 +148,7 @@ def matmul_free_cpu_python(x: torch.Tensor, w: torch.Tensor, bias: Optional[torc
     return y
 
 
-def matmul_free_cpu_optimized(x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+def matmul_free_cpu_optimized(x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor] = None, kernel: Optional[str] = None) -> torch.Tensor:
     """
     Call optimized C++ kernels for MatMul-free operations.
 
@@ -140,6 +156,7 @@ def matmul_free_cpu_optimized(x: torch.Tensor, w: torch.Tensor, bias: Optional[t
         x: Input tensor [M, K]
         w: Ternary weight tensor [N, K] with values in {-1, 0, 1}
         bias: Optional bias tensor [N]
+        kernel: Optional kernel name to force a specific implementation
 
     Returns:
         Output tensor [M, N]
@@ -162,7 +179,7 @@ def matmul_free_cpu_optimized(x: torch.Tensor, w: torch.Tensor, bias: Optional[t
     num_threads = min(torch.get_num_threads(), os.cpu_count() or 1)
 
     # Call appropriate optimized kernel based on architecture
-    impl = get_optimal_implementation()
+    impl = get_optimal_implementation(force_kernel=kernel)
 
     bias_tensor = bias if bias is not None else torch.empty(0)
 
@@ -188,7 +205,7 @@ def matmul_free_cpu_optimized(x: torch.Tensor, w: torch.Tensor, bias: Optional[t
     return y
 
 
-def matmul_free_cpu(x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+def matmul_free_cpu(x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor] = None, kernel: Optional[str] = None) -> torch.Tensor:
     """
     CPU-optimized MatMul-free operation with automatic implementation selection.
 
@@ -196,13 +213,17 @@ def matmul_free_cpu(x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tenso
         x: Input tensor [M, K]
         w: Ternary weight tensor [N, K] with values in {-1, 0, 1}
         bias: Optional bias tensor [N]
+        kernel: Optional kernel name to force a specific implementation
 
     Returns:
         Output tensor [M, N]
     """
+    if kernel == "python":
+        return matmul_free_cpu_python(x, w, bias)
+
     if HAS_OPTIMIZED_KERNELS:
         try:
-            return matmul_free_cpu_optimized(x, w, bias)
+            return matmul_free_cpu_optimized(x, w, bias, kernel=kernel)
         except Exception as e:
             print(f"Warning: Optimized kernel failed ({e}), falling back to Python implementation")
 

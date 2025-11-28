@@ -1,0 +1,11 @@
+Compiling CPU kernels from: ['/Users/mauriziomorri/Desktop/matmulMM-cpu/src/cpu_ops/kernels/arm64/matmul_free_neon.cpp', '/Users/mauriziomorri/Desktop/matmulMM-cpu/src/cpu_ops/kernels/generic/matmul_free_generic.cpp']
+[1/2] c++ -MMD -MF matmul_free_neon.o.d -DTORCH_EXTENSION_NAME=cpu_kernels -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_clang\" -DPYBIND11_STDLIB=\"_libcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1002\" -isystem /Users/mauriziomorri/Desktop/matmulMM-cpu/cpu-matmul-env/lib/python3.9/site-packages/torch/include -isystem /Users/mauriziomorri/Desktop/matmulMM-cpu/cpu-matmul-env/lib/python3.9/site-packages/torch/include/torch/csrc/api/include -isystem /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/include/python3.9 -fPIC -std=c++17 -O3 -DHAS_NEON_SUPPORT -Xpreprocessor -fopenmp -std=c++17 -mmacosx-version-min=10.9 -mcpu=apple-m1 -mtune=native -c /Users/mauriziomorri/Desktop/matmulMM-cpu/src/cpu_ops/kernels/arm64/matmul_free_neon.cpp -o matmul_free_neon.o 
+[2/2] c++ matmul_free_neon.o matmul_free_generic.o -shared -L/opt/homebrew/lib -L/usr/local/lib -lomp -L/Users/mauriziomorri/Desktop/matmulMM-cpu/cpu-matmul-env/lib/python3.9/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -undefined dynamic_lookup -o cpu_kernels.so
+FAILED: [code=1] cpu_kernels.so 
+c++ matmul_free_neon.o matmul_free_generic.o -shared -L/opt/homebrew/lib -L/usr/local/lib -lomp -L/Users/mauriziomorri/Desktop/matmulMM-cpu/cpu-matmul-env/lib/python3.9/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -undefined dynamic_lookup -o cpu_kernels.so
+duplicate symbol '_PyInit_cpu_kernels' in:
+    /Users/mauriziomorri/Library/Caches/torch_extensions/py39_cpu/cpu_kernels/matmul_free_neon.o
+    /Users/mauriziomorri/Library/Caches/torch_extensions/py39_cpu/cpu_kernels/matmul_free_generic.o
+ld: 1 duplicate symbols
+clang++: error: linker command failed with exit code 1 (use -v to see invocation)
+ninja: build stopped: subcommand failed.

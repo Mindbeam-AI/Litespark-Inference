@@ -40,6 +40,7 @@ class CPUBenchmark:
         M: int, 
         N: int, 
         K: int, 
+        kernel: str,
         num_runs: int = 100
     ) -> Dict[str, float]:
         """Benchmark a single MatMul operation size."""
@@ -75,12 +76,12 @@ class CPUBenchmark:
         
         # Warmup
         for _ in range(5):
-            _ = matmul_free_cpu(x, w_ternary)
+            _ = matmul_free_cpu(x, w_ternary, kernel=kernel)
         
         # Benchmark
         for _ in range(num_runs):
             start = time.perf_counter()
-            result_matmul_free = matmul_free_cpu(x, w_ternary)
+            result_matmul_free = matmul_free_cpu(x, w_ternary, kernel=kernel)
             end = time.perf_counter()
             times_matmul_free.append(end - start)
         
@@ -115,26 +116,35 @@ class CPUBenchmark:
         
         results = {}
         
+        kernels = ["python", "generic", "neon", "avx2"] # Add more as they are implemented
+
         for config_name, (M, N, K) in test_configs.items():
             print(f"\nBenchmarking {config_name}: {M}x{K} @ {K}x{N}")
             
-            try:
-                config_results = self.benchmark_single_operation(M, N, K, num_runs=50)
-                results[config_name] = {
-                    'dimensions': (M, N, K),
-                    **config_results
-                }
-                
-                print(f"  PyTorch: {config_results['pytorch_time']*1000:.2f}ms "
-                      f"({config_results['pytorch_gflops']:.1f} GFLOPS)")
-                print(f"  MatMul-free: {config_results['matmul_free_time']*1000:.2f}ms "
-                      f"({config_results['matmul_free_gflops']:.1f} GFLOPS)")
-                print(f"  Speedup: {config_results['speedup']:.2f}x")
-                print(f"  Memory reduction: {config_results['memory_reduction']:.1f}x")
-                
-            except Exception as e:
-                print(f"  Error: {e}")
-                results[config_name] = {'error': str(e)}
+            for kernel in kernels:
+                try:
+                    config_results = self.benchmark_single_operation(M, N, K, kernel, num_runs=50)
+                    
+                    if config_name not in results:
+                        results[config_name] = {}
+                    
+                    results[config_name][kernel] = {
+                        'dimensions': (M, N, K),
+                        **config_results
+                    }
+                    
+                    print(f"  [{kernel}] PyTorch: {config_results['pytorch_time']*1000:.2f}ms "
+                          f"({config_results['pytorch_gflops']:.1f} GFLOPS)")
+                    print(f"  [{kernel}] MatMul-free: {config_results['matmul_free_time']*1000:.2f}ms "
+                          f"({config_results['matmul_free_gflops']:.1f} GFLOPS)")
+                    print(f"  [{kernel}] Speedup: {config_results['speedup']:.2f}x")
+                    print(f"  [{kernel}] Memory reduction: {config_results['memory_reduction']:.1f}x")
+                    
+                except Exception as e:
+                    print(f"  [{kernel}] Error: {e}")
+                    if config_name not in results:
+                        results[config_name] = {}
+                    results[config_name][kernel] = {'error': str(e)}
         
         return results
     
@@ -217,55 +227,59 @@ class CPUBenchmark:
         model_results = self.results['model_sizes']
         
         # Extract data for plotting
-        configs = []
-        speedups = []
-        memory_reductions = []
+        kernels = list(next(iter(model_results.values())).keys())
         
-        for config_name, results in model_results.items():
-            if 'error' not in results:
-                configs.append(config_name)
-                speedups.append(results['speedup'])
-                memory_reductions.append(results['memory_reduction'])
-        
-        # Create plots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # Speedup plot
-        bars1 = ax1.bar(configs, speedups, color='skyblue', alpha=0.7)
-        ax1.set_title('MatMul-Free vs PyTorch CPU Speedup')
-        ax1.set_ylabel('Speedup (x)')
-        ax1.set_xlabel('Test Configuration')
-        ax1.tick_params(axis='x', rotation=45)
-        ax1.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='No speedup')
-        ax1.legend()
-        
-        # Add value labels on bars
-        for bar, speedup in zip(bars1, speedups):
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width()/2., height + 0.05,
-                    f'{speedup:.1f}x', ha='center', va='bottom')
-        
-        # Memory reduction plot
-        bars2 = ax2.bar(configs, memory_reductions, color='lightgreen', alpha=0.7)
-        ax2.set_title('Memory Usage Reduction')
-        ax2.set_ylabel('Memory Reduction (x)')
-        ax2.set_xlabel('Test Configuration')
-        ax2.tick_params(axis='x', rotation=45)
-        
-        # Add value labels on bars
-        for bar, reduction in zip(bars2, memory_reductions):
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                    f'{reduction:.1f}x', ha='center', va='bottom')
-        
-        plt.tight_layout()
-        
-        # Save plot
-        plot_path = self.output_dir / f"cpu_benchmark_{self.simd_caps.architecture}.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"📊 Plot saved to: {plot_path}")
-        
-        plt.show()
+        for kernel in kernels:
+            configs = []
+            speedups = []
+            memory_reductions = []
+            
+            for config_name, results in model_results.items():
+                if kernel in results and 'error' not in results[kernel]:
+                    configs.append(config_name)
+                    speedups.append(results[kernel]['speedup'])
+                    memory_reductions.append(results[kernel]['memory_reduction'])
+            
+            # Create plots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            fig.suptitle(f"Benchmark Results for Kernel: {kernel.upper()}", fontsize=16)
+            
+            # Speedup plot
+            bars1 = ax1.bar(configs, speedups, color='skyblue', alpha=0.7)
+            ax1.set_title('MatMul-Free vs PyTorch CPU Speedup')
+            ax1.set_ylabel('Speedup (x)')
+            ax1.set_xlabel('Test Configuration')
+            ax1.tick_params(axis='x', rotation=45)
+            ax1.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='No speedup')
+            ax1.legend()
+            
+            # Add value labels on bars
+            for bar, speedup in zip(bars1, speedups):
+                height = bar.get_height()
+                ax1.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                        f'{speedup:.1f}x', ha='center', va='bottom')
+            
+            # Memory reduction plot
+            bars2 = ax2.bar(configs, memory_reductions, color='lightgreen', alpha=0.7)
+            ax2.set_title('Memory Usage Reduction')
+            ax2.set_ylabel('Memory Reduction (x)')
+            ax2.set_xlabel('Test Configuration')
+            ax2.tick_params(axis='x', rotation=45)
+            
+            # Add value labels on bars
+            for bar, reduction in zip(bars2, memory_reductions):
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                        f'{reduction:.1f}x', ha='center', va='bottom')
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            
+            # Save plot
+            plot_path = self.output_dir / f"cpu_benchmark_{self.simd_caps.architecture}_{kernel}.png"
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"📊 Plot for {kernel} saved to: {plot_path}")
+            
+            plt.show()
     
     def run_full_benchmark(self):
         """Run the complete benchmark suite."""

@@ -1,0 +1,468 @@
+{
+  "system_info": {
+    "cpu_info": {
+      "platform": "arm64",
+      "processor": "arm",
+      "system": "Darwin",
+      "architecture": "64bit",
+      "cpu_count": 10
+    },
+    "simd_capabilities": {
+      "architecture": "arm64",
+      "has_sse": false,
+      "has_avx": false,
+      "has_avx2": false,
+      "has_avx512": false,
+      "has_neon": true,
+      "vector_width": 4,
+      "optimal_block_size": 64
+    },
+    "memory_gb": 16.0,
+    "timestamp": "2025-11-26 12:15:04"
+  },
+  "benchmark_results": {
+    "model_sizes": {
+      "single_token": {
+        "python": {
+          "dimensions": [
+            1,
+            1024,
+            1024
+          ],
+          "pytorch_time": 2.142995999999897e-05,
+          "pytorch_std": 2.1553819147281315e-06,
+          "matmul_free_time": 0.01017073834,
+          "matmul_free_std": 0.00010827678476803432,
+          "speedup": 0.0021070210719823677,
+          "pytorch_gflops": 97.86075195661125,
+          "matmul_free_gflops": 0.10309733324630982,
+          "memory_reduction": 3.9767441860465116
+        },
+        "generic": {
+          "dimensions": [
+            1,
+            1024,
+            1024
+          ],
+          "pytorch_time": 1.3885959999999642e-05,
+          "pytorch_std": 1.354648278473335e-06,
+          "matmul_free_time": 0.0001010299799999892,
+          "matmul_free_std": 6.214005704817966e-06,
+          "speedup": 0.13744395475482749,
+          "pytorch_gflops": 151.02679253001264,
+          "matmul_free_gflops": 10.378859819630886,
+          "memory_reduction": 3.9767441860465116
+        },
+        "neon": {
+          "dimensions": [
+            1,
+            1024,
+            1024
+          ],
+          "pytorch_time": 1.4186580000012939e-05,
+          "pytorch_std": 1.6172015469929459e-06,
+          "matmul_free_time": 0.0001014616800000212,
+          "matmul_free_std": 4.3156316081312004e-06,
+          "speedup": 0.1398220490732065,
+          "pytorch_gflops": 147.82646698486087,
+          "matmul_free_gflops": 10.334699760537978,
+          "memory_reduction": 3.9767441860465116
+        },
+        "avx2": {
+          "dimensions": [
+            1,
+            1024,
+            1024
+          ],
+          "pytorch_time": 1.4119099999954087e-05,
+          "pytorch_std": 4.3016221359030315e-07,
+          "matmul_free_time": 9.80166799999882e-05,
+          "matmul_free_std": 2.269470497207806e-06,
+          "speedup": 0.14404793143326,
+          "pytorch_gflops": 148.53298014794282,
+          "matmul_free_gflops": 10.69793426996432,
+          "memory_reduction": 3.9767441860465116
+        }
+      },
+      "small_batch": {
+        "python": {
+          "dimensions": [
+            32,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.00011003506000001551,
+          "pytorch_std": 3.3945326771456864e-06,
+          "matmul_free_time": 0.32897286162000017,
+          "matmul_free_std": 0.0046292294942509105,
+          "speedup": 0.0003344806603747093,
+          "pytorch_gflops": 609.8861944546634,
+          "matmul_free_gflops": 0.10199756853730707,
+          "memory_reduction": 3.4
+        },
+        "generic": {
+          "dimensions": [
+            32,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.00010993084000006092,
+          "pytorch_std": 1.8677433263871264e-06,
+          "matmul_free_time": 0.0015732216199999983,
+          "matmul_free_std": 0.00010941873522667093,
+          "speedup": 0.06987625812062069,
+          "pytorch_gflops": 610.4643974335391,
+          "matmul_free_gflops": 21.32848390425758,
+          "memory_reduction": 3.4
+        },
+        "neon": {
+          "dimensions": [
+            32,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.00010719577999978468,
+          "pytorch_std": 1.070636918700443e-06,
+          "matmul_free_time": 0.0014775115999999854,
+          "matmul_free_std": 7.20416176021238e-05,
+          "speedup": 0.07255156575405956,
+          "pytorch_gflops": 626.0401668809612,
+          "matmul_free_gflops": 22.710097166073236,
+          "memory_reduction": 3.4
+        },
+        "avx2": {
+          "dimensions": [
+            32,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.00010813074000004975,
+          "pytorch_std": 2.8146276045117035e-06,
+          "matmul_free_time": 0.0014745316800002684,
+          "matmul_free_std": 6.801530419602849e-05,
+          "speedup": 0.07333225963651731,
+          "pytorch_gflops": 620.6270668264096,
+          "matmul_free_gflops": 22.75599260098223,
+          "memory_reduction": 3.4
+        }
+      },
+      "medium_batch": {
+        "python": {
+          "dimensions": [
+            128,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.0002353282600000739,
+          "pytorch_std": 7.5161895262574926e-06,
+          "matmul_free_time": 1.3413985183400003,
+          "matmul_free_std": 0.005811715434851758,
+          "speedup": 0.00017543500815201134,
+          "pytorch_gflops": 1140.6851688782117,
+          "matmul_free_gflops": 0.10005805595051374,
+          "memory_reduction": 2.5
+        },
+        "generic": {
+          "dimensions": [
+            128,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.00023280243999863616,
+          "pytorch_std": 5.248680040741251e-06,
+          "matmul_free_time": 0.0030665717200000133,
+          "matmul_free_std": 0.0002850721600923139,
+          "speedup": 0.07591618956123261,
+          "pytorch_gflops": 1153.0611792624366,
+          "matmul_free_gflops": 43.76800553029277,
+          "memory_reduction": 2.5
+        },
+        "neon": {
+          "dimensions": [
+            128,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.000231930879998572,
+          "pytorch_std": 1.55412445695171e-06,
+          "matmul_free_time": 0.003169657539999662,
+          "matmul_free_std": 0.0005132269631700167,
+          "speedup": 0.07317222036504194,
+          "pytorch_gflops": 1157.394202969664,
+          "matmul_free_gflops": 42.34455183445916,
+          "memory_reduction": 2.5
+        },
+        "avx2": {
+          "dimensions": [
+            128,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.00022824915999933637,
+          "pytorch_std": 3.228429222535184e-06,
+          "matmul_free_time": 0.002864621679999857,
+          "matmul_free_std": 2.2384124513164066e-05,
+          "speedup": 0.0796786401474654,
+          "pytorch_gflops": 1176.0632810249135,
+          "matmul_free_gflops": 46.85356147971577,
+          "memory_reduction": 2.5
+        }
+      },
+      "large_batch": {
+        "python": {
+          "dimensions": [
+            512,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.0007309282600004962,
+          "pytorch_std": 1.7683811105471657e-05,
+          "matmul_free_time": 5.378356094199998,
+          "matmul_free_std": 0.039674689572946814,
+          "speedup": 0.00013590179735193192,
+          "pytorch_gflops": 1469.0112323735725,
+          "matmul_free_gflops": 0.09982063340487252,
+          "memory_reduction": 1.6
+        },
+        "generic": {
+          "dimensions": [
+            512,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.0007306809199997133,
+          "pytorch_std": 7.08534027166309e-06,
+          "matmul_free_time": 0.011397735780001313,
+          "matmul_free_std": 4.4265347261066023e-05,
+          "speedup": 0.06410755031554426,
+          "pytorch_gflops": 1469.508501741665,
+          "matmul_free_gflops": 47.10329510726192,
+          "memory_reduction": 1.6
+        },
+        "neon": {
+          "dimensions": [
+            512,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.0007440500199970756,
+          "pytorch_std": 4.66932683904985e-06,
+          "matmul_free_time": 0.011598204940002006,
+          "matmul_free_std": 0.0005104020674755087,
+          "speedup": 0.0641521704303448,
+          "pytorch_gflops": 1443.1043547370919,
+          "matmul_free_gflops": 46.289138256933335,
+          "memory_reduction": 1.6
+        },
+        "avx2": {
+          "dimensions": [
+            512,
+            1024,
+            1024
+          ],
+          "pytorch_time": 0.0007289116199967793,
+          "pytorch_std": 4.515775718669478e-06,
+          "matmul_free_time": 0.011681989159999375,
+          "matmul_free_std": 0.0005213367808074225,
+          "speedup": 0.062396190410162845,
+          "pytorch_gflops": 1473.0754655890166,
+          "matmul_free_gflops": 45.95714861971578,
+          "memory_reduction": 1.6
+        }
+      },
+      "wide_layer": {
+        "python": {
+          "dimensions": [
+            128,
+            4096,
+            1024
+          ],
+          "pytorch_time": 0.0008872307999968143,
+          "pytorch_std": 9.87329876454774e-06,
+          "matmul_free_time": 5.453906265020005,
+          "matmul_free_std": 0.011383669423385133,
+          "speedup": 0.00016267804338466384,
+          "pytorch_gflops": 1210.2170303418854,
+          "matmul_free_gflops": 0.09843786928340816,
+          "memory_reduction": 2.8461538461538463
+        },
+        "generic": {
+          "dimensions": [
+            128,
+            4096,
+            1024
+          ],
+          "pytorch_time": 0.0009381557799974872,
+          "pytorch_std": 2.988553956795632e-05,
+          "matmul_free_time": 0.012406030700005885,
+          "matmul_free_std": 0.0017285108902466051,
+          "speedup": 0.07562094619006884,
+          "pytorch_gflops": 1144.524019244305,
+          "matmul_free_gflops": 43.27499463625745,
+          "memory_reduction": 2.8461538461538463
+        },
+        "neon": {
+          "dimensions": [
+            128,
+            4096,
+            1024
+          ],
+          "pytorch_time": 0.0008857174599893369,
+          "pytorch_std": 1.8046241293327786e-05,
+          "matmul_free_time": 0.012759070840006643,
+          "matmul_free_std": 0.001480804093683796,
+          "speedup": 0.06941864898281855,
+          "pytorch_gflops": 1212.2848114712863,
+          "matmul_free_gflops": 42.077586897363794,
+          "memory_reduction": 2.8461538461538463
+        },
+        "avx2": {
+          "dimensions": [
+            128,
+            4096,
+            1024
+          ],
+          "pytorch_time": 0.0008858791599982396,
+          "pytorch_std": 1.428971679171521e-05,
+          "matmul_free_time": 0.012863607479998792,
+          "matmul_free_std": 0.001881176014350303,
+          "speedup": 0.06886708579810637,
+          "pytorch_gflops": 1212.0635324598152,
+          "matmul_free_gflops": 41.73564164133298,
+          "memory_reduction": 2.8461538461538463
+        }
+      },
+      "deep_layer": {
+        "python": {
+          "dimensions": [
+            128,
+            1024,
+            4096
+          ],
+          "pytorch_time": 0.0009008191000111765,
+          "pytorch_std": 2.4165090516475286e-05,
+          "matmul_free_time": 3.695280158259991,
+          "matmul_free_std": 0.008176654497020024,
+          "speedup": 0.00024377558978785205,
+          "pytorch_gflops": 1191.9616535513935,
+          "matmul_free_gflops": 0.14528557754949717,
+          "memory_reduction": 2.8461538461538463
+        },
+        "generic": {
+          "dimensions": [
+            128,
+            1024,
+            4096
+          ],
+          "pytorch_time": 0.0008957200600048054,
+          "pytorch_std": 1.2497967355473373e-05,
+          "matmul_free_time": 0.013252131679996637,
+          "matmul_free_std": 0.0010965437407889954,
+          "speedup": 0.06759063987847672,
+          "pytorch_gflops": 1198.7470996175296,
+          "matmul_free_gflops": 40.51204175780845,
+          "memory_reduction": 2.8461538461538463
+        },
+        "neon": {
+          "dimensions": [
+            128,
+            1024,
+            4096
+          ],
+          "pytorch_time": 0.0008822883399943748,
+          "pytorch_std": 1.6993324496617885e-05,
+          "matmul_free_time": 0.013379219100008867,
+          "matmul_free_std": 0.0005446616818590573,
+          "speedup": 0.06594468133000304,
+          "pytorch_gflops": 1216.9965025343595,
+          "matmul_free_gflops": 40.12722326967828,
+          "memory_reduction": 2.8461538461538463
+        },
+        "avx2": {
+          "dimensions": [
+            128,
+            1024,
+            4096
+          ],
+          "pytorch_time": 0.0009412316200018722,
+          "pytorch_std": 5.063831893574012e-05,
+          "matmul_free_time": 0.013547078260005492,
+          "matmul_free_std": 0.00043810713972849464,
+          "speedup": 0.06947856961752656,
+          "pytorch_gflops": 1140.783842342509,
+          "matmul_free_gflops": 39.630014804371726,
+          "memory_reduction": 2.8461538461538463
+        }
+      },
+      "square_large": {
+        "python": {
+          "dimensions": [
+            256,
+            2048,
+            2048
+          ],
+          "pytorch_time": 0.0015050550400019346,
+          "pytorch_std": 1.8430907369491573e-05,
+          "matmul_free_time": 8.533755102659988,
+          "matmul_free_std": 0.012015565366375982,
+          "speedup": 0.00017636492047127131,
+          "pytorch_gflops": 1426.8472520428486,
+          "matmul_free_gflops": 0.12582290106559452,
+          "memory_reduction": 2.5
+        },
+        "generic": {
+          "dimensions": [
+            256,
+            2048,
+            2048
+          ],
+          "pytorch_time": 0.0014907134199938809,
+          "pytorch_std": 1.546945250099908e-05,
+          "matmul_free_time": 0.02520781833997262,
+          "matmul_free_std": 0.0017978777154120924,
+          "speedup": 0.059136947112556036,
+          "pytorch_gflops": 1440.574438518716,
+          "matmul_free_gflops": 42.59558719119071,
+          "memory_reduction": 2.5
+        },
+        "neon": {
+          "dimensions": [
+            256,
+            2048,
+            2048
+          ],
+          "pytorch_time": 0.0014336999599981937,
+          "pytorch_std": 1.366887869100714e-05,
+          "matmul_free_time": 0.02530651415998818,
+          "matmul_free_std": 0.0013207511156222576,
+          "speedup": 0.05665339568042915,
+          "pytorch_gflops": 1497.861273569894,
+          "matmul_free_gflops": 42.429463702973365,
+          "memory_reduction": 2.5
+        },
+        "avx2": {
+          "dimensions": [
+            256,
+            2048,
+            2048
+          ],
+          "pytorch_time": 0.0014707025600000634,
+          "pytorch_std": 2.3446134739391735e-05,
+          "matmul_free_time": 0.025341695039992375,
+          "matmul_free_std": 0.0021785309779671024,
+          "speedup": 0.058034892996664596,
+          "pytorch_gflops": 1460.1753654388874,
+          "matmul_free_gflops": 42.370560544805734,
+          "memory_reduction": 2.5
+        }
+      }
+    },
+    "threading": {
+      "1_threads": 0.26059938119999515,
+      "2_threads": 0.2887030269500201,
+      "4_threads": 0.48118493745001845,
+      "5_threads": 0.4869876626000291,
+      "10_threads": 0.5034393041499697
+    }
+  }
+}

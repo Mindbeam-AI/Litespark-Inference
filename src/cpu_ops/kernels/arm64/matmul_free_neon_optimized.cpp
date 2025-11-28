@@ -98,7 +98,6 @@ void matmul_free_neon(
                     results[i] += bias[n + i];
                 }
                 y_row[n + i] = results[i];
-                printf("y_row[%d] = %f\n", n + i, y_row[n + i]);
             }
         }
 
@@ -133,7 +132,6 @@ void matmul_free_neon(
             }
 
             y_row[n] = result;
-            printf("y_row[%d] = %f\n", n, y_row[n]);
         }
     }
 }
