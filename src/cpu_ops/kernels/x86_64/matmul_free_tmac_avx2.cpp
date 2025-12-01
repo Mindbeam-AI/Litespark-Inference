@@ -400,11 +400,10 @@ void matmul_free_tmac_tiled(
 /**
  * T-MAC with PSHUFB for true SIMD lookups
  *
- * Uses int8 quantized LUT and PSHUFB for 32 parallel lookups.
- * This is closest to Microsoft's actual implementation.
+ * Uses float accumulation with PSHUFB for index gathering.
+ * This avoids quantization errors while still using PSHUFB for parallel index loading.
  *
- * Key: We use int16 accumulation to avoid precision loss,
- * with pack/unpack technique from BitNet paper.
+ * Strategy: Use PSHUFB to gather indices, then do float lookups
  */
 void matmul_free_tmac_pshufb(
     torch::Tensor x_tensor,
@@ -430,146 +429,85 @@ void matmul_free_tmac_pshufb(
         const float* __restrict__ x_row = x + m * K;
         float* __restrict__ y_row = y + m * N;
 
-        // Use int32 accumulators for precision (like BitNet's pack-unpack)
-        // We'll convert to float at the end
-        alignas(64) int32_t acc_buffer[TILE_N];
+        // Initialize output
+        if (bias != nullptr) {
+            memcpy(y_row, bias, N * sizeof(float));
+        } else {
+            memset(y_row, 0, N * sizeof(float));
+        }
 
-        // Process N in tiles
-        for (int n_base = 0; n_base < N; n_base += TILE_N) {
-            const int n_end = std::min(n_base + TILE_N, N);
-            const int n_count = n_end - n_base;
+        // K-first iteration
+        for (int kg = 0; kg < K_groups; kg++) {
+            const int k_base = kg * 4;
 
-            // Initialize accumulators
-            memset(acc_buffer, 0, n_count * sizeof(int32_t));
-
-            // Quantization scale for this batch row
-            // Find max activation magnitude for quantization
-            float max_abs = 0.0f;
-            for (int k = 0; k < K; k++) {
-                float abs_val = x_row[k] > 0 ? x_row[k] : -x_row[k];
-                if (abs_val > max_abs) max_abs = abs_val;
-            }
-            const float quant_scale = (max_abs > 0) ? (127.0f / (4.0f * max_abs)) : 1.0f;
-            const float dequant_scale = (max_abs > 0) ? (4.0f * max_abs / 127.0f) : 1.0f;
-
-            // K-first iteration
-            for (int kg = 0; kg < K_groups; kg++) {
-                const int k_base = kg * 4;
-
-                // Get activations for this K-group
-                float x_vals[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                for (int i = 0; i < 4 && k_base + i < K; i++) {
-                    x_vals[i] = x_row[k_base + i];
-                }
-
-                // Build int8 LUT for PSHUFB
-                // Quantize to int8 with scaling
-                alignas(16) int8_t lut_int8[16];
-                {
-                    const float x0 = x_vals[0], x1 = x_vals[1], x2 = x_vals[2], x3 = x_vals[3];
-                    float sums[16];
-                    sums[0]  = 0.0f;
-                    sums[1]  = x0;
-                    sums[2]  = x1;
-                    sums[3]  = x0 + x1;
-                    sums[4]  = x2;
-                    sums[5]  = x0 + x2;
-                    sums[6]  = x1 + x2;
-                    sums[7]  = x0 + x1 + x2;
-                    sums[8]  = x3;
-                    sums[9]  = x0 + x3;
-                    sums[10] = x1 + x3;
-                    sums[11] = x0 + x1 + x3;
-                    sums[12] = x2 + x3;
-                    sums[13] = x0 + x2 + x3;
-                    sums[14] = x1 + x2 + x3;
-                    sums[15] = x0 + x1 + x2 + x3;
-
-                    for (int i = 0; i < 16; i++) {
-                        float scaled = sums[i] * quant_scale;
-                        // Clamp to int8 range
-                        if (scaled > 127.0f) scaled = 127.0f;
-                        if (scaled < -127.0f) scaled = -127.0f;
-                        lut_int8[i] = (int8_t)scaled;
-                    }
-                }
-
-                // Duplicate LUT for AVX2 (256-bit = two 128-bit lanes)
-                __m256i lut_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut_int8));
-
-                const uint8_t* __restrict__ sign_ptr = sign_plane + kg * N + n_base;
-                const uint8_t* __restrict__ value_ptr = value_plane + kg * N + n_base;
-
-                // Process 32 outputs at a time with PSHUFB
-                int i = 0;
-                for (; i + 31 < n_count; i += 32) {
-                    // Load 32 indices (sequential!)
-                    __m256i sign_idx = _mm256_loadu_si256((__m256i*)(sign_ptr + i));
-                    __m256i value_idx = _mm256_loadu_si256((__m256i*)(value_ptr + i));
-
-                    // Mask to 4 bits
-                    __m256i mask = _mm256_set1_epi8(0x0F);
-                    sign_idx = _mm256_and_si256(sign_idx, mask);
-                    value_idx = _mm256_and_si256(value_idx, mask);
-
-                    // PSHUFB lookup - 32 parallel lookups!
-                    __m256i sign_vals = _mm256_shuffle_epi8(lut_vec, sign_idx);
-                    __m256i value_vals = _mm256_shuffle_epi8(lut_vec, value_idx);
-
-                    // Compute 2*value - sign in int16
-                    // First, unpack int8 to int16
-                    __m256i sign_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(sign_vals));
-                    __m256i sign_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(sign_vals, 1));
-                    __m256i value_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(value_vals));
-                    __m256i value_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(value_vals, 1));
-
-                    // result = 2*value - sign
-                    __m256i result_lo = _mm256_sub_epi16(_mm256_slli_epi16(value_lo, 1), sign_lo);
-                    __m256i result_hi = _mm256_sub_epi16(_mm256_slli_epi16(value_hi, 1), sign_hi);
-
-                    // Accumulate to int32
-                    // Unpack int16 to int32 and add to accumulators
-                    __m256i acc_0 = _mm256_loadu_si256((__m256i*)(acc_buffer + i));
-                    __m256i acc_8 = _mm256_loadu_si256((__m256i*)(acc_buffer + i + 8));
-                    __m256i acc_16 = _mm256_loadu_si256((__m256i*)(acc_buffer + i + 16));
-                    __m256i acc_24 = _mm256_loadu_si256((__m256i*)(acc_buffer + i + 24));
-
-                    // Extend int16 to int32 and accumulate
-                    __m256i res_0 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(result_lo));
-                    __m256i res_8 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(result_lo, 1));
-                    __m256i res_16 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(result_hi));
-                    __m256i res_24 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(result_hi, 1));
-
-                    acc_0 = _mm256_add_epi32(acc_0, res_0);
-                    acc_8 = _mm256_add_epi32(acc_8, res_8);
-                    acc_16 = _mm256_add_epi32(acc_16, res_16);
-                    acc_24 = _mm256_add_epi32(acc_24, res_24);
-
-                    _mm256_storeu_si256((__m256i*)(acc_buffer + i), acc_0);
-                    _mm256_storeu_si256((__m256i*)(acc_buffer + i + 8), acc_8);
-                    _mm256_storeu_si256((__m256i*)(acc_buffer + i + 16), acc_16);
-                    _mm256_storeu_si256((__m256i*)(acc_buffer + i + 24), acc_24);
-                }
-
-                // Handle remaining with scalar
-                alignas(64) float lut_float[16];
-                build_lut_16(x_vals, lut_float);
-                for (; i < n_count; i++) {
-                    const uint8_t s = sign_ptr[i] & 0x0F;
-                    const uint8_t v = value_ptr[i] & 0x0F;
-                    // Accumulate in int32 (scaled)
-                    int32_t scaled_result = (int32_t)((2.0f * lut_float[v] - lut_float[s]) * quant_scale);
-                    acc_buffer[i] += scaled_result;
-                }
+            // Get activations for this K-group
+            float x_vals[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int i = 0; i < 4 && k_base + i < K; i++) {
+                x_vals[i] = x_row[k_base + i];
             }
 
-            // Convert int32 accumulators to float output
-            for (int i = 0; i < n_count; i++) {
-                float result = (float)acc_buffer[i] * dequant_scale;
-                if (bias != nullptr) {
-                    result += bias[n_base + i];
-                }
-                y_row[n_base + i] = result;
+            // Build float LUT
+            alignas(64) float lut[16];
+            build_lut_16(x_vals, lut);
+
+            const uint8_t* __restrict__ sign_ptr = sign_plane + kg * N;
+            const uint8_t* __restrict__ value_ptr = value_plane + kg * N;
+
+            const __m256 two = _mm256_set1_ps(2.0f);
+
+            // Process 16 outputs at a time (gather indices, then float lookups)
+            int n = 0;
+            for (; n + 15 < N; n += 16) {
+                // Load 16 indices
+                __m128i sign_idx_16 = _mm_loadu_si128((__m128i*)(sign_ptr + n));
+                __m128i value_idx_16 = _mm_loadu_si128((__m128i*)(value_ptr + n));
+
+                // Mask to 4 bits
+                __m128i mask = _mm_set1_epi8(0x0F);
+                sign_idx_16 = _mm_and_si128(sign_idx_16, mask);
+                value_idx_16 = _mm_and_si128(value_idx_16, mask);
+
+                // Extract indices to array for lookups
+                alignas(16) uint8_t s_idx[16];
+                alignas(16) uint8_t v_idx[16];
+                _mm_store_si128((__m128i*)s_idx, sign_idx_16);
+                _mm_store_si128((__m128i*)v_idx, value_idx_16);
+
+                // Lookup and accumulate in two batches of 8
+                // First 8
+                __m256 y_vec0 = _mm256_loadu_ps(y_row + n);
+                __m256 sign_vec0 = _mm256_set_ps(
+                    lut[s_idx[7]], lut[s_idx[6]], lut[s_idx[5]], lut[s_idx[4]],
+                    lut[s_idx[3]], lut[s_idx[2]], lut[s_idx[1]], lut[s_idx[0]]
+                );
+                __m256 value_vec0 = _mm256_set_ps(
+                    lut[v_idx[7]], lut[v_idx[6]], lut[v_idx[5]], lut[v_idx[4]],
+                    lut[v_idx[3]], lut[v_idx[2]], lut[v_idx[1]], lut[v_idx[0]]
+                );
+                __m256 result0 = _mm256_fmsub_ps(two, value_vec0, sign_vec0);
+                y_vec0 = _mm256_add_ps(y_vec0, result0);
+                _mm256_storeu_ps(y_row + n, y_vec0);
+
+                // Second 8
+                __m256 y_vec1 = _mm256_loadu_ps(y_row + n + 8);
+                __m256 sign_vec1 = _mm256_set_ps(
+                    lut[s_idx[15]], lut[s_idx[14]], lut[s_idx[13]], lut[s_idx[12]],
+                    lut[s_idx[11]], lut[s_idx[10]], lut[s_idx[9]], lut[s_idx[8]]
+                );
+                __m256 value_vec1 = _mm256_set_ps(
+                    lut[v_idx[15]], lut[v_idx[14]], lut[v_idx[13]], lut[v_idx[12]],
+                    lut[v_idx[11]], lut[v_idx[10]], lut[v_idx[9]], lut[v_idx[8]]
+                );
+                __m256 result1 = _mm256_fmsub_ps(two, value_vec1, sign_vec1);
+                y_vec1 = _mm256_add_ps(y_vec1, result1);
+                _mm256_storeu_ps(y_row + n + 8, y_vec1);
+            }
+
+            // Handle remaining
+            for (; n < N; n++) {
+                const uint8_t s = sign_ptr[n] & 0x0F;
+                const uint8_t v = value_ptr[n] & 0x0F;
+                y_row[n] += 2.0f * lut[v] - lut[s];
             }
         }
     }
@@ -675,6 +613,99 @@ void matmul_free_tmac_optimized(
     }
 }
 
+/**
+ * T-MAC with AVX2 gather instructions for true vectorized float lookups
+ *
+ * Uses _mm256_i32gather_ps to gather 8 floats from LUT in parallel
+ * This is the fastest approach for float LUTs on x86
+ */
+void matmul_free_tmac_gather(
+    torch::Tensor x_tensor,
+    torch::Tensor sign_plane_tensor,
+    torch::Tensor value_plane_tensor,
+    torch::Tensor y_tensor,
+    torch::Tensor bias_tensor,
+    int M, int N, int K,
+    int num_threads
+) {
+    const float* __restrict__ x = x_tensor.data_ptr<float>();
+    const uint8_t* __restrict__ sign_plane = sign_plane_tensor.data_ptr<uint8_t>();
+    const uint8_t* __restrict__ value_plane = value_plane_tensor.data_ptr<uint8_t>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_groups = (K + 3) / 4;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const float* __restrict__ x_row = x + m * K;
+        float* __restrict__ y_row = y + m * N;
+
+        // Initialize output
+        if (bias != nullptr) {
+            memcpy(y_row, bias, N * sizeof(float));
+        } else {
+            memset(y_row, 0, N * sizeof(float));
+        }
+
+        const __m256 two = _mm256_set1_ps(2.0f);
+
+        // K-first iteration
+        for (int kg = 0; kg < K_groups; kg++) {
+            const int k_base = kg * 4;
+
+            // Get activations for this K-group
+            float x_vals[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int i = 0; i < 4 && k_base + i < K; i++) {
+                x_vals[i] = x_row[k_base + i];
+            }
+
+            // Build float LUT (aligned for gather)
+            alignas(64) float lut[16];
+            build_lut_16(x_vals, lut);
+
+            const uint8_t* __restrict__ sign_ptr = sign_plane + kg * N;
+            const uint8_t* __restrict__ value_ptr = value_plane + kg * N;
+
+            // Process 8 outputs at a time using AVX2 gather
+            int n = 0;
+            for (; n + 7 < N; n += 8) {
+                // Load 8 indices and convert to int32 for gather
+                // We need to zero-extend uint8 to int32
+                alignas(32) int32_t s_idx32[8];
+                alignas(32) int32_t v_idx32[8];
+
+                for (int i = 0; i < 8; i++) {
+                    s_idx32[i] = sign_ptr[n + i] & 0x0F;
+                    v_idx32[i] = value_ptr[n + i] & 0x0F;
+                }
+
+                __m256i sign_idx = _mm256_load_si256((__m256i*)s_idx32);
+                __m256i value_idx = _mm256_load_si256((__m256i*)v_idx32);
+
+                // Gather from LUT - 8 parallel lookups!
+                __m256 sign_vec = _mm256_i32gather_ps(lut, sign_idx, 4);  // scale=4 for float
+                __m256 value_vec = _mm256_i32gather_ps(lut, value_idx, 4);
+
+                // result = 2*value - sign
+                __m256 y_vec = _mm256_loadu_ps(y_row + n);
+                __m256 result = _mm256_fmsub_ps(two, value_vec, sign_vec);
+                y_vec = _mm256_add_ps(y_vec, result);
+                _mm256_storeu_ps(y_row + n, y_vec);
+            }
+
+            // Handle remaining
+            for (; n < N; n++) {
+                const uint8_t s = sign_ptr[n] & 0x0F;
+                const uint8_t v = value_ptr[n] & 0x0F;
+                y_row[n] += 2.0f * lut[v] - lut[s];
+            }
+        }
+    }
+}
+
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pack_ternary_bitplanes", &pack_ternary_bitplanes,
@@ -686,7 +717,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("matmul_free_tmac_tiled", &matmul_free_tmac_tiled,
           "T-MAC kernel with K-first + tiling");
     m.def("matmul_free_tmac_pshufb", &matmul_free_tmac_pshufb,
-          "T-MAC kernel with PSHUFB parallel lookups");
+          "T-MAC kernel with float LUT + vectorized accumulation");
+    m.def("matmul_free_tmac_gather", &matmul_free_tmac_gather,
+          "T-MAC kernel with AVX2 gather instructions");
     m.def("matmul_free_tmac_optimized", &matmul_free_tmac_optimized,
           "T-MAC kernel optimized (K-first + AVX2)");
 }

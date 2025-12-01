@@ -236,6 +236,26 @@ for name, M, N, K in configs:
     print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
     results['tmac_optimized'] = {'time': avg_time, 'gflops': gflops, 'y': y_tmac_opt.clone()}
 
+    # Test T-MAC Gather (AVX2 gather instructions)
+    print("\n  T-MAC K-first Gather:")
+    y_tmac_gather = torch.zeros(M, N, dtype=torch.float32)
+
+    for _ in range(5):
+        tmac_kernel.matmul_free_tmac_gather(x, sign_plane, value_plane, y_tmac_gather, bias, M, N, K, num_threads)
+
+    gc.collect()
+    times = []
+    for _ in range(30):
+        start = time.perf_counter()
+        tmac_kernel.matmul_free_tmac_gather(x, sign_plane, value_plane, y_tmac_gather, bias, M, N, K, num_threads)
+        times.append(time.perf_counter() - start)
+
+    avg_time = np.mean(times) * 1000
+    std_time = np.std(times) * 1000
+    gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+    print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+    results['tmac_gather'] = {'time': avg_time, 'gflops': gflops, 'y': y_tmac_gather.clone()}
+
     # Test AVX-512 packed v1 for comparison
     if avx512_kernel is not None:
         print("\n  AVX-512 packed v1 (baseline):")
@@ -277,12 +297,10 @@ for name, M, N, K in configs:
 
     # Verify correctness
     print("\n  Correctness check vs PyTorch:")
-    for key in ['tmac_scalar', 'tmac_avx2', 'tmac_tiled', 'tmac_pshufb', 'tmac_optimized']:
+    for key in ['tmac_scalar', 'tmac_avx2', 'tmac_tiled', 'tmac_pshufb', 'tmac_optimized', 'tmac_gather']:
         if key in results:
             max_diff = torch.max(torch.abs(results[key]['y'] - y_pt)).item()
-            # Higher tolerance for quantized PSHUFB version
-            tol = 0.5 if 'pshufb' in key else 1e-3
-            status = 'OK' if max_diff < tol else 'MISMATCH!'
+            status = 'OK' if max_diff < 1e-3 else 'MISMATCH!'
             print(f"    {key}: max_diff={max_diff:.6f} {status}")
 
     if 'avx512_packed' in results:
@@ -302,6 +320,7 @@ for name, M, N, K in configs:
         ('tmac_tiled', 'T-MAC K-first Tiled'),
         ('tmac_pshufb', 'T-MAC K-first PSHUFB'),
         ('tmac_optimized', 'T-MAC K-first Optimized'),
+        ('tmac_gather', 'T-MAC K-first Gather'),
         ('avx512_packed', 'AVX-512 packed'),
         ('pytorch', 'PyTorch'),
     ]:
