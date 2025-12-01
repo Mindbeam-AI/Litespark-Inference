@@ -10,8 +10,48 @@ import torch
 import time
 import numpy as np
 import platform
+import psutil
+import tracemalloc
+import os
 from pathlib import Path
 from torch.utils.cpp_extension import load
+
+
+def get_process_memory_mb():
+    """Get current process memory usage in MB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024)
+
+
+def measure_memory_usage(func, *args, **kwargs):
+    """Measure peak memory usage during function execution."""
+    # Force garbage collection before measurement
+    import gc
+    gc.collect()
+
+    # Get baseline memory
+    baseline_mb = get_process_memory_mb()
+
+    # Start tracemalloc for Python allocations
+    tracemalloc.start()
+
+    # Run the function
+    result = func(*args, **kwargs)
+
+    # Get peak memory
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Get process memory after
+    after_mb = get_process_memory_mb()
+
+    return {
+        'result': result,
+        'baseline_mb': baseline_mb,
+        'after_mb': after_mb,
+        'delta_mb': after_mb - baseline_mb,
+        'python_peak_mb': peak / (1024 * 1024),
+    }
 
 # Check architecture
 arch = platform.machine().lower()
@@ -73,6 +113,11 @@ for name, M, N, K in configs:
     print(f"\n{name}: {M}x{K} @ {K}x{N}")
     print("-"*70)
 
+    # Measure memory before tensor allocation
+    import gc
+    gc.collect()
+    mem_before = get_process_memory_mb()
+
     # Create test data
     x = torch.randn(M, K, dtype=torch.float32)
     w_float = torch.randn(N, K, dtype=torch.float32)
@@ -85,23 +130,47 @@ for name, M, N, K in configs:
     y = torch.zeros(M, N, dtype=torch.float32)
     bias = torch.zeros(N, dtype=torch.float32)
 
+    # Measure memory after tensor allocation
+    mem_after_alloc = get_process_memory_mb()
+    tensor_memory_mb = mem_after_alloc - mem_before
+
+    # Calculate theoretical memory for comparison
+    theoretical_mb = (M * K + N * K + N * K + M * N + N) * 4 / (1024 * 1024)  # x, w_float, w_ternary, y, bias
+
+    print(f"\nMemory Usage:")
+    print(f"  Actual tensor allocation: {tensor_memory_mb:.2f} MB")
+    print(f"  Theoretical (float32):    {theoretical_mb:.2f} MB")
+
     # Warmup
     for _ in range(10):
         avx2_kernel.matmul_free_avx2(x, w_ternary, y, bias, M, N, K, num_threads)
 
-    # Benchmark
+    # Measure peak memory during kernel execution
+    gc.collect()
+    mem_before_kernel = get_process_memory_mb()
+    tracemalloc.start()
+
+    # Benchmark with memory tracking
     times = []
     for _ in range(50):
         start = time.perf_counter()
         avx2_kernel.matmul_free_avx2(x, w_ternary, y, bias, M, N, K, num_threads)
         times.append(time.perf_counter() - start)
 
+    current_mem, peak_mem = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    mem_after_kernel = get_process_memory_mb()
+
     avg_time = np.mean(times) * 1000
     std_time = np.std(times) * 1000
     gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
 
-    print(f"Time:   {avg_time:.2f} ± {std_time:.2f} ms")
-    print(f"GFLOPS: {gflops:.1f}")
+    print(f"\nPerformance:")
+    print(f"  Time:   {avg_time:.2f} ± {std_time:.2f} ms")
+    print(f"  GFLOPS: {gflops:.1f}")
+    print(f"\nKernel Memory:")
+    print(f"  Process memory delta: {mem_after_kernel - mem_before_kernel:.2f} MB")
+    print(f"  Python peak alloc:    {peak_mem / (1024 * 1024):.2f} MB")
 
     # Compare with PyTorch
     print("\nComparing with PyTorch...")
@@ -110,17 +179,28 @@ for name, M, N, K in configs:
     for _ in range(10):
         _ = torch.matmul(x, w_pytorch.t())
 
+    # Measure PyTorch memory
+    gc.collect()
+    mem_before_pt = get_process_memory_mb()
+    tracemalloc.start()
+
     times_pt = []
     for _ in range(50):
         start = time.perf_counter()
         y_pytorch = torch.matmul(x, w_pytorch.t())
         times_pt.append(time.perf_counter() - start)
 
+    current_mem_pt, peak_mem_pt = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    mem_after_pt = get_process_memory_mb()
+
     avg_time_pt = np.mean(times_pt) * 1000
     gflops_pt = (2.0 * M * N * K / 1e9) / (avg_time_pt / 1000)
 
-    print(f"PyTorch: {avg_time_pt:.2f} ms ({gflops_pt:.1f} GFLOPS)")
-    print(f"Speedup: {avg_time_pt/avg_time:.3f}x vs PyTorch ({gflops/gflops_pt:.2%})")
+    print(f"  PyTorch: {avg_time_pt:.2f} ms ({gflops_pt:.1f} GFLOPS)")
+    print(f"  PyTorch memory delta: {mem_after_pt - mem_before_pt:.2f} MB")
+    print(f"  PyTorch peak alloc:   {peak_mem_pt / (1024 * 1024):.2f} MB")
+    print(f"\nSpeedup: {avg_time_pt/avg_time:.3f}x vs PyTorch ({gflops/gflops_pt:.2%})")
 
     # Verify correctness
     y_verify = torch.zeros(M, N, dtype=torch.float32)

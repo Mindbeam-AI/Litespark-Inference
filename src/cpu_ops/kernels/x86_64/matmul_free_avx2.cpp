@@ -33,15 +33,15 @@ inline float hsum_avx(__m256 v) {
 }
 
 /**
- * AVX2-optimized MatMul-free kernel with output blocking
+ * AVX2-optimized MatMul-free kernel with K-blocking for cache efficiency
  *
  * Computes: y[m,n] = sum(x[m,k] where w[n,k]==1) - sum(x[m,k] where w[n,k]==-1)
  *
  * Key optimizations:
- * - 8-way output blocking (reduced from 16 to avoid register spilling)
- * - _mm256_and_ps with mask for faster predication than blendv
- * - Prefetching for memory latency hiding
- * - Sequential memory access patterns
+ * - 4-way output blocking (minimal register pressure)
+ * - K-blocking for L1/L2 cache efficiency
+ * - Process multiple K values per inner loop iteration
+ * - _mm256_and_ps with mask for fast predication
  *
  * @param x_tensor Input matrix [M, K] (row-major)
  * @param w_tensor Ternary weight matrix [N, K] (row-major, values in {-1, 0, 1})
@@ -60,95 +60,142 @@ void matmul_free_avx2(
     int M, int N, int K,
     int num_threads
 ) {
-    const float* x = x_tensor.data_ptr<float>();
-    const float* w = w_tensor.data_ptr<float>();
-    float* y = y_tensor.data_ptr<float>();
+    const float* __restrict__ x = x_tensor.data_ptr<float>();
+    const float* __restrict__ w = w_tensor.data_ptr<float>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
     const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
 
-    // AVX2: 8-wide SIMD, 8-way output blocking (reduced to avoid register pressure)
-    const int K_SIMD = 8;
+    // Tuned parameters for Intel Ice Lake
+    const int K_SIMD = 8;          // AVX2 width
+    const int N_BLOCK = 4;         // Output blocking - reduced for more registers per output
+    const int K_BLOCK = 32;        // Process 32 K values (4 AVX2 loads) per inner iteration
     const int K_SIMD_END = (K / K_SIMD) * K_SIMD;
-    const int N_BLOCK = 8;  // Reduced from 16 to fit in registers
-    const int K_PREFETCH = 128;  // Prefetch distance
 
     omp_set_num_threads(num_threads);
 
-    // Parallelize over output rows with dynamic scheduling
-    #pragma omp parallel for schedule(dynamic, 4)
+    // Parallelize over output rows
+    #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
-        const float* x_row = x + m * K;
-        float* y_row = y + m * N;
+        const float* __restrict__ x_row = x + m * K;
+        float* __restrict__ y_row = y + m * N;
 
-        // Process N_BLOCK outputs together for better instruction-level parallelism
+        // Process N_BLOCK outputs together
         int n = 0;
         for (; n <= N - N_BLOCK; n += N_BLOCK) {
-            // 8 separate positive/negative accumulators (16 total - fits in YMM registers)
-            __m256 sum_pos[N_BLOCK], sum_neg[N_BLOCK];
-
-            #pragma unroll
-            for (int i = 0; i < N_BLOCK; i++) {
-                sum_pos[i] = _mm256_setzero_ps();
-                sum_neg[i] = _mm256_setzero_ps();
-            }
+            // 4 accumulators for pos/neg (8 total YMM registers)
+            __m256 sum_pos0 = _mm256_setzero_ps();
+            __m256 sum_pos1 = _mm256_setzero_ps();
+            __m256 sum_pos2 = _mm256_setzero_ps();
+            __m256 sum_pos3 = _mm256_setzero_ps();
+            __m256 sum_neg0 = _mm256_setzero_ps();
+            __m256 sum_neg1 = _mm256_setzero_ps();
+            __m256 sum_neg2 = _mm256_setzero_ps();
+            __m256 sum_neg3 = _mm256_setzero_ps();
 
             const __m256 zero = _mm256_setzero_ps();
 
-            // SIMD loop over K dimension
-            for (int k = 0; k < K_SIMD_END; k += K_SIMD) {
-                // Prefetch future data
-                if (k + K_PREFETCH < K) {
-                    _mm_prefetch((const char*)(x_row + k + K_PREFETCH), _MM_HINT_T0);
-                }
+            // Pointers to weight rows
+            const float* __restrict__ w0 = w + (n + 0) * K;
+            const float* __restrict__ w1 = w + (n + 1) * K;
+            const float* __restrict__ w2 = w + (n + 2) * K;
+            const float* __restrict__ w3 = w + (n + 3) * K;
 
-                // Load input once per K iteration
+            // Main loop: process K_BLOCK elements at a time for better cache use
+            int k = 0;
+            for (; k <= K_SIMD_END - K_BLOCK; k += K_BLOCK) {
+                // Prefetch next K_BLOCK
+                _mm_prefetch((const char*)(x_row + k + K_BLOCK), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w0 + k + K_BLOCK), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w1 + k + K_BLOCK), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w2 + k + K_BLOCK), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w3 + k + K_BLOCK), _MM_HINT_T0);
+
+                // Unroll 4x to process K_BLOCK (32) elements
+                for (int kk = 0; kk < K_BLOCK; kk += K_SIMD) {
+                    const __m256 x_vals = _mm256_loadu_ps(x_row + k + kk);
+
+                    // Output 0
+                    __m256 wv0 = _mm256_loadu_ps(w0 + k + kk);
+                    __m256 mp0 = _mm256_cmp_ps(wv0, zero, _CMP_GT_OQ);
+                    __m256 mn0 = _mm256_cmp_ps(wv0, zero, _CMP_LT_OQ);
+                    sum_pos0 = _mm256_add_ps(sum_pos0, _mm256_and_ps(x_vals, mp0));
+                    sum_neg0 = _mm256_add_ps(sum_neg0, _mm256_and_ps(x_vals, mn0));
+
+                    // Output 1
+                    __m256 wv1 = _mm256_loadu_ps(w1 + k + kk);
+                    __m256 mp1 = _mm256_cmp_ps(wv1, zero, _CMP_GT_OQ);
+                    __m256 mn1 = _mm256_cmp_ps(wv1, zero, _CMP_LT_OQ);
+                    sum_pos1 = _mm256_add_ps(sum_pos1, _mm256_and_ps(x_vals, mp1));
+                    sum_neg1 = _mm256_add_ps(sum_neg1, _mm256_and_ps(x_vals, mn1));
+
+                    // Output 2
+                    __m256 wv2 = _mm256_loadu_ps(w2 + k + kk);
+                    __m256 mp2 = _mm256_cmp_ps(wv2, zero, _CMP_GT_OQ);
+                    __m256 mn2 = _mm256_cmp_ps(wv2, zero, _CMP_LT_OQ);
+                    sum_pos2 = _mm256_add_ps(sum_pos2, _mm256_and_ps(x_vals, mp2));
+                    sum_neg2 = _mm256_add_ps(sum_neg2, _mm256_and_ps(x_vals, mn2));
+
+                    // Output 3
+                    __m256 wv3 = _mm256_loadu_ps(w3 + k + kk);
+                    __m256 mp3 = _mm256_cmp_ps(wv3, zero, _CMP_GT_OQ);
+                    __m256 mn3 = _mm256_cmp_ps(wv3, zero, _CMP_LT_OQ);
+                    sum_pos3 = _mm256_add_ps(sum_pos3, _mm256_and_ps(x_vals, mp3));
+                    sum_neg3 = _mm256_add_ps(sum_neg3, _mm256_and_ps(x_vals, mn3));
+                }
+            }
+
+            // Handle remaining SIMD iterations
+            for (; k < K_SIMD_END; k += K_SIMD) {
                 const __m256 x_vals = _mm256_loadu_ps(x_row + k);
 
-                // Process all N_BLOCK outputs with this input - manually unrolled
-                #pragma unroll
-                for (int i = 0; i < N_BLOCK; i++) {
-                    // Load 8 weight values
-                    const __m256 w_vals = _mm256_loadu_ps(w + (n + i) * K + k);
+                __m256 wv0 = _mm256_loadu_ps(w0 + k);
+                sum_pos0 = _mm256_add_ps(sum_pos0, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv0, zero, _CMP_GT_OQ)));
+                sum_neg0 = _mm256_add_ps(sum_neg0, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv0, zero, _CMP_LT_OQ)));
 
-                    // Create masks for positive and negative weights
-                    // Use _mm256_and_ps instead of blendv - faster on most Intel CPUs
-                    const __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);  // w > 0
-                    const __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);  // w < 0
+                __m256 wv1 = _mm256_loadu_ps(w1 + k);
+                sum_pos1 = _mm256_add_ps(sum_pos1, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv1, zero, _CMP_GT_OQ)));
+                sum_neg1 = _mm256_add_ps(sum_neg1, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv1, zero, _CMP_LT_OQ)));
 
-                    // TRUE matmul-free: conditional accumulation using AND with mask
-                    // _mm256_and_ps is 1 cycle latency vs blendv's 2 cycles
-                    sum_pos[i] = _mm256_add_ps(sum_pos[i], _mm256_and_ps(x_vals, mask_pos));
-                    sum_neg[i] = _mm256_add_ps(sum_neg[i], _mm256_and_ps(x_vals, mask_neg));
-                }
+                __m256 wv2 = _mm256_loadu_ps(w2 + k);
+                sum_pos2 = _mm256_add_ps(sum_pos2, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv2, zero, _CMP_GT_OQ)));
+                sum_neg2 = _mm256_add_ps(sum_neg2, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv2, zero, _CMP_LT_OQ)));
+
+                __m256 wv3 = _mm256_loadu_ps(w3 + k);
+                sum_pos3 = _mm256_add_ps(sum_pos3, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv3, zero, _CMP_GT_OQ)));
+                sum_neg3 = _mm256_add_ps(sum_neg3, _mm256_and_ps(x_vals, _mm256_cmp_ps(wv3, zero, _CMP_LT_OQ)));
             }
 
-            // Reduce and write results for this block
-            for (int i = 0; i < N_BLOCK; i++) {
-                float sum_p = hsum_avx(sum_pos[i]);
-                float sum_n = hsum_avx(sum_neg[i]);
+            // Horizontal reduce and store
+            float r0 = hsum_avx(sum_pos0) - hsum_avx(sum_neg0);
+            float r1 = hsum_avx(sum_pos1) - hsum_avx(sum_neg1);
+            float r2 = hsum_avx(sum_pos2) - hsum_avx(sum_neg2);
+            float r3 = hsum_avx(sum_pos3) - hsum_avx(sum_neg3);
 
-                // Handle scalar tail
-                for (int k = K_SIMD_END; k < K; k++) {
-                    float x_val = x_row[k];
-                    float w_val = w[(n + i) * K + k];
-
-                    if (w_val > 0.0f) {
-                        sum_p += x_val;
-                    } else if (w_val < 0.0f) {
-                        sum_n += x_val;
-                    }
-                }
-
-                float result = sum_p - sum_n;
-                if (bias != nullptr) {
-                    result += bias[n + i];
-                }
-                y_row[n + i] = result;
+            // Scalar tail for K
+            for (int kk = K_SIMD_END; kk < K; kk++) {
+                float xv = x_row[kk];
+                if (w0[kk] > 0.0f) r0 += xv; else if (w0[kk] < 0.0f) r0 -= xv;
+                if (w1[kk] > 0.0f) r1 += xv; else if (w1[kk] < 0.0f) r1 -= xv;
+                if (w2[kk] > 0.0f) r2 += xv; else if (w2[kk] < 0.0f) r2 -= xv;
+                if (w3[kk] > 0.0f) r3 += xv; else if (w3[kk] < 0.0f) r3 -= xv;
             }
+
+            // Add bias and store
+            if (bias != nullptr) {
+                r0 += bias[n + 0];
+                r1 += bias[n + 1];
+                r2 += bias[n + 2];
+                r3 += bias[n + 3];
+            }
+            y_row[n + 0] = r0;
+            y_row[n + 1] = r1;
+            y_row[n + 2] = r2;
+            y_row[n + 3] = r3;
         }
 
-        // Handle remaining outputs (scalar tail)
+        // Handle remaining outputs one at a time
         for (; n < N; n++) {
-            const float* w_row = w + n * K;
+            const float* __restrict__ w_row = w + n * K;
 
             __m256 sum_pos_vec = _mm256_setzero_ps();
             __m256 sum_neg_vec = _mm256_setzero_ps();
@@ -158,28 +205,19 @@ void matmul_free_avx2(
                 const __m256 x_vals = _mm256_loadu_ps(x_row + k);
                 const __m256 w_vals = _mm256_loadu_ps(w_row + k);
 
-                const __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);
-                const __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);
-
-                sum_pos_vec = _mm256_add_ps(sum_pos_vec, _mm256_and_ps(x_vals, mask_pos));
-                sum_neg_vec = _mm256_add_ps(sum_neg_vec, _mm256_and_ps(x_vals, mask_neg));
+                sum_pos_vec = _mm256_add_ps(sum_pos_vec, _mm256_and_ps(x_vals, _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ)));
+                sum_neg_vec = _mm256_add_ps(sum_neg_vec, _mm256_and_ps(x_vals, _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ)));
             }
 
-            float sum_pos = hsum_avx(sum_pos_vec);
-            float sum_neg = hsum_avx(sum_neg_vec);
+            float result = hsum_avx(sum_pos_vec) - hsum_avx(sum_neg_vec);
 
             for (int k = K_SIMD_END; k < K; k++) {
                 float x_val = x_row[k];
                 float w_val = w_row[k];
-
-                if (w_val > 0.0f) {
-                    sum_pos += x_val;
-                } else if (w_val < 0.0f) {
-                    sum_neg += x_val;
-                }
+                if (w_val > 0.0f) result += x_val;
+                else if (w_val < 0.0f) result -= x_val;
             }
 
-            float result = sum_pos - sum_neg;
             if (bias != nullptr) {
                 result += bias[n];
             }

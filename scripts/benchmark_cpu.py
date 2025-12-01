@@ -4,6 +4,8 @@ Comprehensive CPU Benchmarking for MatMul-Free Operations
 
 Compares MatMul-free operations against traditional PyTorch CPU operations
 across different architectures and model sizes.
+
+Includes actual runtime memory measurement using psutil and tracemalloc.
 """
 
 import argparse
@@ -15,6 +17,9 @@ import json
 from pathlib import Path
 import psutil
 import platform
+import tracemalloc
+import gc
+import os
 from typing import Dict, List, Tuple
 import sys
 
@@ -24,80 +29,149 @@ from src.cpu_ops import get_cpu_info, detect_simd_support
 from src.cpu_ops.matmul_free_cpu import matmul_free_cpu, weight_quant_cpu
 
 
+def get_process_memory_mb():
+    """Get current process memory usage in MB (RSS - Resident Set Size)."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024)
+
+
+def measure_peak_memory(func, *args, **kwargs):
+    """
+    Measure actual peak memory usage during function execution.
+    Returns dict with memory metrics in MB.
+    """
+    gc.collect()
+
+    # Baseline process memory
+    baseline_mb = get_process_memory_mb()
+
+    # Track Python allocations
+    tracemalloc.start()
+
+    # Execute function
+    result = func(*args, **kwargs)
+
+    # Get tracemalloc stats
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Final process memory
+    after_mb = get_process_memory_mb()
+
+    return {
+        'result': result,
+        'baseline_mb': baseline_mb,
+        'after_mb': after_mb,
+        'process_delta_mb': after_mb - baseline_mb,
+        'python_current_mb': current / (1024 * 1024),
+        'python_peak_mb': peak / (1024 * 1024),
+    }
+
+
 class CPUBenchmark:
-    """Comprehensive CPU benchmarking suite."""
-    
+    """Comprehensive CPU benchmarking suite with actual memory measurement."""
+
     def __init__(self, output_dir: str = "benchmark_results"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        
+
         self.cpu_info = get_cpu_info()
         self.simd_caps = detect_simd_support()
         self.results = {}
         
     def benchmark_single_operation(
-        self, 
-        M: int, 
-        N: int, 
-        K: int, 
+        self,
+        M: int,
+        N: int,
+        K: int,
         kernel: str,
         num_runs: int = 100
     ) -> Dict[str, float]:
-        """Benchmark a single MatMul operation size."""
-        
+        """Benchmark a single MatMul operation size with actual memory measurement."""
+
+        # Measure memory before tensor creation
+        gc.collect()
+        mem_before_tensors = get_process_memory_mb()
+
         # Create test data
         x = torch.randn(M, K, dtype=torch.float32)
         w_full = torch.randn(N, K, dtype=torch.float32)
         w_ternary = weight_quant_cpu(w_full)
-        
+
+        # Measure memory after tensor creation
+        mem_after_tensors = get_process_memory_mb()
+        tensor_memory_mb = mem_after_tensors - mem_before_tensors
+
         results = {}
-        
+        results['tensor_memory_mb'] = tensor_memory_mb
+
         # Benchmark 1: Traditional PyTorch F.linear
         print(f"  Testing PyTorch F.linear ({M}x{K} @ {K}x{N})...")
-        times_pytorch = []
-        
+
         # Warmup
         for _ in range(5):
             _ = torch.nn.functional.linear(x, w_full)
-        
-        # Benchmark
+
+        # Benchmark with memory measurement
+        gc.collect()
+        mem_before_pytorch = get_process_memory_mb()
+        tracemalloc.start()
+
+        times_pytorch = []
         for _ in range(num_runs):
             start = time.perf_counter()
             result_pytorch = torch.nn.functional.linear(x, w_full)
             end = time.perf_counter()
             times_pytorch.append(end - start)
-        
+
+        pytorch_current, pytorch_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        mem_after_pytorch = get_process_memory_mb()
+
         results['pytorch_time'] = np.mean(times_pytorch)
         results['pytorch_std'] = np.std(times_pytorch)
-        
+        results['pytorch_memory_delta_mb'] = mem_after_pytorch - mem_before_pytorch
+        results['pytorch_peak_alloc_mb'] = pytorch_peak / (1024 * 1024)
+
         # Benchmark 2: MatMul-free CPU operation
         print(f"  Testing MatMul-free CPU ({M}x{K} @ {K}x{N})...")
-        times_matmul_free = []
-        
+
         # Warmup
         for _ in range(5):
             _ = matmul_free_cpu(x, w_ternary, kernel=kernel)
-        
-        # Benchmark
+
+        # Benchmark with memory measurement
+        gc.collect()
+        mem_before_matmul_free = get_process_memory_mb()
+        tracemalloc.start()
+
+        times_matmul_free = []
         for _ in range(num_runs):
             start = time.perf_counter()
             result_matmul_free = matmul_free_cpu(x, w_ternary, kernel=kernel)
             end = time.perf_counter()
             times_matmul_free.append(end - start)
-        
+
+        matmul_free_current, matmul_free_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        mem_after_matmul_free = get_process_memory_mb()
+
         results['matmul_free_time'] = np.mean(times_matmul_free)
         results['matmul_free_std'] = np.std(times_matmul_free)
-        
-        # Calculate metrics
+        results['matmul_free_memory_delta_mb'] = mem_after_matmul_free - mem_before_matmul_free
+        results['matmul_free_peak_alloc_mb'] = matmul_free_peak / (1024 * 1024)
+
+        # Calculate performance metrics
         results['speedup'] = results['pytorch_time'] / results['matmul_free_time']
         results['pytorch_gflops'] = (2 * M * N * K) / results['pytorch_time'] / 1e9
-        results['matmul_free_gflops'] = (M * N * K) / results['matmul_free_time'] / 1e9  # Only add/subtract
-        
-        # Memory usage (approximate)
-        pytorch_memory = (M * K + N * K + M * N) * 4  # float32
-        matmul_free_memory = (M * K + N * K * 0.25 + M * N) * 4  # ternary weights = 2 bits
-        results['memory_reduction'] = pytorch_memory / matmul_free_memory
-        
+        results['matmul_free_gflops'] = (2 * M * N * K) / results['matmul_free_time'] / 1e9
+
+        # Actual memory comparison (not theoretical)
+        if results['matmul_free_peak_alloc_mb'] > 0:
+            results['memory_reduction'] = results['pytorch_peak_alloc_mb'] / results['matmul_free_peak_alloc_mb']
+        else:
+            results['memory_reduction'] = 1.0
+
         return results
     
     def benchmark_model_sizes(self) -> Dict[str, Dict]:
@@ -132,13 +206,16 @@ class CPUBenchmark:
                         'dimensions': (M, N, K),
                         **config_results
                     }
-                    
+
                     print(f"  [{kernel}] PyTorch: {config_results['pytorch_time']*1000:.2f}ms "
                           f"({config_results['pytorch_gflops']:.1f} GFLOPS)")
                     print(f"  [{kernel}] MatMul-free: {config_results['matmul_free_time']*1000:.2f}ms "
                           f"({config_results['matmul_free_gflops']:.1f} GFLOPS)")
                     print(f"  [{kernel}] Speedup: {config_results['speedup']:.2f}x")
-                    print(f"  [{kernel}] Memory reduction: {config_results['memory_reduction']:.1f}x")
+                    print(f"  [{kernel}] Memory (actual):")
+                    print(f"           Tensor alloc: {config_results['tensor_memory_mb']:.2f} MB")
+                    print(f"           PyTorch peak: {config_results['pytorch_peak_alloc_mb']:.2f} MB")
+                    print(f"           MatMul-free peak: {config_results['matmul_free_peak_alloc_mb']:.2f} MB")
                     
                 except Exception as e:
                     print(f"  [{kernel}] Error: {e}")
