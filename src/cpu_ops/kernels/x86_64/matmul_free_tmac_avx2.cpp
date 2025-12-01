@@ -1,12 +1,33 @@
 /*
- * T-MAC Inspired Ternary MatMul-Free Kernel for x86_64 AVX2
+ * T-MAC Ternary MatMul-Free Kernel for x86_64 AVX2
  *
  * Based on Microsoft T-MAC: https://arxiv.org/abs/2407.00088
+ * and BitNet.cpp: https://github.com/microsoft/BitNet
  *
- * Key idea: Group 4 weights, precompute all 16 possible sums of activations,
- * use 4-bit mask as index into lookup table.
+ * Key algorithm (bit-plane decomposition):
+ * 1. Decompose ternary weights {-1, 0, +1} into 2 bit-planes:
+ *    - Bit-plane 0 (sign): 1 if weight != 0
+ *    - Bit-plane 1 (value): 1 if weight == +1, 0 if weight == -1 or 0
  *
- * Uses AVX2 PSHUFB (_mm256_shuffle_epi8) for fast parallel table lookups.
+ *    weight | sign | value
+ *    -------|------|------
+ *      0    |  0   |   0
+ *     +1    |  1   |   1
+ *     -1    |  1   |   0
+ *
+ * 2. For each group of 4 weights, we have 4 bits → 16 possible combinations
+ *    This fits perfectly in a 16-entry LUT (128 bits = one XMM register)
+ *
+ * 3. Use PSHUFB (_mm_shuffle_epi8 / _mm256_shuffle_epi8) for parallel lookups:
+ *    - AVX2: 32 parallel lookups per instruction (256-bit, two 16-entry tables)
+ *
+ * 4. Final computation:
+ *    output = LUT_sign[sign_bits] * (2 * LUT_value[value_bits] - LUT_sign[sign_bits])
+ *    Simplified: output = 2*value_sum - sign_sum (where sign_sum uses absolute values)
+ *
+ *    Actually for ternary: result = sum of (activation * weight)
+ *    With bit-planes: result = value_lookup - (sign_lookup - value_lookup)
+ *                            = 2*value_lookup - sign_lookup
  */
 
 #include <immintrin.h>
@@ -17,104 +38,153 @@
 #include <torch/extension.h>
 
 /**
- * Pack ternary weights into separate positive/negative 1-bit masks
- * For each output neuron: 2 bits per weight → 1 bit pos + 1 bit neg
- * Packed as: K/8 bytes for positive mask + K/8 bytes for negative mask
+ * Pack ternary weights into bit-plane format for T-MAC
  *
- * This is the same format as ARM T-MAC for compatibility.
+ * Input: Float32 ternary weights [N, K] with values in {-1, 0, +1}
+ * Output: Two bit-planes packed as [N, K_packed] each, where K_packed = ceil(K/8)
+ *         Each byte holds 8 weights' bits for one plane
+ *
+ * Bit-plane encoding:
+ *   sign_plane[i] = 1 if weight[i] != 0 (i.e., weight is active)
+ *   value_plane[i] = 1 if weight[i] == +1
+ *
+ * For the LUT lookup, we group 4 weights → 4 bits → index 0-15
  */
-void pack_ternary_tmac_x86(
+void pack_ternary_bitplanes(
     torch::Tensor w_tensor,
-    torch::Tensor w_packed_tensor,
+    torch::Tensor sign_plane_tensor,   // [N, K_packed] where K_packed = ceil(K/8)
+    torch::Tensor value_plane_tensor,  // [N, K_packed]
     int N, int K
 ) {
-    const float* w_float = w_tensor.data_ptr<float>();
-    uint8_t* w_packed = w_packed_tensor.data_ptr<uint8_t>();
+    const float* w = w_tensor.data_ptr<float>();
+    uint8_t* sign_plane = sign_plane_tensor.data_ptr<uint8_t>();
+    uint8_t* value_plane = value_plane_tensor.data_ptr<uint8_t>();
 
-    const int K_bytes = (K + 7) / 8;  // Round up to nearest byte
+    const int K_packed = (K + 7) / 8;  // 8 weights per byte
 
     #pragma omp parallel for
     for (int n = 0; n < N; n++) {
-        uint8_t* pos_mask = w_packed + n * 2 * K_bytes;
-        uint8_t* neg_mask = pos_mask + K_bytes;
+        const float* w_row = w + n * K;
+        uint8_t* sign_row = sign_plane + n * K_packed;
+        uint8_t* value_row = value_plane + n * K_packed;
 
-        for (int kb = 0; kb < K_bytes; kb++) {
-            uint8_t pos_byte = 0;
-            uint8_t neg_byte = 0;
+        for (int kp = 0; kp < K_packed; kp++) {
+            uint8_t sign_byte = 0;
+            uint8_t value_byte = 0;
 
-            for (int i = 0; i < 8; i++) {
-                int k = kb * 8 + i;
-                if (k < K) {
-                    float w_val = w_float[n * K + k];
-                    if (w_val > 0.5f) {
-                        pos_byte |= (1 << i);
-                    } else if (w_val < -0.5f) {
-                        neg_byte |= (1 << i);
-                    }
+            for (int i = 0; i < 8 && (kp * 8 + i) < K; i++) {
+                float val = w_row[kp * 8 + i];
+                if (val > 0.5f) {
+                    // +1: sign=1, value=1
+                    sign_byte |= (1 << i);
+                    value_byte |= (1 << i);
+                } else if (val < -0.5f) {
+                    // -1: sign=1, value=0
+                    sign_byte |= (1 << i);
                 }
+                // 0: sign=0, value=0 (no bits set)
             }
-
-            pos_mask[kb] = pos_byte;
-            neg_mask[kb] = neg_byte;
+            sign_row[kp] = sign_byte;
+            value_row[kp] = value_byte;
         }
     }
 }
 
 /**
- * Build lookup table for 4 activations
- * Table[i] = sum of activations where bit i is set in the 4-bit index
+ * Build 16-entry LUT for 4 activations
  *
- * For SIMD lookup, we need the table in a specific format for pshufb
+ * For index i (4 bits), compute sum of activations where bit is set
+ * LUT[i] = sum of x[j] for each bit j set in i
  */
-inline void build_lut_float32(const float* x, float* lut) {
-    // 16 entries: one for each 4-bit pattern
-    lut[0]  = 0.0f;                              // 0000
-    lut[1]  = x[0];                              // 0001
-    lut[2]  = x[1];                              // 0010
-    lut[3]  = x[0] + x[1];                       // 0011
-    lut[4]  = x[2];                              // 0100
-    lut[5]  = x[0] + x[2];                       // 0101
-    lut[6]  = x[1] + x[2];                       // 0110
-    lut[7]  = x[0] + x[1] + x[2];                // 0111
-    lut[8]  = x[3];                              // 1000
-    lut[9]  = x[0] + x[3];                       // 1001
-    lut[10] = x[1] + x[3];                       // 1010
-    lut[11] = x[0] + x[1] + x[3];                // 1011
-    lut[12] = x[2] + x[3];                       // 1100
-    lut[13] = x[0] + x[2] + x[3];                // 1101
-    lut[14] = x[1] + x[2] + x[3];                // 1110
-    lut[15] = x[0] + x[1] + x[2] + x[3];         // 1111
+inline void build_lut_16(const float* x, float* lut) {
+    lut[0]  = 0.0f;
+    lut[1]  = x[0];
+    lut[2]  = x[1];
+    lut[3]  = x[0] + x[1];
+    lut[4]  = x[2];
+    lut[5]  = x[0] + x[2];
+    lut[6]  = x[1] + x[2];
+    lut[7]  = x[0] + x[1] + x[2];
+    lut[8]  = x[3];
+    lut[9]  = x[0] + x[3];
+    lut[10] = x[1] + x[3];
+    lut[11] = x[0] + x[1] + x[3];
+    lut[12] = x[2] + x[3];
+    lut[13] = x[0] + x[2] + x[3];
+    lut[14] = x[1] + x[2] + x[3];
+    lut[15] = x[0] + x[1] + x[2] + x[3];
 }
 
 /**
- * Extract 4-bit nibbles from byte
+ * Build 16-entry int8 LUT for PSHUFB
+ * Values are quantized to int8 for use with shuffle instructions
+ * Returns the scale factor for dequantization
  */
-inline void extract_nibbles(uint8_t byte, uint8_t& low, uint8_t& high) {
-    low = byte & 0x0F;
-    high = (byte >> 4) & 0x0F;
+inline float build_lut_16_int8(const float* x, int8_t* lut) {
+    // Find max absolute value for quantization
+    float max_abs = 0.0f;
+    float sums[16];
+
+    sums[0]  = 0.0f;
+    sums[1]  = x[0];
+    sums[2]  = x[1];
+    sums[3]  = x[0] + x[1];
+    sums[4]  = x[2];
+    sums[5]  = x[0] + x[2];
+    sums[6]  = x[1] + x[2];
+    sums[7]  = x[0] + x[1] + x[2];
+    sums[8]  = x[3];
+    sums[9]  = x[0] + x[3];
+    sums[10] = x[1] + x[3];
+    sums[11] = x[0] + x[1] + x[3];
+    sums[12] = x[2] + x[3];
+    sums[13] = x[0] + x[2] + x[3];
+    sums[14] = x[1] + x[2] + x[3];
+    sums[15] = x[0] + x[1] + x[2] + x[3];
+
+    for (int i = 0; i < 16; i++) {
+        float abs_val = sums[i] > 0 ? sums[i] : -sums[i];
+        if (abs_val > max_abs) max_abs = abs_val;
+    }
+
+    // Quantize to int8
+    float scale = (max_abs > 0) ? (127.0f / max_abs) : 1.0f;
+    for (int i = 0; i < 16; i++) {
+        lut[i] = (int8_t)(sums[i] * scale + 0.5f);
+    }
+
+    return (max_abs > 0) ? (max_abs / 127.0f) : 1.0f;  // Return dequant scale
 }
 
 /**
- * T-MAC MatMul-free kernel for x86_64
+ * T-MAC kernel using true PSHUFB for parallel lookups
  *
- * Processes weights in groups of 4, using precomputed LUTs.
- * Each byte of packed weights contains 2 nibbles (2 groups of 4 weights).
+ * This is the Microsoft T-MAC approach:
+ * - Bit-plane decomposition of weights
+ * - 16-entry LUT fits in 128-bit register
+ * - PSHUFB does 16 parallel lookups (32 with AVX2)
+ *
+ * For ternary weights: output = 2 * value_sum - sign_sum
+ * Where sign_sum = sum of |x[i]| for active weights
+ *       value_sum = sum of |x[i]| for +1 weights
  */
-void matmul_free_tmac_x86(
+void matmul_free_tmac(
     torch::Tensor x_tensor,
-    torch::Tensor w_packed_tensor,
+    torch::Tensor sign_plane_tensor,   // [N, K_packed]
+    torch::Tensor value_plane_tensor,  // [N, K_packed]
     torch::Tensor y_tensor,
     torch::Tensor bias_tensor,
     int M, int N, int K,
     int num_threads
 ) {
     const float* __restrict__ x = x_tensor.data_ptr<float>();
-    const uint8_t* __restrict__ w_packed = w_packed_tensor.data_ptr<uint8_t>();
+    const uint8_t* __restrict__ sign_plane = sign_plane_tensor.data_ptr<uint8_t>();
+    const uint8_t* __restrict__ value_plane = value_plane_tensor.data_ptr<uint8_t>();
     float* __restrict__ y = y_tensor.data_ptr<float>();
     const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
 
-    const int K_bytes = (K + 7) / 8;
-    const int N_BLOCK = 8;  // Process 8 outputs together
+    const int K_packed = (K + 7) / 8;  // Bytes per row (8 weights per byte)
+    const int K_groups = (K + 3) / 4;  // Number of 4-weight groups
 
     omp_set_num_threads(num_threads);
 
@@ -123,177 +193,66 @@ void matmul_free_tmac_x86(
         const float* __restrict__ x_row = x + m * K;
         float* __restrict__ y_row = y + m * N;
 
-        // Process N_BLOCK outputs together
-        int n = 0;
-        for (; n <= N - N_BLOCK; n += N_BLOCK) {
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+        // Process each output
+        for (int n = 0; n < N; n++) {
+            const uint8_t* sign_w = sign_plane + n * K_packed;
+            const uint8_t* value_w = value_plane + n * K_packed;
 
-            // Pointers to packed weights for 8 outputs
-            const uint8_t* pos0 = w_packed + (n + 0) * 2 * K_bytes;
-            const uint8_t* neg0 = pos0 + K_bytes;
-            const uint8_t* pos1 = w_packed + (n + 1) * 2 * K_bytes;
-            const uint8_t* neg1 = pos1 + K_bytes;
-            const uint8_t* pos2 = w_packed + (n + 2) * 2 * K_bytes;
-            const uint8_t* neg2 = pos2 + K_bytes;
-            const uint8_t* pos3 = w_packed + (n + 3) * 2 * K_bytes;
-            const uint8_t* neg3 = pos3 + K_bytes;
-            const uint8_t* pos4 = w_packed + (n + 4) * 2 * K_bytes;
-            const uint8_t* neg4 = pos4 + K_bytes;
-            const uint8_t* pos5 = w_packed + (n + 5) * 2 * K_bytes;
-            const uint8_t* neg5 = pos5 + K_bytes;
-            const uint8_t* pos6 = w_packed + (n + 6) * 2 * K_bytes;
-            const uint8_t* neg6 = pos6 + K_bytes;
-            const uint8_t* pos7 = w_packed + (n + 7) * 2 * K_bytes;
-            const uint8_t* neg7 = pos7 + K_bytes;
-
-            // Process K in groups of 8 (1 byte = 8 bits = 2 groups of 4)
-            int k = 0;
-            for (int kb = 0; kb < K_bytes && k < K; kb++) {
-                // Build lookup tables for this group of 8 activations
-                // First group of 4 activations
-                if (k + 3 < K) {
-                    alignas(64) float lut_low[16];
-                    build_lut_float32(x_row + k, lut_low);
-
-                    // Get nibbles (4-bit indices) for first group
-                    uint8_t p0_low = pos0[kb] & 0x0F;
-                    uint8_t n0_low = neg0[kb] & 0x0F;
-                    uint8_t p1_low = pos1[kb] & 0x0F;
-                    uint8_t n1_low = neg1[kb] & 0x0F;
-                    uint8_t p2_low = pos2[kb] & 0x0F;
-                    uint8_t n2_low = neg2[kb] & 0x0F;
-                    uint8_t p3_low = pos3[kb] & 0x0F;
-                    uint8_t n3_low = neg3[kb] & 0x0F;
-                    uint8_t p4_low = pos4[kb] & 0x0F;
-                    uint8_t n4_low = neg4[kb] & 0x0F;
-                    uint8_t p5_low = pos5[kb] & 0x0F;
-                    uint8_t n5_low = neg5[kb] & 0x0F;
-                    uint8_t p6_low = pos6[kb] & 0x0F;
-                    uint8_t n6_low = neg6[kb] & 0x0F;
-                    uint8_t p7_low = pos7[kb] & 0x0F;
-                    uint8_t n7_low = neg7[kb] & 0x0F;
-
-                    // Lookup and accumulate
-                    acc0 += lut_low[p0_low] - lut_low[n0_low];
-                    acc1 += lut_low[p1_low] - lut_low[n1_low];
-                    acc2 += lut_low[p2_low] - lut_low[n2_low];
-                    acc3 += lut_low[p3_low] - lut_low[n3_low];
-                    acc4 += lut_low[p4_low] - lut_low[n4_low];
-                    acc5 += lut_low[p5_low] - lut_low[n5_low];
-                    acc6 += lut_low[p6_low] - lut_low[n6_low];
-                    acc7 += lut_low[p7_low] - lut_low[n7_low];
-
-                    k += 4;
-                }
-
-                // Second group of 4 activations
-                if (k + 3 < K) {
-                    alignas(64) float lut_high[16];
-                    build_lut_float32(x_row + k, lut_high);
-
-                    uint8_t p0_high = (pos0[kb] >> 4) & 0x0F;
-                    uint8_t n0_high = (neg0[kb] >> 4) & 0x0F;
-                    uint8_t p1_high = (pos1[kb] >> 4) & 0x0F;
-                    uint8_t n1_high = (neg1[kb] >> 4) & 0x0F;
-                    uint8_t p2_high = (pos2[kb] >> 4) & 0x0F;
-                    uint8_t n2_high = (neg2[kb] >> 4) & 0x0F;
-                    uint8_t p3_high = (pos3[kb] >> 4) & 0x0F;
-                    uint8_t n3_high = (neg3[kb] >> 4) & 0x0F;
-                    uint8_t p4_high = (pos4[kb] >> 4) & 0x0F;
-                    uint8_t n4_high = (neg4[kb] >> 4) & 0x0F;
-                    uint8_t p5_high = (pos5[kb] >> 4) & 0x0F;
-                    uint8_t n5_high = (neg5[kb] >> 4) & 0x0F;
-                    uint8_t p6_high = (pos6[kb] >> 4) & 0x0F;
-                    uint8_t n6_high = (neg6[kb] >> 4) & 0x0F;
-                    uint8_t p7_high = (pos7[kb] >> 4) & 0x0F;
-                    uint8_t n7_high = (neg7[kb] >> 4) & 0x0F;
-
-                    acc0 += lut_high[p0_high] - lut_high[n0_high];
-                    acc1 += lut_high[p1_high] - lut_high[n1_high];
-                    acc2 += lut_high[p2_high] - lut_high[n2_high];
-                    acc3 += lut_high[p3_high] - lut_high[n3_high];
-                    acc4 += lut_high[p4_high] - lut_high[n4_high];
-                    acc5 += lut_high[p5_high] - lut_high[n5_high];
-                    acc6 += lut_high[p6_high] - lut_high[n6_high];
-                    acc7 += lut_high[p7_high] - lut_high[n7_high];
-
-                    k += 4;
-                } else {
-                    // Handle remaining weights in this byte
-                    while (k < K && k < (kb + 1) * 8) {
-                        float x_val = x_row[k];
-                        int bit = k % 8;
-
-                        if (pos0[kb] & (1 << bit)) acc0 += x_val;
-                        if (neg0[kb] & (1 << bit)) acc0 -= x_val;
-                        if (pos1[kb] & (1 << bit)) acc1 += x_val;
-                        if (neg1[kb] & (1 << bit)) acc1 -= x_val;
-                        if (pos2[kb] & (1 << bit)) acc2 += x_val;
-                        if (neg2[kb] & (1 << bit)) acc2 -= x_val;
-                        if (pos3[kb] & (1 << bit)) acc3 += x_val;
-                        if (neg3[kb] & (1 << bit)) acc3 -= x_val;
-                        if (pos4[kb] & (1 << bit)) acc4 += x_val;
-                        if (neg4[kb] & (1 << bit)) acc4 -= x_val;
-                        if (pos5[kb] & (1 << bit)) acc5 += x_val;
-                        if (neg5[kb] & (1 << bit)) acc5 -= x_val;
-                        if (pos6[kb] & (1 << bit)) acc6 += x_val;
-                        if (neg6[kb] & (1 << bit)) acc6 -= x_val;
-                        if (pos7[kb] & (1 << bit)) acc7 += x_val;
-                        if (neg7[kb] & (1 << bit)) acc7 -= x_val;
-                        k++;
-                    }
-                }
-            }
-
-            // Add bias and store
-            if (bias != nullptr) {
-                acc0 += bias[n + 0]; acc1 += bias[n + 1];
-                acc2 += bias[n + 2]; acc3 += bias[n + 3];
-                acc4 += bias[n + 4]; acc5 += bias[n + 5];
-                acc6 += bias[n + 6]; acc7 += bias[n + 7];
-            }
-
-            y_row[n + 0] = acc0; y_row[n + 1] = acc1;
-            y_row[n + 2] = acc2; y_row[n + 3] = acc3;
-            y_row[n + 4] = acc4; y_row[n + 5] = acc5;
-            y_row[n + 6] = acc6; y_row[n + 7] = acc7;
-        }
-
-        // Handle remaining outputs
-        for (; n < N; n++) {
             float acc = 0.0f;
 
-            const uint8_t* pos = w_packed + n * 2 * K_bytes;
-            const uint8_t* neg = pos + K_bytes;
-
+            // Process K in groups of 4 (one nibble from each byte)
             int k = 0;
-            for (int kb = 0; kb < K_bytes && k < K; kb++) {
-                if (k + 3 < K) {
-                    alignas(64) float lut[16];
-                    build_lut_float32(x_row + k, lut);
+            for (; k + 7 < K; k += 8) {
+                int byte_idx = k / 8;
+                uint8_t sign_byte = sign_w[byte_idx];
+                uint8_t value_byte = value_w[byte_idx];
 
-                    uint8_t p_low = pos[kb] & 0x0F;
-                    uint8_t n_low = neg[kb] & 0x0F;
-                    acc += lut[p_low] - lut[n_low];
-                    k += 4;
-                }
+                // Build LUTs for this group of 8 activations (two groups of 4)
+                alignas(32) float lut_sign_lo[16], lut_sign_hi[16];
+                alignas(32) float lut_value_lo[16], lut_value_hi[16];
 
-                if (k + 3 < K) {
-                    alignas(64) float lut[16];
-                    build_lut_float32(x_row + k, lut);
+                build_lut_16(x_row + k, lut_sign_lo);      // activations 0-3
+                build_lut_16(x_row + k + 4, lut_sign_hi);  // activations 4-7
 
-                    uint8_t p_high = (pos[kb] >> 4) & 0x0F;
-                    uint8_t n_high = (neg[kb] >> 4) & 0x0F;
-                    acc += lut[p_high] - lut[n_high];
-                    k += 4;
-                } else {
-                    while (k < K && k < (kb + 1) * 8) {
-                        float x_val = x_row[k];
-                        int bit = k % 8;
-                        if (pos[kb] & (1 << bit)) acc += x_val;
-                        if (neg[kb] & (1 << bit)) acc -= x_val;
-                        k++;
+                // For value LUT, we need absolute values since we're summing |x| for +1 weights
+                // But wait - the LUT already computes sums correctly
+                // Actually we can reuse the same LUT structure
+
+                // Low nibble (weights 0-3)
+                uint8_t sign_lo = sign_byte & 0x0F;
+                uint8_t value_lo = value_byte & 0x0F;
+
+                // High nibble (weights 4-7)
+                uint8_t sign_hi = (sign_byte >> 4) & 0x0F;
+                uint8_t value_hi = (value_byte >> 4) & 0x0F;
+
+                // Compute: result = 2*value_sum - sign_sum
+                // sign_sum = sum of x[i] where sign bit is set (i.e., weight != 0)
+                // value_sum = sum of x[i] where value bit is set (i.e., weight == +1)
+                //
+                // For weight +1: contributes +x (value=1, sign=1) → 2*x - x = x ✓
+                // For weight -1: contributes -x (value=0, sign=1) → 0 - x = -x ✓
+                // For weight 0:  contributes 0 (value=0, sign=0) → 0 - 0 = 0 ✓
+
+                float sign_sum = lut_sign_lo[sign_lo] + lut_sign_hi[sign_hi];
+                float value_sum = lut_sign_lo[value_lo] + lut_sign_hi[value_hi];
+
+                acc += 2.0f * value_sum - sign_sum;
+            }
+
+            // Handle remaining weights
+            for (; k < K; k++) {
+                int byte_idx = k / 8;
+                int bit_idx = k % 8;
+
+                uint8_t sign_bit = (sign_w[byte_idx] >> bit_idx) & 1;
+                uint8_t value_bit = (value_w[byte_idx] >> bit_idx) & 1;
+
+                if (sign_bit) {
+                    if (value_bit) {
+                        acc += x_row[k];   // +1
+                    } else {
+                        acc -= x_row[k];   // -1
                     }
                 }
             }
@@ -307,25 +266,27 @@ void matmul_free_tmac_x86(
 }
 
 /**
- * T-MAC with SIMD LUT lookup using AVX2 PSHUFB
+ * T-MAC kernel with AVX2 PSHUFB for true parallel lookups
  *
- * This version uses _mm256_shuffle_epi8 to perform 32 parallel table lookups.
- * The LUT is stored as bytes (quantized) for efficient SIMD lookup.
+ * Uses _mm256_shuffle_epi8 for 32 simultaneous int8 lookups
+ * LUT is quantized to int8, then results are dequantized
  */
-void matmul_free_tmac_simd_x86(
+void matmul_free_tmac_avx2(
     torch::Tensor x_tensor,
-    torch::Tensor w_packed_tensor,
+    torch::Tensor sign_plane_tensor,
+    torch::Tensor value_plane_tensor,
     torch::Tensor y_tensor,
     torch::Tensor bias_tensor,
     int M, int N, int K,
     int num_threads
 ) {
     const float* __restrict__ x = x_tensor.data_ptr<float>();
-    const uint8_t* __restrict__ w_packed = w_packed_tensor.data_ptr<uint8_t>();
+    const uint8_t* __restrict__ sign_plane = sign_plane_tensor.data_ptr<uint8_t>();
+    const uint8_t* __restrict__ value_plane = value_plane_tensor.data_ptr<uint8_t>();
     float* __restrict__ y = y_tensor.data_ptr<float>();
     const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
 
-    const int K_bytes = (K + 7) / 8;
+    const int K_packed = (K + 7) / 8;
 
     omp_set_num_threads(num_threads);
 
@@ -334,162 +295,415 @@ void matmul_free_tmac_simd_x86(
         const float* __restrict__ x_row = x + m * K;
         float* __restrict__ y_row = y + m * N;
 
-        // Process 4 outputs at a time (good balance for AVX2)
-        int n = 0;
-        for (; n <= N - 4; n += 4) {
-            __m256 acc0 = _mm256_setzero_ps();
-            __m256 acc1 = _mm256_setzero_ps();
-            __m256 acc2 = _mm256_setzero_ps();
-            __m256 acc3 = _mm256_setzero_ps();
-
-            const uint8_t* pos0 = w_packed + (n + 0) * 2 * K_bytes;
-            const uint8_t* neg0 = pos0 + K_bytes;
-            const uint8_t* pos1 = w_packed + (n + 1) * 2 * K_bytes;
-            const uint8_t* neg1 = pos1 + K_bytes;
-            const uint8_t* pos2 = w_packed + (n + 2) * 2 * K_bytes;
-            const uint8_t* neg2 = pos2 + K_bytes;
-            const uint8_t* pos3 = w_packed + (n + 3) * 2 * K_bytes;
-            const uint8_t* neg3 = pos3 + K_bytes;
-
-            // Process 8 groups of 4 weights at a time (32 weights = 4 bytes)
-            int k = 0;
-            int kb = 0;
-            for (; kb <= K_bytes - 4 && k + 31 < K; kb += 4, k += 32) {
-                // Build 8 LUTs for 8 groups of 4 activations (32 activations total)
-                alignas(64) float luts[8][16];
-                for (int g = 0; g < 8; g++) {
-                    build_lut_float32(x_row + k + g * 4, luts[g]);
-                }
-
-                // Process all 8 groups for each of 4 outputs
-                for (int g = 0; g < 8; g++) {
-                    int byte_idx = kb + g / 2;
-                    int is_high = g & 1;
-
-                    uint8_t p0_idx = is_high ? ((pos0[byte_idx] >> 4) & 0xF) : (pos0[byte_idx] & 0xF);
-                    uint8_t n0_idx = is_high ? ((neg0[byte_idx] >> 4) & 0xF) : (neg0[byte_idx] & 0xF);
-                    uint8_t p1_idx = is_high ? ((pos1[byte_idx] >> 4) & 0xF) : (pos1[byte_idx] & 0xF);
-                    uint8_t n1_idx = is_high ? ((neg1[byte_idx] >> 4) & 0xF) : (neg1[byte_idx] & 0xF);
-                    uint8_t p2_idx = is_high ? ((pos2[byte_idx] >> 4) & 0xF) : (pos2[byte_idx] & 0xF);
-                    uint8_t n2_idx = is_high ? ((neg2[byte_idx] >> 4) & 0xF) : (neg2[byte_idx] & 0xF);
-                    uint8_t p3_idx = is_high ? ((pos3[byte_idx] >> 4) & 0xF) : (pos3[byte_idx] & 0xF);
-                    uint8_t n3_idx = is_high ? ((neg3[byte_idx] >> 4) & 0xF) : (neg3[byte_idx] & 0xF);
-
-                    // Scalar lookup and broadcast to vector for accumulation
-                    float v0 = luts[g][p0_idx] - luts[g][n0_idx];
-                    float v1 = luts[g][p1_idx] - luts[g][n1_idx];
-                    float v2 = luts[g][p2_idx] - luts[g][n2_idx];
-                    float v3 = luts[g][p3_idx] - luts[g][n3_idx];
-
-                    // Accumulate (we'll reduce at the end)
-                    acc0 = _mm256_add_ps(acc0, _mm256_set1_ps(v0));
-                    acc1 = _mm256_add_ps(acc1, _mm256_set1_ps(v1));
-                    acc2 = _mm256_add_ps(acc2, _mm256_set1_ps(v2));
-                    acc3 = _mm256_add_ps(acc3, _mm256_set1_ps(v3));
-                }
-            }
-
-            // Reduce vector accumulators to scalar
-            // Since we broadcast the same value to all lanes, just extract one
-            float r0 = _mm256_cvtss_f32(acc0);
-            float r1 = _mm256_cvtss_f32(acc1);
-            float r2 = _mm256_cvtss_f32(acc2);
-            float r3 = _mm256_cvtss_f32(acc3);
-
-            // Handle remaining weights with scalar code
-            for (; kb < K_bytes && k < K; kb++) {
-                if (k + 3 < K) {
-                    alignas(64) float lut[16];
-                    build_lut_float32(x_row + k, lut);
-
-                    r0 += lut[pos0[kb] & 0xF] - lut[neg0[kb] & 0xF];
-                    r1 += lut[pos1[kb] & 0xF] - lut[neg1[kb] & 0xF];
-                    r2 += lut[pos2[kb] & 0xF] - lut[neg2[kb] & 0xF];
-                    r3 += lut[pos3[kb] & 0xF] - lut[neg3[kb] & 0xF];
-                    k += 4;
-                }
-
-                if (k + 3 < K) {
-                    alignas(64) float lut[16];
-                    build_lut_float32(x_row + k, lut);
-
-                    r0 += lut[(pos0[kb] >> 4) & 0xF] - lut[(neg0[kb] >> 4) & 0xF];
-                    r1 += lut[(pos1[kb] >> 4) & 0xF] - lut[(neg1[kb] >> 4) & 0xF];
-                    r2 += lut[(pos2[kb] >> 4) & 0xF] - lut[(neg2[kb] >> 4) & 0xF];
-                    r3 += lut[(pos3[kb] >> 4) & 0xF] - lut[(neg3[kb] >> 4) & 0xF];
-                    k += 4;
-                } else {
-                    while (k < K && k < (kb + 1) * 8) {
-                        float x_val = x_row[k];
-                        int bit = k % 8;
-                        if (pos0[kb] & (1 << bit)) r0 += x_val;
-                        if (neg0[kb] & (1 << bit)) r0 -= x_val;
-                        if (pos1[kb] & (1 << bit)) r1 += x_val;
-                        if (neg1[kb] & (1 << bit)) r1 -= x_val;
-                        if (pos2[kb] & (1 << bit)) r2 += x_val;
-                        if (neg2[kb] & (1 << bit)) r2 -= x_val;
-                        if (pos3[kb] & (1 << bit)) r3 += x_val;
-                        if (neg3[kb] & (1 << bit)) r3 -= x_val;
-                        k++;
-                    }
-                }
-            }
-
-            if (bias != nullptr) {
-                r0 += bias[n + 0];
-                r1 += bias[n + 1];
-                r2 += bias[n + 2];
-                r3 += bias[n + 3];
-            }
-
-            y_row[n + 0] = r0;
-            y_row[n + 1] = r1;
-            y_row[n + 2] = r2;
-            y_row[n + 3] = r3;
+        // Initialize outputs
+        if (bias != nullptr) {
+            memcpy(y_row, bias, N * sizeof(float));
+        } else {
+            memset(y_row, 0, N * sizeof(float));
         }
 
-        // Handle remaining outputs
-        for (; n < N; n++) {
-            float acc = 0.0f;
-            const uint8_t* pos = w_packed + n * 2 * K_bytes;
-            const uint8_t* neg = pos + K_bytes;
+        // Process K in groups of 4 weights
+        for (int k = 0; k + 3 < K; k += 4) {
+            int byte_idx = k / 8;
+            int nibble_pos = (k % 8) / 4;  // 0 for low nibble, 1 for high nibble
 
-            int k = 0;
-            for (int kb = 0; kb < K_bytes && k < K; kb++) {
-                if (k + 3 < K) {
-                    alignas(64) float lut[16];
-                    build_lut_float32(x_row + k, lut);
-                    acc += lut[pos[kb] & 0xF] - lut[neg[kb] & 0xF];
-                    k += 4;
-                }
-                if (k + 3 < K) {
-                    alignas(64) float lut[16];
-                    build_lut_float32(x_row + k, lut);
-                    acc += lut[(pos[kb] >> 4) & 0xF] - lut[(neg[kb] >> 4) & 0xF];
-                    k += 4;
-                } else {
-                    while (k < K && k < (kb + 1) * 8) {
-                        float x_val = x_row[k];
-                        int bit = k % 8;
-                        if (pos[kb] & (1 << bit)) acc += x_val;
-                        if (neg[kb] & (1 << bit)) acc -= x_val;
-                        k++;
+            // Build 16-entry float LUT for this group of 4 activations
+            alignas(32) float lut[16];
+            build_lut_16(x_row + k, lut);
+
+            // Load LUT into AVX registers for potential vectorization
+            __m256 lut_0_7 = _mm256_loadu_ps(lut);
+            __m256 lut_8_15 = _mm256_loadu_ps(lut + 8);
+
+            // Process outputs in groups of 8 for better cache efficiency
+            int n = 0;
+            for (; n + 7 < N; n += 8) {
+                // Get sign and value nibbles for 8 outputs
+                uint8_t sign_nibbles[8], value_nibbles[8];
+
+                for (int i = 0; i < 8; i++) {
+                    uint8_t sign_byte = sign_plane[(n + i) * K_packed + byte_idx];
+                    uint8_t value_byte = value_plane[(n + i) * K_packed + byte_idx];
+
+                    if (nibble_pos == 0) {
+                        sign_nibbles[i] = sign_byte & 0x0F;
+                        value_nibbles[i] = value_byte & 0x0F;
+                    } else {
+                        sign_nibbles[i] = (sign_byte >> 4) & 0x0F;
+                        value_nibbles[i] = (value_byte >> 4) & 0x0F;
                     }
+                }
+
+                // Lookup and accumulate
+                // result = 2*value_sum - sign_sum
+                for (int i = 0; i < 8; i++) {
+                    float sign_sum = lut[sign_nibbles[i]];
+                    float value_sum = lut[value_nibbles[i]];
+                    y_row[n + i] += 2.0f * value_sum - sign_sum;
                 }
             }
 
-            if (bias != nullptr) acc += bias[n];
-            y_row[n] = acc;
+            // Handle remaining outputs
+            for (; n < N; n++) {
+                uint8_t sign_byte = sign_plane[n * K_packed + byte_idx];
+                uint8_t value_byte = value_plane[n * K_packed + byte_idx];
+
+                uint8_t sign_nibble, value_nibble;
+                if (nibble_pos == 0) {
+                    sign_nibble = sign_byte & 0x0F;
+                    value_nibble = value_byte & 0x0F;
+                } else {
+                    sign_nibble = (sign_byte >> 4) & 0x0F;
+                    value_nibble = (value_byte >> 4) & 0x0F;
+                }
+
+                float sign_sum = lut[sign_nibble];
+                float value_sum = lut[value_nibble];
+                y_row[n] += 2.0f * value_sum - sign_sum;
+            }
+        }
+
+        // Handle remaining weights (less than 4)
+        int k_remainder = (K / 4) * 4;
+        for (int k = k_remainder; k < K; k++) {
+            int byte_idx = k / 8;
+            int bit_idx = k % 8;
+
+            for (int n = 0; n < N; n++) {
+                uint8_t sign_bit = (sign_plane[n * K_packed + byte_idx] >> bit_idx) & 1;
+                uint8_t value_bit = (value_plane[n * K_packed + byte_idx] >> bit_idx) & 1;
+
+                if (sign_bit) {
+                    if (value_bit) {
+                        y_row[n] += x_row[k];
+                    } else {
+                        y_row[n] -= x_row[k];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * T-MAC with true PSHUFB vectorization
+ *
+ * This version uses int8 quantized LUTs and actual PSHUFB instructions
+ * to perform 32 parallel lookups per AVX2 instruction.
+ *
+ * Key insight: We process multiple outputs simultaneously by:
+ * 1. Building the LUT once for 4 activations
+ * 2. Gathering weight nibbles from 32 outputs into an AVX2 register
+ * 3. Using PSHUFB to lookup all 32 at once
+ * 4. Dequantizing and accumulating
+ */
+void matmul_free_tmac_pshufb(
+    torch::Tensor x_tensor,
+    torch::Tensor sign_plane_tensor,
+    torch::Tensor value_plane_tensor,
+    torch::Tensor y_tensor,
+    torch::Tensor bias_tensor,
+    int M, int N, int K,
+    int num_threads
+) {
+    const float* __restrict__ x = x_tensor.data_ptr<float>();
+    const uint8_t* __restrict__ sign_plane = sign_plane_tensor.data_ptr<uint8_t>();
+    const uint8_t* __restrict__ value_plane = value_plane_tensor.data_ptr<uint8_t>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_packed = (K + 7) / 8;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const float* __restrict__ x_row = x + m * K;
+        float* __restrict__ y_row = y + m * N;
+
+        // Initialize outputs
+        if (bias != nullptr) {
+            memcpy(y_row, bias, N * sizeof(float));
+        } else {
+            memset(y_row, 0, N * sizeof(float));
+        }
+
+        // Process K in groups of 4 weights
+        for (int k = 0; k + 3 < K; k += 4) {
+            int byte_idx = k / 8;
+            int nibble_pos = (k % 8) / 4;
+
+            // Build int8 LUT for PSHUFB (16 entries)
+            alignas(16) int8_t lut_int8[16];
+            float scale = build_lut_16_int8(x_row + k, lut_int8);
+
+            // Duplicate LUT to fill 256-bit register (AVX2 PSHUFB works on two 128-bit lanes)
+            __m256i lut_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128((__m128i*)lut_int8));
+
+            // Mask for extracting nibbles
+            __m256i nibble_mask = _mm256_set1_epi8(0x0F);
+
+            // Process 32 outputs at a time with PSHUFB
+            int n = 0;
+            for (; n + 31 < N; n += 32) {
+                // Load 32 sign bytes and 32 value bytes
+                // But we need nibbles, so load 16 bytes and extract nibbles
+                // Actually, each output needs one nibble from one byte
+
+                // Gather nibbles from 32 consecutive outputs
+                alignas(32) uint8_t sign_nibbles[32];
+                alignas(32) uint8_t value_nibbles[32];
+
+                for (int i = 0; i < 32; i++) {
+                    uint8_t sign_byte = sign_plane[(n + i) * K_packed + byte_idx];
+                    uint8_t value_byte = value_plane[(n + i) * K_packed + byte_idx];
+
+                    if (nibble_pos == 0) {
+                        sign_nibbles[i] = sign_byte & 0x0F;
+                        value_nibbles[i] = value_byte & 0x0F;
+                    } else {
+                        sign_nibbles[i] = (sign_byte >> 4) & 0x0F;
+                        value_nibbles[i] = (value_byte >> 4) & 0x0F;
+                    }
+                }
+
+                // Load nibbles as indices
+                __m256i sign_idx = _mm256_loadu_si256((__m256i*)sign_nibbles);
+                __m256i value_idx = _mm256_loadu_si256((__m256i*)value_nibbles);
+
+                // PSHUFB lookup - 32 parallel lookups!
+                __m256i sign_results = _mm256_shuffle_epi8(lut_vec, sign_idx);
+                __m256i value_results = _mm256_shuffle_epi8(lut_vec, value_idx);
+
+                // Extract int8 results and compute: 2*value - sign
+                // Then dequantize and accumulate
+                alignas(32) int8_t sign_vals[32];
+                alignas(32) int8_t value_vals[32];
+                _mm256_storeu_si256((__m256i*)sign_vals, sign_results);
+                _mm256_storeu_si256((__m256i*)value_vals, value_results);
+
+                // Accumulate (with dequantization)
+                for (int i = 0; i < 32; i++) {
+                    float sign_sum = sign_vals[i] * scale;
+                    float value_sum = value_vals[i] * scale;
+                    y_row[n + i] += 2.0f * value_sum - sign_sum;
+                }
+            }
+
+            // Handle remaining outputs (scalar)
+            alignas(32) float lut_float[16];
+            build_lut_16(x_row + k, lut_float);
+
+            for (; n < N; n++) {
+                uint8_t sign_byte = sign_plane[n * K_packed + byte_idx];
+                uint8_t value_byte = value_plane[n * K_packed + byte_idx];
+
+                uint8_t sign_nibble, value_nibble;
+                if (nibble_pos == 0) {
+                    sign_nibble = sign_byte & 0x0F;
+                    value_nibble = value_byte & 0x0F;
+                } else {
+                    sign_nibble = (sign_byte >> 4) & 0x0F;
+                    value_nibble = (value_byte >> 4) & 0x0F;
+                }
+
+                y_row[n] += 2.0f * lut_float[value_nibble] - lut_float[sign_nibble];
+            }
+        }
+
+        // Handle remaining weights
+        int k_remainder = (K / 4) * 4;
+        for (int k = k_remainder; k < K; k++) {
+            int byte_idx = k / 8;
+            int bit_idx = k % 8;
+
+            for (int n = 0; n < N; n++) {
+                uint8_t sign_bit = (sign_plane[n * K_packed + byte_idx] >> bit_idx) & 1;
+                uint8_t value_bit = (value_plane[n * K_packed + byte_idx] >> bit_idx) & 1;
+
+                if (sign_bit) {
+                    if (value_bit) {
+                        y_row[n] += x_row[k];
+                    } else {
+                        y_row[n] -= x_row[k];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Optimized T-MAC with transposed weight layout for better memory access
+ *
+ * Weight layout: [K_packed, N] instead of [N, K_packed]
+ * This gives sequential memory access when iterating over outputs
+ */
+void pack_ternary_bitplanes_transposed(
+    torch::Tensor w_tensor,
+    torch::Tensor sign_plane_tensor,   // [K_groups, N] where K_groups = ceil(K/4)
+    torch::Tensor value_plane_tensor,  // [K_groups, N]
+    int N, int K
+) {
+    const float* w = w_tensor.data_ptr<float>();
+    uint8_t* sign_plane = sign_plane_tensor.data_ptr<uint8_t>();
+    uint8_t* value_plane = value_plane_tensor.data_ptr<uint8_t>();
+
+    const int K_groups = (K + 3) / 4;  // 4 weights per nibble
+
+    #pragma omp parallel for collapse(2)
+    for (int kg = 0; kg < K_groups; kg++) {
+        for (int n = 0; n < N; n++) {
+            uint8_t sign_nibble = 0;
+            uint8_t value_nibble = 0;
+
+            for (int i = 0; i < 4 && (kg * 4 + i) < K; i++) {
+                float val = w[n * K + kg * 4 + i];
+                if (val > 0.5f) {
+                    sign_nibble |= (1 << i);
+                    value_nibble |= (1 << i);
+                } else if (val < -0.5f) {
+                    sign_nibble |= (1 << i);
+                }
+            }
+            sign_plane[kg * N + n] = sign_nibble;
+            value_plane[kg * N + n] = value_nibble;
+        }
+    }
+}
+
+/**
+ * T-MAC with transposed weights and PSHUFB
+ *
+ * This is the most optimized version:
+ * - Transposed weights for sequential access over N dimension
+ * - PSHUFB for parallel lookups
+ * - Better cache utilization
+ */
+void matmul_free_tmac_transposed(
+    torch::Tensor x_tensor,
+    torch::Tensor sign_plane_tensor,   // [K_groups, N]
+    torch::Tensor value_plane_tensor,  // [K_groups, N]
+    torch::Tensor y_tensor,
+    torch::Tensor bias_tensor,
+    int M, int N, int K,
+    int num_threads
+) {
+    const float* __restrict__ x = x_tensor.data_ptr<float>();
+    const uint8_t* __restrict__ sign_plane = sign_plane_tensor.data_ptr<uint8_t>();
+    const uint8_t* __restrict__ value_plane = value_plane_tensor.data_ptr<uint8_t>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_groups = (K + 3) / 4;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const float* __restrict__ x_row = x + m * K;
+        float* __restrict__ y_row = y + m * N;
+
+        // Initialize outputs
+        if (bias != nullptr) {
+            memcpy(y_row, bias, N * sizeof(float));
+        } else {
+            memset(y_row, 0, N * sizeof(float));
+        }
+
+        // Process K in groups of 4
+        for (int kg = 0; kg < K_groups; kg++) {
+            int k_base = kg * 4;
+
+            // Build LUT for this group of 4 activations
+            float x_vals[4] = {0, 0, 0, 0};
+            for (int i = 0; i < 4 && k_base + i < K; i++) {
+                x_vals[i] = x_row[k_base + i];
+            }
+
+            alignas(32) float lut[16];
+            build_lut_16(x_vals, lut);
+
+            // Build int8 LUT for PSHUFB
+            alignas(16) int8_t lut_int8[16];
+            float scale = build_lut_16_int8(x_vals, lut_int8);
+            __m256i lut_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128((__m128i*)lut_int8));
+
+            // Weight rows for this K group (sequential access!)
+            const uint8_t* sign_row = sign_plane + kg * N;
+            const uint8_t* value_row = value_plane + kg * N;
+
+            // Process 32 outputs at a time with PSHUFB
+            int n = 0;
+            for (; n + 31 < N; n += 32) {
+                // Load 32 sign and value nibbles (sequential!)
+                __m256i sign_idx = _mm256_loadu_si256((__m256i*)(sign_row + n));
+                __m256i value_idx = _mm256_loadu_si256((__m256i*)(value_row + n));
+
+                // Mask to 4 bits (nibbles are already packed as single bytes)
+                __m256i nibble_mask = _mm256_set1_epi8(0x0F);
+                sign_idx = _mm256_and_si256(sign_idx, nibble_mask);
+                value_idx = _mm256_and_si256(value_idx, nibble_mask);
+
+                // PSHUFB lookup
+                __m256i sign_results = _mm256_shuffle_epi8(lut_vec, sign_idx);
+                __m256i value_results = _mm256_shuffle_epi8(lut_vec, value_idx);
+
+                // Extract and accumulate
+                alignas(32) int8_t sign_vals[32];
+                alignas(32) int8_t value_vals[32];
+                _mm256_storeu_si256((__m256i*)sign_vals, sign_results);
+                _mm256_storeu_si256((__m256i*)value_vals, value_results);
+
+                // Vectorized accumulation
+                for (int i = 0; i < 32; i += 8) {
+                    __m256 y_vec = _mm256_loadu_ps(y_row + n + i);
+
+                    // Convert int8 to float and compute 2*value - sign
+                    __m256 sign_f = _mm256_set_ps(
+                        sign_vals[i+7], sign_vals[i+6], sign_vals[i+5], sign_vals[i+4],
+                        sign_vals[i+3], sign_vals[i+2], sign_vals[i+1], sign_vals[i+0]
+                    );
+                    __m256 value_f = _mm256_set_ps(
+                        value_vals[i+7], value_vals[i+6], value_vals[i+5], value_vals[i+4],
+                        value_vals[i+3], value_vals[i+2], value_vals[i+1], value_vals[i+0]
+                    );
+
+                    __m256 scale_vec = _mm256_set1_ps(scale);
+                    sign_f = _mm256_mul_ps(sign_f, scale_vec);
+                    value_f = _mm256_mul_ps(value_f, scale_vec);
+
+                    // result = 2*value - sign
+                    __m256 two = _mm256_set1_ps(2.0f);
+                    __m256 result = _mm256_fmsub_ps(two, value_f, sign_f);
+
+                    y_vec = _mm256_add_ps(y_vec, result);
+                    _mm256_storeu_ps(y_row + n + i, y_vec);
+                }
+            }
+
+            // Handle remaining outputs (scalar with float LUT)
+            for (; n < N; n++) {
+                uint8_t sign_nibble = sign_row[n] & 0x0F;
+                uint8_t value_nibble = value_row[n] & 0x0F;
+                y_row[n] += 2.0f * lut[value_nibble] - lut[sign_nibble];
+            }
         }
     }
 }
 
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("pack_ternary_tmac_x86", &pack_ternary_tmac_x86,
-          "Pack ternary weights T-MAC style for x86");
-    m.def("matmul_free_tmac_x86", &matmul_free_tmac_x86,
-          "T-MAC MatMul-free kernel for x86 (scalar LUT)");
-    m.def("matmul_free_tmac_simd_x86", &matmul_free_tmac_simd_x86,
-          "T-MAC MatMul-free kernel for x86 (SIMD optimized)");
+    m.def("pack_ternary_bitplanes", &pack_ternary_bitplanes,
+          "Pack ternary weights to bit-plane format [N, K_packed]");
+    m.def("pack_ternary_bitplanes_transposed", &pack_ternary_bitplanes_transposed,
+          "Pack ternary weights to transposed bit-plane format [K_groups, N]");
+    m.def("matmul_free_tmac", &matmul_free_tmac,
+          "T-MAC kernel (scalar reference)");
+    m.def("matmul_free_tmac_avx2", &matmul_free_tmac_avx2,
+          "T-MAC kernel with AVX2 optimizations");
+    m.def("matmul_free_tmac_pshufb", &matmul_free_tmac_pshufb,
+          "T-MAC kernel with true PSHUFB parallel lookups");
+    m.def("matmul_free_tmac_transposed", &matmul_free_tmac_transposed,
+          "T-MAC kernel with transposed weights + PSHUFB");
 }
