@@ -107,11 +107,42 @@ void pack_weights_2bit_avx512(
 }
 
 /**
+ * Fast mask extraction from 2-bit packed weights using SIMD
+ *
+ * Given a uint32_t with 16 x 2-bit codes (encoding: 00=0, 01=+1, 11=-1):
+ * - Extract bit0 of each 2-bit code -> if code & 1 is set, weight is non-zero
+ * - Extract bit1 of each 2-bit code -> if code & 2 is set, weight is negative
+ *
+ * pos_mask = (bit0 set) AND (bit1 not set) = code == 01
+ * neg_mask = (bit0 set) AND (bit1 set) = code == 11
+ */
+inline void extract_masks_fast(uint32_t packed, __mmask16& pos_mask, __mmask16& neg_mask) {
+    // Extract even bits (bit0 of each 2-bit code) and odd bits (bit1)
+    // packed format: b31b30 b29b28 ... b3b2 b1b0
+    // bit0 positions: 0, 2, 4, 6, ... 30 (even)
+    // bit1 positions: 1, 3, 5, 7, ... 31 (odd)
+
+    // Use PEXT to extract specific bits (BMI2 instruction)
+    // Even bits mask: 0x55555555 = 0101...0101
+    // Odd bits mask:  0xAAAAAAAA = 1010...1010
+
+    uint32_t bit0_vals = _pext_u32(packed, 0x55555555);  // Extract bit0 of each code
+    uint32_t bit1_vals = _pext_u32(packed, 0xAAAAAAAA);  // Extract bit1 of each code
+
+    // pos_mask: bit0=1 AND bit1=0 (code == 01)
+    // neg_mask: bit0=1 AND bit1=1 (code == 11)
+    pos_mask = (__mmask16)(bit0_vals & ~bit1_vals);
+    neg_mask = (__mmask16)(bit0_vals & bit1_vals);
+}
+
+/**
  * AVX-512 MatMul-free kernel with 2-bit packed weights
  *
+ * Uses BMI2 PEXT instruction for fast mask extraction (no scalar loops)
+ *
  * For each group of 16 weights packed in a uint32_t:
- * - Extract positive mask (where code == 01)
- * - Extract negative mask (where code == 11)
+ * - Extract positive mask (where code == 01) using PEXT
+ * - Extract negative mask (where code == 11) using PEXT
  * - Use masks to selectively add/subtract input values
  *
  * @param x_tensor Input matrix [M, K]
@@ -136,77 +167,74 @@ void matmul_free_avx512_packed(
     const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
 
     const int K_packed = (K + 15) / 16;
-    const int K_aligned = K_packed * 16;  // K rounded up to multiple of 16
 
     omp_set_num_threads(num_threads);
-
-    // Lookup tables for decoding 2-bit codes to masks
-    // For a 2-bit code: 00=0, 01=+1, 11=-1
-    // pos_mask[code] = 1 if code==01, else 0
-    // neg_mask[code] = 1 if code==11, else 0
-    alignas(64) static const uint32_t pos_lut[4] = {0, 0xFFFFFFFF, 0, 0};
-    alignas(64) static const uint32_t neg_lut[4] = {0, 0, 0, 0xFFFFFFFF};
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
         const float* __restrict__ x_row = x + m * K;
         float* __restrict__ y_row = y + m * N;
 
-        // Process 2 outputs at a time for better register utilization
+        // Process 4 outputs at a time for better register utilization
         int n = 0;
-        for (; n <= N - 2; n += 2) {
+        for (; n <= N - 4; n += 4) {
             const uint32_t* __restrict__ wp0 = w_packed + (n + 0) * K_packed;
             const uint32_t* __restrict__ wp1 = w_packed + (n + 1) * K_packed;
+            const uint32_t* __restrict__ wp2 = w_packed + (n + 2) * K_packed;
+            const uint32_t* __restrict__ wp3 = w_packed + (n + 3) * K_packed;
 
             __m512 sum_pos0 = _mm512_setzero_ps();
             __m512 sum_neg0 = _mm512_setzero_ps();
             __m512 sum_pos1 = _mm512_setzero_ps();
             __m512 sum_neg1 = _mm512_setzero_ps();
+            __m512 sum_pos2 = _mm512_setzero_ps();
+            __m512 sum_neg2 = _mm512_setzero_ps();
+            __m512 sum_pos3 = _mm512_setzero_ps();
+            __m512 sum_neg3 = _mm512_setzero_ps();
 
             for (int kp = 0; kp < K_packed; kp++) {
                 // Load 16 input values
                 __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
 
-                // Decode packed weights for output 0
-                uint32_t packed0 = wp0[kp];
-                __mmask16 pos_mask0 = 0, neg_mask0 = 0;
+                // Decode packed weights using fast PEXT-based extraction
+                __mmask16 pos_mask0, neg_mask0;
+                __mmask16 pos_mask1, neg_mask1;
+                __mmask16 pos_mask2, neg_mask2;
+                __mmask16 pos_mask3, neg_mask3;
 
-                // Extract masks: check each 2-bit code
-                for (int i = 0; i < 16; i++) {
-                    uint32_t code = (packed0 >> (i * 2)) & 0x3;
-                    if (code == 0x1) pos_mask0 |= (1 << i);
-                    else if (code == 0x3) neg_mask0 |= (1 << i);
-                }
+                extract_masks_fast(wp0[kp], pos_mask0, neg_mask0);
+                extract_masks_fast(wp1[kp], pos_mask1, neg_mask1);
+                extract_masks_fast(wp2[kp], pos_mask2, neg_mask2);
+                extract_masks_fast(wp3[kp], pos_mask3, neg_mask3);
 
                 // Masked addition using AVX-512 mask registers
                 sum_pos0 = _mm512_mask_add_ps(sum_pos0, pos_mask0, sum_pos0, x_vals);
                 sum_neg0 = _mm512_mask_add_ps(sum_neg0, neg_mask0, sum_neg0, x_vals);
-
-                // Decode packed weights for output 1
-                uint32_t packed1 = wp1[kp];
-                __mmask16 pos_mask1 = 0, neg_mask1 = 0;
-
-                for (int i = 0; i < 16; i++) {
-                    uint32_t code = (packed1 >> (i * 2)) & 0x3;
-                    if (code == 0x1) pos_mask1 |= (1 << i);
-                    else if (code == 0x3) neg_mask1 |= (1 << i);
-                }
-
                 sum_pos1 = _mm512_mask_add_ps(sum_pos1, pos_mask1, sum_pos1, x_vals);
                 sum_neg1 = _mm512_mask_add_ps(sum_neg1, neg_mask1, sum_neg1, x_vals);
+                sum_pos2 = _mm512_mask_add_ps(sum_pos2, pos_mask2, sum_pos2, x_vals);
+                sum_neg2 = _mm512_mask_add_ps(sum_neg2, neg_mask2, sum_neg2, x_vals);
+                sum_pos3 = _mm512_mask_add_ps(sum_pos3, pos_mask3, sum_pos3, x_vals);
+                sum_neg3 = _mm512_mask_add_ps(sum_neg3, neg_mask3, sum_neg3, x_vals);
             }
 
             // Horizontal sum and store
             float r0 = hsum_avx512(sum_pos0) - hsum_avx512(sum_neg0);
             float r1 = hsum_avx512(sum_pos1) - hsum_avx512(sum_neg1);
+            float r2 = hsum_avx512(sum_pos2) - hsum_avx512(sum_neg2);
+            float r3 = hsum_avx512(sum_pos3) - hsum_avx512(sum_neg3);
 
             if (bias != nullptr) {
                 r0 += bias[n + 0];
                 r1 += bias[n + 1];
+                r2 += bias[n + 2];
+                r3 += bias[n + 3];
             }
 
             y_row[n + 0] = r0;
             y_row[n + 1] = r1;
+            y_row[n + 2] = r2;
+            y_row[n + 3] = r3;
         }
 
         // Handle remaining outputs
@@ -219,14 +247,8 @@ void matmul_free_avx512_packed(
             for (int kp = 0; kp < K_packed; kp++) {
                 __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
 
-                uint32_t packed = wp[kp];
-                __mmask16 pos_mask = 0, neg_mask = 0;
-
-                for (int i = 0; i < 16; i++) {
-                    uint32_t code = (packed >> (i * 2)) & 0x3;
-                    if (code == 0x1) pos_mask |= (1 << i);
-                    else if (code == 0x3) neg_mask |= (1 << i);
-                }
+                __mmask16 pos_mask, neg_mask;
+                extract_masks_fast(wp[kp], pos_mask, neg_mask);
 
                 sum_pos = _mm512_mask_add_ps(sum_pos, pos_mask, sum_pos, x_vals);
                 sum_neg = _mm512_mask_add_ps(sum_neg, neg_mask, sum_neg, x_vals);
