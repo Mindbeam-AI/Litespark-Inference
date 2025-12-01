@@ -137,22 +137,9 @@ inline void extract_masks_fast(uint32_t packed, __mmask16& pos_mask, __mmask16& 
 
 /**
  * AVX-512 MatMul-free kernel with 2-bit packed weights
- *
- * Uses BMI2 PEXT instruction for fast mask extraction (no scalar loops)
- *
- * For each group of 16 weights packed in a uint32_t:
- * - Extract positive mask (where code == 01) using PEXT
- * - Extract negative mask (where code == 11) using PEXT
- * - Use masks to selectively add/subtract input values
- *
- * @param x_tensor Input matrix [M, K]
- * @param w_packed_tensor Packed weights [N, K_packed] as uint32
- * @param y_tensor Output matrix [M, N]
- * @param bias_tensor Optional bias [N]
- * @param M, N, K Dimensions
- * @param num_threads OpenMP threads
+ * VERSION 1: Basic implementation (for comparison)
  */
-void matmul_free_avx512_packed(
+void matmul_free_avx512_packed_v1(
     torch::Tensor x_tensor,
     torch::Tensor w_packed_tensor,
     torch::Tensor y_tensor,
@@ -175,7 +162,6 @@ void matmul_free_avx512_packed(
         const float* __restrict__ x_row = x + m * K;
         float* __restrict__ y_row = y + m * N;
 
-        // Process 4 outputs at a time for better register utilization
         int n = 0;
         for (; n <= N - 4; n += 4) {
             const uint32_t* __restrict__ wp0 = w_packed + (n + 0) * K_packed;
@@ -193,10 +179,8 @@ void matmul_free_avx512_packed(
             __m512 sum_neg3 = _mm512_setzero_ps();
 
             for (int kp = 0; kp < K_packed; kp++) {
-                // Load 16 input values
                 __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
 
-                // Decode packed weights using fast PEXT-based extraction
                 __mmask16 pos_mask0, neg_mask0;
                 __mmask16 pos_mask1, neg_mask1;
                 __mmask16 pos_mask2, neg_mask2;
@@ -207,7 +191,6 @@ void matmul_free_avx512_packed(
                 extract_masks_fast(wp2[kp], pos_mask2, neg_mask2);
                 extract_masks_fast(wp3[kp], pos_mask3, neg_mask3);
 
-                // Masked addition using AVX-512 mask registers
                 sum_pos0 = _mm512_mask_add_ps(sum_pos0, pos_mask0, sum_pos0, x_vals);
                 sum_neg0 = _mm512_mask_add_ps(sum_neg0, neg_mask0, sum_neg0, x_vals);
                 sum_pos1 = _mm512_mask_add_ps(sum_pos1, pos_mask1, sum_pos1, x_vals);
@@ -218,7 +201,6 @@ void matmul_free_avx512_packed(
                 sum_neg3 = _mm512_mask_add_ps(sum_neg3, neg_mask3, sum_neg3, x_vals);
             }
 
-            // Horizontal sum and store
             float r0 = hsum_avx512(sum_pos0) - hsum_avx512(sum_neg0);
             float r1 = hsum_avx512(sum_pos1) - hsum_avx512(sum_neg1);
             float r2 = hsum_avx512(sum_pos2) - hsum_avx512(sum_neg2);
@@ -237,27 +219,186 @@ void matmul_free_avx512_packed(
             y_row[n + 3] = r3;
         }
 
-        // Handle remaining outputs
         for (; n < N; n++) {
             const uint32_t* __restrict__ wp = w_packed + n * K_packed;
-
             __m512 sum_pos = _mm512_setzero_ps();
             __m512 sum_neg = _mm512_setzero_ps();
 
             for (int kp = 0; kp < K_packed; kp++) {
                 __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
-
                 __mmask16 pos_mask, neg_mask;
                 extract_masks_fast(wp[kp], pos_mask, neg_mask);
-
                 sum_pos = _mm512_mask_add_ps(sum_pos, pos_mask, sum_pos, x_vals);
                 sum_neg = _mm512_mask_add_ps(sum_neg, neg_mask, sum_neg, x_vals);
             }
 
             float result = hsum_avx512(sum_pos) - hsum_avx512(sum_neg);
-            if (bias != nullptr) {
-                result += bias[n];
+            if (bias != nullptr) result += bias[n];
+            y_row[n] = result;
+        }
+    }
+}
+
+/**
+ * AVX-512 MatMul-free kernel with 2-bit packed weights
+ * VERSION 2: Cache blocking + Prefetching + 8-way N-blocking
+ *
+ * Optimizations:
+ * - K-blocking: Process K in L2-cache-friendly chunks
+ * - N-blocking: Process 8 outputs together (more work per x_row load)
+ * - Prefetching: Prefetch next K-block of weights and inputs
+ * - Software pipelining: Overlap computation with memory access
+ */
+void matmul_free_avx512_packed(
+    torch::Tensor x_tensor,
+    torch::Tensor w_packed_tensor,
+    torch::Tensor y_tensor,
+    torch::Tensor bias_tensor,
+    int M, int N, int K,
+    int num_threads
+) {
+    const float* __restrict__ x = x_tensor.data_ptr<float>();
+    const uint32_t* __restrict__ w_packed = reinterpret_cast<const uint32_t*>(
+        w_packed_tensor.data_ptr<uint8_t>());
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_packed = (K + 15) / 16;
+
+    // Tuning parameters for Ice Lake
+    // L1 cache: 48KB, L2 cache: 1.25MB per core
+    // K_BLOCK: number of packed K elements to process together
+    // Should fit: 8 outputs * 2 accumulators * 64 bytes = 1KB registers
+    //           + K_BLOCK * 16 * 4 bytes (x values) in L1
+    const int K_BLOCK = 16;  // Process 16*16=256 K elements at a time
+    const int N_BLOCK = 8;   // Process 8 outputs together
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const float* __restrict__ x_row = x + m * K;
+        float* __restrict__ y_row = y + m * N;
+
+        // Process N_BLOCK outputs at a time
+        int n = 0;
+        for (; n <= N - N_BLOCK; n += N_BLOCK) {
+            // Weight pointers for 8 outputs
+            const uint32_t* __restrict__ wp0 = w_packed + (n + 0) * K_packed;
+            const uint32_t* __restrict__ wp1 = w_packed + (n + 1) * K_packed;
+            const uint32_t* __restrict__ wp2 = w_packed + (n + 2) * K_packed;
+            const uint32_t* __restrict__ wp3 = w_packed + (n + 3) * K_packed;
+            const uint32_t* __restrict__ wp4 = w_packed + (n + 4) * K_packed;
+            const uint32_t* __restrict__ wp5 = w_packed + (n + 5) * K_packed;
+            const uint32_t* __restrict__ wp6 = w_packed + (n + 6) * K_packed;
+            const uint32_t* __restrict__ wp7 = w_packed + (n + 7) * K_packed;
+
+            // Accumulators for 8 outputs (pos/neg pairs)
+            __m512 sum_pos0 = _mm512_setzero_ps(), sum_neg0 = _mm512_setzero_ps();
+            __m512 sum_pos1 = _mm512_setzero_ps(), sum_neg1 = _mm512_setzero_ps();
+            __m512 sum_pos2 = _mm512_setzero_ps(), sum_neg2 = _mm512_setzero_ps();
+            __m512 sum_pos3 = _mm512_setzero_ps(), sum_neg3 = _mm512_setzero_ps();
+            __m512 sum_pos4 = _mm512_setzero_ps(), sum_neg4 = _mm512_setzero_ps();
+            __m512 sum_pos5 = _mm512_setzero_ps(), sum_neg5 = _mm512_setzero_ps();
+            __m512 sum_pos6 = _mm512_setzero_ps(), sum_neg6 = _mm512_setzero_ps();
+            __m512 sum_pos7 = _mm512_setzero_ps(), sum_neg7 = _mm512_setzero_ps();
+
+            // Process K in blocks for better cache locality
+            for (int kp_base = 0; kp_base < K_packed; kp_base += K_BLOCK) {
+                const int kp_end = std::min(kp_base + K_BLOCK, K_packed);
+
+                // Prefetch next K-block of weights
+                if (kp_base + K_BLOCK < K_packed) {
+                    _mm_prefetch((const char*)(wp0 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(wp1 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(wp2 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(wp3 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(wp4 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(wp5 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(wp6 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(wp7 + kp_base + K_BLOCK), _MM_HINT_T0);
+                    // Prefetch input data
+                    _mm_prefetch((const char*)(x_row + (kp_base + K_BLOCK) * 16), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(x_row + (kp_base + K_BLOCK) * 16 + 64), _MM_HINT_T0);
+                }
+
+                // Inner loop over K-block
+                for (int kp = kp_base; kp < kp_end; kp++) {
+                    // Load 16 input values (reused across all 8 outputs)
+                    __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
+
+                    // Extract masks for all 8 outputs
+                    __mmask16 pm0, nm0, pm1, nm1, pm2, nm2, pm3, nm3;
+                    __mmask16 pm4, nm4, pm5, nm5, pm6, nm6, pm7, nm7;
+
+                    extract_masks_fast(wp0[kp], pm0, nm0);
+                    extract_masks_fast(wp1[kp], pm1, nm1);
+                    extract_masks_fast(wp2[kp], pm2, nm2);
+                    extract_masks_fast(wp3[kp], pm3, nm3);
+                    extract_masks_fast(wp4[kp], pm4, nm4);
+                    extract_masks_fast(wp5[kp], pm5, nm5);
+                    extract_masks_fast(wp6[kp], pm6, nm6);
+                    extract_masks_fast(wp7[kp], pm7, nm7);
+
+                    // Accumulate with masked adds
+                    sum_pos0 = _mm512_mask_add_ps(sum_pos0, pm0, sum_pos0, x_vals);
+                    sum_neg0 = _mm512_mask_add_ps(sum_neg0, nm0, sum_neg0, x_vals);
+                    sum_pos1 = _mm512_mask_add_ps(sum_pos1, pm1, sum_pos1, x_vals);
+                    sum_neg1 = _mm512_mask_add_ps(sum_neg1, nm1, sum_neg1, x_vals);
+                    sum_pos2 = _mm512_mask_add_ps(sum_pos2, pm2, sum_pos2, x_vals);
+                    sum_neg2 = _mm512_mask_add_ps(sum_neg2, nm2, sum_neg2, x_vals);
+                    sum_pos3 = _mm512_mask_add_ps(sum_pos3, pm3, sum_pos3, x_vals);
+                    sum_neg3 = _mm512_mask_add_ps(sum_neg3, nm3, sum_neg3, x_vals);
+                    sum_pos4 = _mm512_mask_add_ps(sum_pos4, pm4, sum_pos4, x_vals);
+                    sum_neg4 = _mm512_mask_add_ps(sum_neg4, nm4, sum_neg4, x_vals);
+                    sum_pos5 = _mm512_mask_add_ps(sum_pos5, pm5, sum_pos5, x_vals);
+                    sum_neg5 = _mm512_mask_add_ps(sum_neg5, nm5, sum_neg5, x_vals);
+                    sum_pos6 = _mm512_mask_add_ps(sum_pos6, pm6, sum_pos6, x_vals);
+                    sum_neg6 = _mm512_mask_add_ps(sum_neg6, nm6, sum_neg6, x_vals);
+                    sum_pos7 = _mm512_mask_add_ps(sum_pos7, pm7, sum_pos7, x_vals);
+                    sum_neg7 = _mm512_mask_add_ps(sum_neg7, nm7, sum_neg7, x_vals);
+                }
             }
+
+            // Horizontal sum and store all 8 results
+            float r0 = hsum_avx512(sum_pos0) - hsum_avx512(sum_neg0);
+            float r1 = hsum_avx512(sum_pos1) - hsum_avx512(sum_neg1);
+            float r2 = hsum_avx512(sum_pos2) - hsum_avx512(sum_neg2);
+            float r3 = hsum_avx512(sum_pos3) - hsum_avx512(sum_neg3);
+            float r4 = hsum_avx512(sum_pos4) - hsum_avx512(sum_neg4);
+            float r5 = hsum_avx512(sum_pos5) - hsum_avx512(sum_neg5);
+            float r6 = hsum_avx512(sum_pos6) - hsum_avx512(sum_neg6);
+            float r7 = hsum_avx512(sum_pos7) - hsum_avx512(sum_neg7);
+
+            if (bias != nullptr) {
+                r0 += bias[n + 0]; r1 += bias[n + 1];
+                r2 += bias[n + 2]; r3 += bias[n + 3];
+                r4 += bias[n + 4]; r5 += bias[n + 5];
+                r6 += bias[n + 6]; r7 += bias[n + 7];
+            }
+
+            y_row[n + 0] = r0; y_row[n + 1] = r1;
+            y_row[n + 2] = r2; y_row[n + 3] = r3;
+            y_row[n + 4] = r4; y_row[n + 5] = r5;
+            y_row[n + 6] = r6; y_row[n + 7] = r7;
+        }
+
+        // Handle remaining outputs (< 8)
+        for (; n < N; n++) {
+            const uint32_t* __restrict__ wp = w_packed + n * K_packed;
+            __m512 sum_pos = _mm512_setzero_ps();
+            __m512 sum_neg = _mm512_setzero_ps();
+
+            for (int kp = 0; kp < K_packed; kp++) {
+                __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
+                __mmask16 pos_mask, neg_mask;
+                extract_masks_fast(wp[kp], pos_mask, neg_mask);
+                sum_pos = _mm512_mask_add_ps(sum_pos, pos_mask, sum_pos, x_vals);
+                sum_neg = _mm512_mask_add_ps(sum_neg, neg_mask, sum_neg, x_vals);
+            }
+
+            float result = hsum_avx512(sum_pos) - hsum_avx512(sum_neg);
+            if (bias != nullptr) result += bias[n];
             y_row[n] = result;
         }
     }
@@ -409,7 +550,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pack_weights_2bit_avx512", &pack_weights_2bit_avx512,
           "Pack ternary weights to 2-bit format for AVX-512");
     m.def("matmul_free_avx512_packed", &matmul_free_avx512_packed,
-          "AVX-512 MatMul-free with 2-bit packed weights");
+          "AVX-512 MatMul-free with 2-bit packed weights (optimized v2)");
+    m.def("matmul_free_avx512_packed_v1", &matmul_free_avx512_packed_v1,
+          "AVX-512 MatMul-free with 2-bit packed weights (basic v1)");
     m.def("matmul_free_avx512_float", &matmul_free_avx512_float,
           "AVX-512 MatMul-free with float32 weights");
 }

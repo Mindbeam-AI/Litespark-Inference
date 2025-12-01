@@ -65,7 +65,7 @@ except Exception as e:
 print("  [2/2] AVX-512 kernel...", end=' ', flush=True)
 try:
     avx512_kernel = load(
-        name="avx512_matmul_free_test2",
+        name="avx512_matmul_free_test3",
         sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_avx512.cpp")],
         extra_cflags=['-O3', '-mavx512f', '-mavx512bw', '-mavx512dq', '-mbmi2',
                       '-fopenmp', '-std=c++17', '-march=native'],
@@ -185,20 +185,48 @@ for name, M, N, K in configs:
 
     # Benchmark AVX-512 with 2-bit packed weights
     if avx512_kernel is not None:
-        print("\n  AVX-512 (2-bit packed weights):")
-
-        # Pack weights
+        # Pack weights (shared between v1 and v2)
         gc.collect()
-        mem_before_pack = get_process_memory_mb()
         K_packed = (K + 15) // 16
         w_packed = torch.zeros(N, K_packed * 4, dtype=torch.uint8)  # 4 bytes per uint32
         avx512_kernel.pack_weights_2bit_avx512(w_ternary, w_packed, N, K)
-        mem_after_pack = get_process_memory_mb()
 
-        # Compare memory
         float_mem_mb = N * K * 4 / (1024 * 1024)
         packed_mem_mb = N * K_packed * 4 / (1024 * 1024)
-        print(f"    Weight memory: {float_mem_mb:.2f}MB (float32) -> {packed_mem_mb:.2f}MB (2-bit) = {float_mem_mb/packed_mem_mb:.1f}x reduction")
+
+        # Test v1 (basic)
+        print("\n  AVX-512 packed v1 (basic):")
+        print(f"    Weight memory: {float_mem_mb:.2f}MB -> {packed_mem_mb:.2f}MB = {float_mem_mb/packed_mem_mb:.1f}x reduction")
+
+        y_packed_v1 = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(10):  # Warmup
+            avx512_kernel.matmul_free_avx512_packed_v1(x, w_packed, y_packed_v1, bias, M, N, K, num_threads)
+
+        gc.collect()
+        mem_before = get_process_memory_mb()
+        times = []
+        for _ in range(50):
+            start = time.perf_counter()
+            avx512_kernel.matmul_free_avx512_packed_v1(x, w_packed, y_packed_v1, bias, M, N, K, num_threads)
+            times.append(time.perf_counter() - start)
+        mem_after = get_process_memory_mb()
+
+        avg_time_v1 = np.mean(times) * 1000
+        std_time_v1 = np.std(times) * 1000
+        gflops_v1 = (2.0 * M * N * K / 1e9) / (avg_time_v1 / 1000)
+
+        print(f"    Time: {avg_time_v1:.2f} +/- {std_time_v1:.2f} ms")
+        print(f"    GFLOPS: {gflops_v1:.1f}")
+        print(f"    Memory: {mem_before:.1f}MB -> {mem_after:.1f}MB")
+        results['avx512_packed_v1'] = {'time': avg_time_v1, 'gflops': gflops_v1, 'y': y_packed_v1.clone()}
+
+        if 'avx2' in results:
+            max_diff = torch.max(torch.abs(y_packed_v1 - results['avx2']['y'])).item()
+            print(f"    Max diff vs AVX2: {max_diff:.6f} {'OK' if max_diff < 1e-3 else 'MISMATCH!'}")
+
+        # Test v2 (optimized with cache blocking + prefetching)
+        print("\n  AVX-512 packed v2 (cache blocking + prefetch):")
 
         y_packed = torch.zeros(M, N, dtype=torch.float32)
 
@@ -221,6 +249,8 @@ for name, M, N, K in configs:
         print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms")
         print(f"    GFLOPS: {gflops:.1f}")
         print(f"    Memory: {mem_before:.1f}MB -> {mem_after:.1f}MB")
+        speedup_vs_v1 = avg_time_v1 / avg_time
+        print(f"    Speedup vs v1: {speedup_vs_v1:.2f}x")
         results['avx512_packed'] = {'time': avg_time, 'gflops': gflops, 'y': y_packed.clone()}
 
         # Verify correctness
@@ -253,14 +283,18 @@ for name, M, N, K in configs:
     # Summary
     print(f"\n  Summary for {name}:")
     if 'avx2' in results:
-        print(f"    AVX2:           {results['avx2']['gflops']:.1f} GFLOPS")
+        print(f"    AVX2:              {results['avx2']['gflops']:.1f} GFLOPS")
     if 'avx512_float' in results:
         speedup = results['avx512_float']['gflops'] / results['avx2']['gflops'] if 'avx2' in results else 1.0
-        print(f"    AVX-512 float:  {results['avx512_float']['gflops']:.1f} GFLOPS ({speedup:.2f}x vs AVX2)")
+        print(f"    AVX-512 float:     {results['avx512_float']['gflops']:.1f} GFLOPS ({speedup:.2f}x vs AVX2)")
+    if 'avx512_packed_v1' in results:
+        speedup = results['avx512_packed_v1']['gflops'] / results['avx2']['gflops'] if 'avx2' in results else 1.0
+        print(f"    AVX-512 packed v1: {results['avx512_packed_v1']['gflops']:.1f} GFLOPS ({speedup:.2f}x vs AVX2)")
     if 'avx512_packed' in results:
         speedup = results['avx512_packed']['gflops'] / results['avx2']['gflops'] if 'avx2' in results else 1.0
-        print(f"    AVX-512 packed: {results['avx512_packed']['gflops']:.1f} GFLOPS ({speedup:.2f}x vs AVX2)")
-    print(f"    PyTorch:        {results['pytorch']['gflops']:.1f} GFLOPS")
+        v1_speedup = results['avx512_packed']['gflops'] / results['avx512_packed_v1']['gflops'] if 'avx512_packed_v1' in results else 1.0
+        print(f"    AVX-512 packed v2: {results['avx512_packed']['gflops']:.1f} GFLOPS ({speedup:.2f}x vs AVX2, {v1_speedup:.2f}x vs v1)")
+    print(f"    PyTorch:           {results['pytorch']['gflops']:.1f} GFLOPS")
 
 print("\n" + "="*70)
 print("Optimization Test Complete!")
