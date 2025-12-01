@@ -67,6 +67,21 @@ except Exception as e:
     traceback.print_exc()
     exit(1)
 
+# Compile TL2 kernel
+print("Compiling TL2 kernel...", end=' ', flush=True)
+try:
+    tl2_kernel = load(
+        name="tl2_x86_for_tmac_test",
+        sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_tl2_avx2.cpp")],
+        extra_cflags=['-O3', '-mavx2', '-mfma', '-fopenmp', '-std=c++17', '-march=native'],
+        extra_ldflags=['-fopenmp', '-lgomp'],
+        verbose=False
+    )
+    print("OK")
+except Exception as e:
+    print(f"FAILED: {e}")
+    tl2_kernel = None
+
 # Compile AVX-512 packed kernel for comparison
 print("Compiling AVX-512 packed kernel...", end=' ', flush=True)
 try:
@@ -120,6 +135,12 @@ for name, M, N, K in configs:
     sign_plane = torch.zeros(K_groups, N, dtype=torch.uint8)
     value_plane = torch.zeros(K_groups, N, dtype=torch.uint8)
     tmac_kernel.pack_ternary_bitplanes(w_ternary, sign_plane, value_plane, N, K)
+
+    # Pack weights for TL2 (3 weights per group)
+    if tl2_kernel is not None:
+        K_groups_tl2 = (K + 2) // 3
+        w_packed_tl2 = torch.zeros(K_groups_tl2, N, dtype=torch.uint8)
+        tl2_kernel.pack_ternary_tl2(w_ternary, w_packed_tl2, N, K)
 
     # Pack weights for AVX-512 (2-bit, 16 weights per uint32)
     if avx512_kernel is not None:
@@ -256,6 +277,27 @@ for name, M, N, K in configs:
     print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
     results['tmac_gather'] = {'time': avg_time, 'gflops': gflops, 'y': y_tmac_gather.clone()}
 
+    # Test TL2 Optimized (best TL2 variant)
+    if tl2_kernel is not None:
+        print("\n  TL2 Optimized (element-wise LUT):")
+        y_tl2 = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            tl2_kernel.matmul_free_tl2_optimized(x, w_packed_tl2, y_tl2, bias, M, N, K, num_threads)
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            tl2_kernel.matmul_free_tl2_optimized(x, w_packed_tl2, y_tl2, bias, M, N, K, num_threads)
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['tl2_optimized'] = {'time': avg_time, 'gflops': gflops, 'y': y_tl2.clone()}
+
     # Test AVX-512 packed v1 for comparison
     if avx512_kernel is not None:
         print("\n  AVX-512 packed v1 (baseline):")
@@ -297,7 +339,7 @@ for name, M, N, K in configs:
 
     # Verify correctness
     print("\n  Correctness check vs PyTorch:")
-    for key in ['tmac_scalar', 'tmac_avx2', 'tmac_tiled', 'tmac_pshufb', 'tmac_optimized', 'tmac_gather']:
+    for key in ['tmac_scalar', 'tmac_avx2', 'tmac_tiled', 'tmac_pshufb', 'tmac_optimized', 'tmac_gather', 'tl2_optimized']:
         if key in results:
             max_diff = torch.max(torch.abs(results[key]['y'] - y_pt)).item()
             status = 'OK' if max_diff < 1e-3 else 'MISMATCH!'
@@ -321,6 +363,7 @@ for name, M, N, K in configs:
         ('tmac_pshufb', 'T-MAC K-first PSHUFB'),
         ('tmac_optimized', 'T-MAC K-first Optimized'),
         ('tmac_gather', 'T-MAC K-first Gather'),
+        ('tl2_optimized', 'TL2 element-wise LUT'),
         ('avx512_packed', 'AVX-512 packed'),
         ('pytorch', 'PyTorch'),
     ]:
@@ -330,11 +373,15 @@ for name, M, N, K in configs:
             print(f"    {label:<30} {gflops:>10.1f} {ratio:>11.2f}x")
 
 print("\n" + "="*70)
-print("T-MAC Test Complete!")
+print("T-MAC / TL2 Test Complete!")
 print("="*70)
 print("\nMicrosoft T-MAC Key Insight (K-first iteration):")
 print("  - Traditional: Loop N -> M -> K (build LUT for each output)")
 print("  - T-MAC:       Loop K -> N -> M (build LUT once, use for ALL outputs)")
 print("  - LUT stays in registers, massive reuse")
 print("  - Weight layout: [K_groups, N] for sequential access")
+print("\nTL2 vs T-MAC (from BitNet.cpp paper):")
+print("  - T-MAC: bit-wise LUT, groups 4 weights, 2^4=16 entries, 2.0 bpw")
+print("  - TL2:   element-wise LUT, groups 3 weights, 3^3=27->14 entries, 1.67 bpw")
+print("  - TL2 is 2.32x faster than T-MAC on x86 (per paper)")
 print("="*70)
