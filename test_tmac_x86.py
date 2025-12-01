@@ -1,23 +1,16 @@
 """
-Test T-MAC Kernel for x86_64 (Microsoft K-first approach)
+Test T-MAC / TL2 Kernels for x86_64 (Microsoft approach)
 
-This script benchmarks the T-MAC (Table-based Matrix-vector product Acceleration)
-approach on x86_64 systems using Microsoft's key insight: K-first iteration.
+This script benchmarks:
+1. T-MAC float32 (LUT-based, K-first iteration)
+2. TL2 float32 (element-wise LUT)
+3. T-MAC int8 with PSHUFB (CORRECT Microsoft approach)
+4. TL2 int8 with PSHUFB (CORRECT Microsoft approach)
+5. AVX-512 packed (direct computation baseline)
 
-T-MAC key insight (from Microsoft paper):
-- Traditional GEMM: Loop N -> Loop M -> Loop K (spatial first)
-- T-MAC approach:   Loop K -> Loop N -> Loop M (temporal first)
-
-Why K-first matters:
-- Build LUT ONCE for each K-group of 4 activations
-- Reuse that LUT across ALL N outputs
-- LUT stays in registers, no spilling to cache/memory
-
-Algorithm:
-1. For each K-group (4 weights):
-   a. Build 16-entry LUT from 4 activations
-   b. For each output n: lookup weight pattern, accumulate
-2. result = 2 * value_lookup - sign_lookup
+Key insight from Microsoft:
+- Int8 activations + int8 LUT + PSHUFB = 32 parallel lookups per instruction
+- Float32 LUT = scalar lookups (slow!)
 """
 import torch
 import time
@@ -67,8 +60,8 @@ except Exception as e:
     traceback.print_exc()
     exit(1)
 
-# Compile TL2 kernel
-print("Compiling TL2 kernel...", end=' ', flush=True)
+# Compile TL2 float32 kernel
+print("Compiling TL2 float32 kernel...", end=' ', flush=True)
 try:
     tl2_kernel = load(
         name="tl2_x86_for_tmac_test",
@@ -81,6 +74,36 @@ try:
 except Exception as e:
     print(f"FAILED: {e}")
     tl2_kernel = None
+
+# Compile T-MAC int8 kernel (CORRECT Microsoft approach)
+print("Compiling T-MAC int8 kernel...", end=' ', flush=True)
+try:
+    tmac_int8_kernel = load(
+        name="tmac_int8_for_main_test",
+        sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_tmac_int8.cpp")],
+        extra_cflags=['-O3', '-mavx2', '-mfma', '-fopenmp', '-std=c++17', '-march=native'],
+        extra_ldflags=['-fopenmp', '-lgomp'],
+        verbose=False
+    )
+    print("OK")
+except Exception as e:
+    print(f"FAILED: {e}")
+    tmac_int8_kernel = None
+
+# Compile TL2 int8 kernel (CORRECT Microsoft approach)
+print("Compiling TL2 int8 kernel...", end=' ', flush=True)
+try:
+    tl2_int8_kernel = load(
+        name="tl2_int8_for_main_test",
+        sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_tl2_int8.cpp")],
+        extra_cflags=['-O3', '-mavx2', '-mfma', '-fopenmp', '-std=c++17', '-march=native'],
+        extra_ldflags=['-fopenmp', '-lgomp'],
+        verbose=False
+    )
+    print("OK")
+except Exception as e:
+    print(f"FAILED: {e}")
+    tl2_int8_kernel = None
 
 # Compile AVX-512 packed kernel for comparison
 print("Compiling AVX-512 packed kernel...", end=' ', flush=True)
@@ -136,11 +159,33 @@ for name, M, N, K in configs:
     value_plane = torch.zeros(K_groups, N, dtype=torch.uint8)
     tmac_kernel.pack_ternary_bitplanes(w_ternary, sign_plane, value_plane, N, K)
 
-    # Pack weights for TL2 (3 weights per group)
+    # Pack weights for TL2 float32 (3 weights per group)
     if tl2_kernel is not None:
         K_groups_tl2 = (K + 2) // 3
         w_packed_tl2 = torch.zeros(K_groups_tl2, N, dtype=torch.uint8)
         tl2_kernel.pack_ternary_tl2(w_ternary, w_packed_tl2, N, K)
+
+    # Prepare int8 activations and weights for T-MAC int8
+    if tmac_int8_kernel is not None:
+        x_int8 = torch.zeros(M, K, dtype=torch.int8)
+        scales = torch.zeros(M, dtype=torch.float32)
+        tmac_int8_kernel.quantize_activations_int8(x, x_int8, scales, M, K)
+
+        sign_plane_int8 = torch.zeros(K_groups, N, dtype=torch.uint8)
+        value_plane_int8 = torch.zeros(K_groups, N, dtype=torch.uint8)
+        tmac_int8_kernel.pack_ternary_bitplanes_int8(w_ternary, sign_plane_int8, value_plane_int8, N, K)
+
+    # Prepare int8 weights for TL2 int8
+    if tl2_int8_kernel is not None:
+        if tmac_int8_kernel is None:
+            # Need to quantize activations if not done above
+            x_int8 = torch.zeros(M, K, dtype=torch.int8)
+            scales = torch.zeros(M, dtype=torch.float32)
+            tl2_int8_kernel.quantize_activations_int8_tl2(x, x_int8, scales, M, K)
+
+        K_groups_tl2_int8 = (K + 2) // 3
+        w_packed_tl2_int8 = torch.zeros(K_groups_tl2_int8, N, dtype=torch.uint8)
+        tl2_int8_kernel.pack_ternary_tl2_int8(w_ternary, w_packed_tl2_int8, N, K)
 
     # Pack weights for AVX-512 (2-bit, 16 weights per uint32)
     if avx512_kernel is not None:
@@ -277,9 +322,9 @@ for name, M, N, K in configs:
     print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
     results['tmac_gather'] = {'time': avg_time, 'gflops': gflops, 'y': y_tmac_gather.clone()}
 
-    # Test TL2 Optimized (best TL2 variant)
+    # Test TL2 float32 Optimized
     if tl2_kernel is not None:
-        print("\n  TL2 Optimized (element-wise LUT):")
+        print("\n  TL2 float32 (element-wise LUT):")
         y_tl2 = torch.zeros(M, N, dtype=torch.float32)
 
         for _ in range(5):
@@ -296,7 +341,61 @@ for name, M, N, K in configs:
         std_time = np.std(times) * 1000
         gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
         print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
-        results['tl2_optimized'] = {'time': avg_time, 'gflops': gflops, 'y': y_tl2.clone()}
+        results['tl2_float32'] = {'time': avg_time, 'gflops': gflops, 'y': y_tl2.clone()}
+
+    # Test T-MAC int8 PSHUFB (CORRECT Microsoft approach)
+    if tmac_int8_kernel is not None:
+        print("\n  T-MAC int8 PSHUFB:")
+        y_tmac_int8 = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            tmac_int8_kernel.matmul_free_tmac_int8(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_tmac_int8, bias, M, N, K, num_threads
+            )
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            tmac_int8_kernel.matmul_free_tmac_int8(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_tmac_int8, bias, M, N, K, num_threads
+            )
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['tmac_int8'] = {'time': avg_time, 'gflops': gflops, 'y': y_tmac_int8.clone()}
+
+    # Test TL2 int8 PSHUFB (CORRECT Microsoft approach)
+    if tl2_int8_kernel is not None:
+        print("\n  TL2 int8 PSHUFB:")
+        y_tl2_int8 = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            tl2_int8_kernel.matmul_free_tl2_int8(
+                x_int8, scales, w_packed_tl2_int8,
+                y_tl2_int8, bias, M, N, K, num_threads
+            )
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            tl2_int8_kernel.matmul_free_tl2_int8(
+                x_int8, scales, w_packed_tl2_int8,
+                y_tl2_int8, bias, M, N, K, num_threads
+            )
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['tl2_int8'] = {'time': avg_time, 'gflops': gflops, 'y': y_tl2_int8.clone()}
 
     # Test AVX-512 packed v1 for comparison
     if avx512_kernel is not None:
@@ -339,16 +438,21 @@ for name, M, N, K in configs:
 
     # Verify correctness
     print("\n  Correctness check vs PyTorch:")
-    for key in ['tmac_scalar', 'tmac_avx2', 'tmac_tiled', 'tmac_pshufb', 'tmac_optimized', 'tmac_gather', 'tl2_optimized']:
+
+    # Float32 kernels - tight tolerance
+    for key in ['tmac_scalar', 'tmac_avx2', 'tmac_tiled', 'tmac_pshufb', 'tmac_optimized', 'tmac_gather', 'tl2_float32', 'avx512_packed']:
         if key in results:
             max_diff = torch.max(torch.abs(results[key]['y'] - y_pt)).item()
             status = 'OK' if max_diff < 1e-3 else 'MISMATCH!'
             print(f"    {key}: max_diff={max_diff:.6f} {status}")
 
-    if 'avx512_packed' in results:
-        max_diff = torch.max(torch.abs(results['avx512_packed']['y'] - y_pt)).item()
-        status = 'OK' if max_diff < 1e-3 else 'MISMATCH!'
-        print(f"    avx512_packed: max_diff={max_diff:.6f} {status}")
+    # Int8 kernels - allow quantization error (~1-2% relative)
+    for key in ['tmac_int8', 'tl2_int8']:
+        if key in results:
+            max_diff = torch.max(torch.abs(results[key]['y'] - y_pt)).item()
+            rel_error = max_diff / (torch.max(torch.abs(y_pt)).item() + 1e-6)
+            status = 'OK' if rel_error < 0.02 else 'MISMATCH!'
+            print(f"    {key}: max_diff={max_diff:.4f}, rel_err={rel_error:.4f} {status}")
 
     # Summary
     print(f"\n  Summary for {name}:")
@@ -357,13 +461,15 @@ for name, M, N, K in configs:
 
     avx512_gflops = results.get('avx512_packed', {}).get('gflops', 1.0)
     for key, label in [
-        ('tmac_scalar', 'T-MAC K-first scalar'),
-        ('tmac_avx2', 'T-MAC K-first AVX2'),
-        ('tmac_tiled', 'T-MAC K-first Tiled'),
-        ('tmac_pshufb', 'T-MAC K-first PSHUFB'),
-        ('tmac_optimized', 'T-MAC K-first Optimized'),
-        ('tmac_gather', 'T-MAC K-first Gather'),
-        ('tl2_optimized', 'TL2 element-wise LUT'),
+        ('tmac_scalar', 'T-MAC float32 scalar'),
+        ('tmac_avx2', 'T-MAC float32 AVX2'),
+        ('tmac_tiled', 'T-MAC float32 Tiled'),
+        ('tmac_pshufb', 'T-MAC float32 PSHUFB'),
+        ('tmac_optimized', 'T-MAC float32 Optimized'),
+        ('tmac_gather', 'T-MAC float32 Gather'),
+        ('tl2_float32', 'TL2 float32'),
+        ('tmac_int8', 'T-MAC int8 PSHUFB'),
+        ('tl2_int8', 'TL2 int8 PSHUFB'),
         ('avx512_packed', 'AVX-512 packed'),
         ('pytorch', 'PyTorch'),
     ]:
@@ -375,13 +481,13 @@ for name, M, N, K in configs:
 print("\n" + "="*70)
 print("T-MAC / TL2 Test Complete!")
 print("="*70)
-print("\nMicrosoft T-MAC Key Insight (K-first iteration):")
-print("  - Traditional: Loop N -> M -> K (build LUT for each output)")
-print("  - T-MAC:       Loop K -> N -> M (build LUT once, use for ALL outputs)")
-print("  - LUT stays in registers, massive reuse")
-print("  - Weight layout: [K_groups, N] for sequential access")
-print("\nTL2 vs T-MAC (from BitNet.cpp paper):")
-print("  - T-MAC: bit-wise LUT, groups 4 weights, 2^4=16 entries, 2.0 bpw")
-print("  - TL2:   element-wise LUT, groups 3 weights, 3^3=27->14 entries, 1.67 bpw")
-print("  - TL2 is 2.32x faster than T-MAC on x86 (per paper)")
+print("\nKey Insights:")
+print("  1. Float32 LUT = SLOW (scalar lookups, ~50 GFLOPS)")
+print("  2. Int8 LUT + PSHUFB = FAST (32 parallel lookups)")
+print("  3. AVX-512 packed (direct computation) = baseline (~145 GFLOPS)")
+print("\nMicrosoft's approach (BitNet.cpp):")
+print("  - Int8 activations (per-row quantization)")
+print("  - Int8 LUT values")
+print("  - PSHUFB for 32 parallel lookups per instruction")
+print("  - Int32 accumulation, float32 output")
 print("="*70)
