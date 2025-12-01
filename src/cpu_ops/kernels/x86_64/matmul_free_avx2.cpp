@@ -38,8 +38,8 @@ inline float hsum_avx(__m256 v) {
  * Computes: y[m,n] = sum(x[m,k] where w[n,k]==1) - sum(x[m,k] where w[n,k]==-1)
  *
  * Key optimizations:
- * - 16-way output blocking (optimal for AVX2's 8-wide SIMD)
- * - _mm256_blendv_ps for hardware predication
+ * - 8-way output blocking (reduced from 16 to avoid register spilling)
+ * - _mm256_and_ps with mask for faster predication than blendv
  * - Prefetching for memory latency hiding
  * - Sequential memory access patterns
  *
@@ -65,16 +65,16 @@ void matmul_free_avx2(
     float* y = y_tensor.data_ptr<float>();
     const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
 
-    // AVX2: 8-wide SIMD, 16-way output blocking (2x NEON's 12-way)
+    // AVX2: 8-wide SIMD, 8-way output blocking (reduced to avoid register pressure)
     const int K_SIMD = 8;
     const int K_SIMD_END = (K / K_SIMD) * K_SIMD;
-    const int N_BLOCK = 16;  // Process 16 outputs together
-    const int K_PREFETCH = 64;  // Prefetch distance
+    const int N_BLOCK = 8;  // Reduced from 16 to fit in registers
+    const int K_PREFETCH = 128;  // Prefetch distance
 
     omp_set_num_threads(num_threads);
 
     // Parallelize over output rows with dynamic scheduling
-    #pragma omp parallel for schedule(dynamic, 8)
+    #pragma omp parallel for schedule(dynamic, 4)
     for (int m = 0; m < M; m++) {
         const float* x_row = x + m * K;
         float* y_row = y + m * N;
@@ -82,45 +82,42 @@ void matmul_free_avx2(
         // Process N_BLOCK outputs together for better instruction-level parallelism
         int n = 0;
         for (; n <= N - N_BLOCK; n += N_BLOCK) {
-            // 16 separate positive/negative accumulators (32 total)
+            // 8 separate positive/negative accumulators (16 total - fits in YMM registers)
             __m256 sum_pos[N_BLOCK], sum_neg[N_BLOCK];
+
+            #pragma unroll
             for (int i = 0; i < N_BLOCK; i++) {
                 sum_pos[i] = _mm256_setzero_ps();
                 sum_neg[i] = _mm256_setzero_ps();
             }
 
-            __m256 zero = _mm256_setzero_ps();
+            const __m256 zero = _mm256_setzero_ps();
 
             // SIMD loop over K dimension
             for (int k = 0; k < K_SIMD_END; k += K_SIMD) {
-                // Load input once per K iteration
-                __m256 x_vals = _mm256_loadu_ps(x_row + k);
-
                 // Prefetch future data
                 if (k + K_PREFETCH < K) {
                     _mm_prefetch((const char*)(x_row + k + K_PREFETCH), _MM_HINT_T0);
                 }
 
-                // Process all N_BLOCK outputs with this input
+                // Load input once per K iteration
+                const __m256 x_vals = _mm256_loadu_ps(x_row + k);
+
+                // Process all N_BLOCK outputs with this input - manually unrolled
+                #pragma unroll
                 for (int i = 0; i < N_BLOCK; i++) {
-                    const float* w_row = w + (n + i) * K;
-
-                    // Prefetch weight data
-                    if (k + K_PREFETCH < K) {
-                        _mm_prefetch((const char*)(w_row + k + K_PREFETCH), _MM_HINT_T0);
-                    }
-
                     // Load 8 weight values
-                    __m256 w_vals = _mm256_loadu_ps(w_row + k);
+                    const __m256 w_vals = _mm256_loadu_ps(w + (n + i) * K + k);
 
                     // Create masks for positive and negative weights
-                    __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);  // w > 0
-                    __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);  // w < 0
+                    // Use _mm256_and_ps instead of blendv - faster on most Intel CPUs
+                    const __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);  // w > 0
+                    const __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);  // w < 0
 
-                    // TRUE matmul-free: conditional accumulation with hardware predication
-                    // _mm256_blendv_ps(a, b, mask): select b if mask bit is set, else a
-                    sum_pos[i] = _mm256_add_ps(sum_pos[i], _mm256_blendv_ps(zero, x_vals, mask_pos));
-                    sum_neg[i] = _mm256_add_ps(sum_neg[i], _mm256_blendv_ps(zero, x_vals, mask_neg));
+                    // TRUE matmul-free: conditional accumulation using AND with mask
+                    // _mm256_and_ps is 1 cycle latency vs blendv's 2 cycles
+                    sum_pos[i] = _mm256_add_ps(sum_pos[i], _mm256_and_ps(x_vals, mask_pos));
+                    sum_neg[i] = _mm256_add_ps(sum_neg[i], _mm256_and_ps(x_vals, mask_neg));
                 }
             }
 
@@ -155,17 +152,17 @@ void matmul_free_avx2(
 
             __m256 sum_pos_vec = _mm256_setzero_ps();
             __m256 sum_neg_vec = _mm256_setzero_ps();
-            __m256 zero = _mm256_setzero_ps();
+            const __m256 zero = _mm256_setzero_ps();
 
             for (int k = 0; k < K_SIMD_END; k += K_SIMD) {
-                __m256 x_vals = _mm256_loadu_ps(x_row + k);
-                __m256 w_vals = _mm256_loadu_ps(w_row + k);
+                const __m256 x_vals = _mm256_loadu_ps(x_row + k);
+                const __m256 w_vals = _mm256_loadu_ps(w_row + k);
 
-                __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);
-                __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);
+                const __m256 mask_pos = _mm256_cmp_ps(w_vals, zero, _CMP_GT_OQ);
+                const __m256 mask_neg = _mm256_cmp_ps(w_vals, zero, _CMP_LT_OQ);
 
-                sum_pos_vec = _mm256_add_ps(sum_pos_vec, _mm256_blendv_ps(zero, x_vals, mask_pos));
-                sum_neg_vec = _mm256_add_ps(sum_neg_vec, _mm256_blendv_ps(zero, x_vals, mask_neg));
+                sum_pos_vec = _mm256_add_ps(sum_pos_vec, _mm256_and_ps(x_vals, mask_pos));
+                sum_neg_vec = _mm256_add_ps(sum_neg_vec, _mm256_and_ps(x_vals, mask_neg));
             }
 
             float sum_pos = hsum_avx(sum_pos_vec);
