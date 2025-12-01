@@ -108,45 +108,40 @@ void pack_ternary_bitplanes_int8(
 }
 
 /**
- * Build 16-entry int8 LUT from 4 int8 activations
+ * Build 16-entry int16 LUT from 4 int8 activations
  *
  * Each entry is the sum of selected activations.
  * For ternary: result = 2*value_sum - sign_sum
+ *
+ * IMPORTANT: Use int16 LUT to avoid overflow!
+ * Sum of 4 int8 values can be up to ±508, which exceeds int8 range.
  */
-inline void build_lut_16_int8(const int8_t* x, int8_t* lut) {
+inline void build_lut_16_int16(const int8_t* x, int16_t* lut) {
     const int16_t x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
 
-    // Compute sums (use int16 to avoid overflow, then clamp)
-    int16_t sums[16];
-    sums[0]  = 0;
-    sums[1]  = x0;
-    sums[2]  = x1;
-    sums[3]  = x0 + x1;
-    sums[4]  = x2;
-    sums[5]  = x0 + x2;
-    sums[6]  = x1 + x2;
-    sums[7]  = x0 + x1 + x2;
-    sums[8]  = x3;
-    sums[9]  = x0 + x3;
-    sums[10] = x1 + x3;
-    sums[11] = x0 + x1 + x3;
-    sums[12] = x2 + x3;
-    sums[13] = x0 + x2 + x3;
-    sums[14] = x1 + x2 + x3;
-    sums[15] = x0 + x1 + x2 + x3;
-
-    // Clamp to int8 range and store
-    for (int i = 0; i < 16; i++) {
-        sums[i] = std::max(int16_t(-128), std::min(int16_t(127), sums[i]));
-        lut[i] = static_cast<int8_t>(sums[i]);
-    }
+    lut[0]  = 0;
+    lut[1]  = x0;
+    lut[2]  = x1;
+    lut[3]  = x0 + x1;
+    lut[4]  = x2;
+    lut[5]  = x0 + x2;
+    lut[6]  = x1 + x2;
+    lut[7]  = x0 + x1 + x2;
+    lut[8]  = x3;
+    lut[9]  = x0 + x3;
+    lut[10] = x1 + x3;
+    lut[11] = x0 + x1 + x3;
+    lut[12] = x2 + x3;
+    lut[13] = x0 + x2 + x3;
+    lut[14] = x1 + x2 + x3;
+    lut[15] = x0 + x1 + x2 + x3;
 }
 
 /**
- * T-MAC Int8 kernel with PSHUFB
+ * T-MAC Int8 kernel with int16 LUT
  *
- * Uses PSHUFB for 32 parallel int8 lookups per instruction!
- * Accumulates in int32 to avoid overflow.
+ * Uses int16 LUT to avoid overflow (sum of 4 int8 can be ±508).
+ * Scalar lookups but vectorized accumulation.
  */
 void matmul_free_tmac_int8(
     torch::Tensor x_int8_tensor,       // [M, K] int8
@@ -188,68 +183,29 @@ void matmul_free_tmac_int8(
                 x_vals[i] = x_row[k_base + i];
             }
 
-            // Build int8 LUT
-            alignas(32) int8_t lut[16];
-            build_lut_16_int8(x_vals, lut);
-
-            // Duplicate LUT for AVX2 PSHUFB (needs same LUT in both 128-bit lanes)
-            __m256i lut_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut));
+            // Build int16 LUT (avoids overflow!)
+            alignas(32) int16_t lut[16];
+            build_lut_16_int16(x_vals, lut);
 
             const uint8_t* __restrict__ sign_row = sign_plane + kg * N;
             const uint8_t* __restrict__ value_row = value_plane + kg * N;
 
-            // Process 32 outputs at a time with PSHUFB
+            // Process 8 outputs at a time with vectorized accumulation
             int n = 0;
-            for (; n + 31 < N; n += 32) {
-                // Load 32 sign and value indices
-                __m256i sign_idx = _mm256_loadu_si256((__m256i*)(sign_row + n));
-                __m256i value_idx = _mm256_loadu_si256((__m256i*)(value_row + n));
+            for (; n + 7 < N; n += 8) {
+                // Scalar lookups into int16 LUT
+                alignas(32) int32_t results[8];
+                for (int i = 0; i < 8; i++) {
+                    uint8_t s = sign_row[n + i] & 0x0F;
+                    uint8_t v = value_row[n + i] & 0x0F;
+                    results[i] = 2 * static_cast<int32_t>(lut[v]) - static_cast<int32_t>(lut[s]);
+                }
 
-                // Mask to 4 bits (indices 0-15)
-                __m256i mask = _mm256_set1_epi8(0x0F);
-                sign_idx = _mm256_and_si256(sign_idx, mask);
-                value_idx = _mm256_and_si256(value_idx, mask);
-
-                // PSHUFB: 32 parallel lookups!
-                __m256i sign_vals = _mm256_shuffle_epi8(lut_vec, sign_idx);
-                __m256i value_vals = _mm256_shuffle_epi8(lut_vec, value_idx);
-
-                // result = 2*value - sign (as int8, then accumulate to int32)
-                // First compute 2*value - sign in int16 to avoid overflow
-
-                // Unpack to int16 for computation
-                __m256i sign_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(sign_vals, 0));
-                __m256i sign_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(sign_vals, 1));
-                __m256i value_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(value_vals, 0));
-                __m256i value_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(value_vals, 1));
-
-                // 2*value - sign
-                __m256i two = _mm256_set1_epi16(2);
-                __m256i result_lo = _mm256_sub_epi16(_mm256_mullo_epi16(two, value_lo), sign_lo);
-                __m256i result_hi = _mm256_sub_epi16(_mm256_mullo_epi16(two, value_hi), sign_hi);
-
-                // Accumulate to int32
-                // result_lo has 16 int16 values, need to extend to 4 groups of 8 int32
-                __m256i res_lo_lo = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(result_lo, 0));
-                __m256i res_lo_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(result_lo, 1));
-                __m256i res_hi_lo = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(result_hi, 0));
-                __m256i res_hi_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(result_hi, 1));
-
-                // Load current accumulators and add
-                __m256i acc0 = _mm256_loadu_si256((__m256i*)(y_acc + n));
-                __m256i acc1 = _mm256_loadu_si256((__m256i*)(y_acc + n + 8));
-                __m256i acc2 = _mm256_loadu_si256((__m256i*)(y_acc + n + 16));
-                __m256i acc3 = _mm256_loadu_si256((__m256i*)(y_acc + n + 24));
-
-                acc0 = _mm256_add_epi32(acc0, res_lo_lo);
-                acc1 = _mm256_add_epi32(acc1, res_lo_hi);
-                acc2 = _mm256_add_epi32(acc2, res_hi_lo);
-                acc3 = _mm256_add_epi32(acc3, res_hi_hi);
-
-                _mm256_storeu_si256((__m256i*)(y_acc + n), acc0);
-                _mm256_storeu_si256((__m256i*)(y_acc + n + 8), acc1);
-                _mm256_storeu_si256((__m256i*)(y_acc + n + 16), acc2);
-                _mm256_storeu_si256((__m256i*)(y_acc + n + 24), acc3);
+                // Vectorized accumulation
+                __m256i res_vec = _mm256_load_si256((__m256i*)results);
+                __m256i acc = _mm256_loadu_si256((__m256i*)(y_acc + n));
+                acc = _mm256_add_epi32(acc, res_vec);
+                _mm256_storeu_si256((__m256i*)(y_acc + n), acc);
             }
 
             // Handle remaining outputs
@@ -313,10 +269,9 @@ void matmul_free_tmac_int8_scalar(
         float scale = scales[m];
         float* y_row = y + m * N;
 
-        // Initialize with bias
-        for (int n = 0; n < N; n++) {
-            y_row[n] = bias ? bias[n] : 0.0f;
-        }
+        // Accumulate in int32 to avoid overflow
+        alignas(64) int32_t y_acc[N];
+        memset(y_acc, 0, N * sizeof(int32_t));
 
         // K-first iteration
         for (int kg = 0; kg < K_groups; kg++) {
@@ -328,8 +283,9 @@ void matmul_free_tmac_int8_scalar(
                 x_vals[i] = x_row[k_base + i];
             }
 
-            int8_t lut[16];
-            build_lut_16_int8(x_vals, lut);
+            // Use int16 LUT to avoid overflow
+            int16_t lut[16];
+            build_lut_16_int16(x_vals, lut);
 
             const uint8_t* sign_row = sign_plane + kg * N;
             const uint8_t* value_row = value_plane + kg * N;
@@ -337,10 +293,14 @@ void matmul_free_tmac_int8_scalar(
             for (int n = 0; n < N; n++) {
                 uint8_t s = sign_row[n] & 0x0F;
                 uint8_t v = value_row[n] & 0x0F;
-                // Accumulate scaled result
-                int16_t result = 2 * static_cast<int16_t>(lut[v]) - static_cast<int16_t>(lut[s]);
-                y_row[n] += static_cast<float>(result) * scale;
+                // Accumulate in int32
+                y_acc[n] += 2 * static_cast<int32_t>(lut[v]) - static_cast<int32_t>(lut[s]);
             }
+        }
+
+        // Convert int32 accumulator to float32 output with scale
+        for (int n = 0; n < N; n++) {
+            y_row[n] = static_cast<float>(y_acc[n]) * scale + (bias ? bias[n] : 0.0f);
         }
     }
 }
