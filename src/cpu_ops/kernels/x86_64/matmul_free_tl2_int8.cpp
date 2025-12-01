@@ -151,10 +151,45 @@ inline void build_tl2_lut_int16(const int8_t* x, int16_t* lut) {
 }
 
 /**
- * TL2 Int8 kernel with int16 LUT
+ * Build split low/high byte LUTs for PSHUFB pack-and-unpack technique (TL2)
  *
- * Uses int16 LUT to avoid overflow (sum of 3 int8 can be ±381).
- * Scalar lookups but vectorized accumulation.
+ * BitNet.cpp approach: split int16 LUT into low and high bytes,
+ * do PSHUFB twice, then unpack to get int16 results.
+ */
+inline void build_tl2_lut_split(const int8_t* x, uint8_t* lut_lo, uint8_t* lut_hi) {
+    const int16_t x0 = x[0], x1 = x[1], x2 = x[2];
+
+    int16_t sums[16];
+    sums[0]  = -x0 - x1 - x2;  // (-1,-1,-1)
+    sums[1]  =     - x1 - x2;  // ( 0,-1,-1)
+    sums[2]  =  x0 - x1 - x2;  // (+1,-1,-1)
+    sums[3]  = -x0      - x2;  // (-1, 0,-1)
+    sums[4]  =          - x2;  // ( 0, 0,-1)
+    sums[5]  =  x0      - x2;  // (+1, 0,-1)
+    sums[6]  = -x0 + x1 - x2;  // (-1,+1,-1)
+    sums[7]  =      x1 - x2;   // ( 0,+1,-1)
+    sums[8]  =  x0 + x1 - x2;  // (+1,+1,-1)
+    sums[9]  = -x0 - x1;       // (-1,-1, 0)
+    sums[10] =     - x1;       // ( 0,-1, 0)
+    sums[11] =  x0 - x1;       // (+1,-1, 0)
+    sums[12] = -x0;            // (-1, 0, 0)
+    sums[13] = 0;              // ( 0, 0, 0)
+    sums[14] = 0;              // padding
+    sums[15] = 0;              // padding
+
+    // Split each int16 into low byte and high byte
+    for (int i = 0; i < 16; i++) {
+        lut_lo[i] = static_cast<uint8_t>(sums[i] & 0xFF);
+        lut_hi[i] = static_cast<uint8_t>((sums[i] >> 8) & 0xFF);
+    }
+}
+
+/**
+ * TL2 Int8 kernel with PSHUFB pack-and-unpack
+ *
+ * Uses BitNet.cpp technique: split int16 LUT into low/high bytes,
+ * do PSHUFB twice, then unpack to int16 for accumulation.
+ * This maintains PSHUFB speed while handling overflow correctly.
  */
 void matmul_free_tl2_int8(
     torch::Tensor x_int8_tensor,
@@ -194,33 +229,85 @@ void matmul_free_tl2_int8(
                 x_vals[i] = x_row[k_base + i];
             }
 
-            // Build int16 LUT (avoids overflow!)
-            alignas(32) int16_t lut[16];
-            build_tl2_lut_int16(x_vals, lut);
+            // Build split LUTs (low byte and high byte)
+            alignas(16) uint8_t lut_lo[16];
+            alignas(16) uint8_t lut_hi[16];
+            build_tl2_lut_split(x_vals, lut_lo, lut_hi);
+
+            // Broadcast LUTs to 256-bit for PSHUFB
+            __m256i lut_lo_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut_lo));
+            __m256i lut_hi_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut_hi));
 
             const uint8_t* __restrict__ packed_row = packed + kg * N;
 
-            // Process 8 outputs at a time with vectorized accumulation
+            // Process 32 outputs at a time with PSHUFB
             int n = 0;
-            for (; n + 7 < N; n += 8) {
-                // Scalar lookups into int16 LUT
-                alignas(32) int32_t results[8];
-                for (int i = 0; i < 8; i++) {
-                    uint8_t p = packed_row[n + i];
-                    uint8_t idx = p & 0x0F;
-                    bool sign = (p & 0x10) != 0;
-                    int16_t val = lut[idx];
-                    results[i] = sign ? -static_cast<int32_t>(val) : static_cast<int32_t>(val);
-                }
+            for (; n + 31 < N; n += 32) {
+                // Load 32 packed values (index + sign bit)
+                __m256i packed_vals = _mm256_loadu_si256((__m256i*)(packed_row + n));
 
-                // Vectorized accumulation
-                __m256i res_vec = _mm256_load_si256((__m256i*)results);
-                __m256i acc = _mm256_loadu_si256((__m256i*)(y_acc + n));
-                acc = _mm256_add_epi32(acc, res_vec);
-                _mm256_storeu_si256((__m256i*)(y_acc + n), acc);
+                // Extract indices (lower 4 bits)
+                __m256i mask_0f = _mm256_set1_epi8(0x0F);
+                __m256i indices = _mm256_and_si256(packed_vals, mask_0f);
+
+                // Extract sign bits (bit 4) -> 0x10 where sign is set
+                __m256i sign_mask = _mm256_set1_epi8(0x10);
+                __m256i sign_bits = _mm256_and_si256(packed_vals, sign_mask);
+
+                // PSHUFB lookups (low and high bytes)
+                __m256i val_lo = _mm256_shuffle_epi8(lut_lo_vec, indices);
+                __m256i val_hi = _mm256_shuffle_epi8(lut_hi_vec, indices);
+
+                // Unpack to int16: interleave low and high bytes
+                __m256i val_16_0 = _mm256_unpacklo_epi8(val_lo, val_hi);
+                __m256i val_16_1 = _mm256_unpackhi_epi8(val_lo, val_hi);
+
+                // Apply sign: negate where sign bit is set
+                // Create mask: 0xFF where sign bit set, 0x00 otherwise
+                __m256i zero = _mm256_setzero_si256();
+                __m256i sign_cmp = _mm256_cmpeq_epi8(sign_bits, zero);  // 0xFF where sign=0
+
+                // Expand sign mask from 32 bytes to 32 int16 (matching val_16_0/1 layout)
+                // After unpack, we have interleaved bytes, so sign pattern needs adjustment
+                // Actually, sign_bits are still in original positions, need to unpack them too
+                __m256i sign_lo = _mm256_unpacklo_epi8(sign_cmp, sign_cmp);  // Expand to 16-bit
+                __m256i sign_hi = _mm256_unpackhi_epi8(sign_cmp, sign_cmp);
+
+                // Negate: compute -val where sign is set
+                __m256i neg_val_0 = _mm256_sub_epi16(zero, val_16_0);
+                __m256i neg_val_1 = _mm256_sub_epi16(zero, val_16_1);
+
+                // Blend: select val or -val based on sign
+                // sign_lo/hi has 0xFFFF where we keep positive, 0x0000 where we negate
+                __m256i res_16_0 = _mm256_blendv_epi8(neg_val_0, val_16_0, sign_lo);
+                __m256i res_16_1 = _mm256_blendv_epi8(neg_val_1, val_16_1, sign_hi);
+
+                // Extend to int32 and accumulate
+                __m256i res_32_0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_0, 0));
+                __m256i res_32_1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_0, 1));
+                __m256i res_32_2 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_1, 0));
+                __m256i res_32_3 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_1, 1));
+
+                // Load current accumulators and add
+                __m256i acc0 = _mm256_loadu_si256((__m256i*)(y_acc + n));
+                __m256i acc1 = _mm256_loadu_si256((__m256i*)(y_acc + n + 8));
+                __m256i acc2 = _mm256_loadu_si256((__m256i*)(y_acc + n + 16));
+                __m256i acc3 = _mm256_loadu_si256((__m256i*)(y_acc + n + 24));
+
+                acc0 = _mm256_add_epi32(acc0, res_32_0);
+                acc1 = _mm256_add_epi32(acc1, res_32_1);
+                acc2 = _mm256_add_epi32(acc2, res_32_2);
+                acc3 = _mm256_add_epi32(acc3, res_32_3);
+
+                _mm256_storeu_si256((__m256i*)(y_acc + n), acc0);
+                _mm256_storeu_si256((__m256i*)(y_acc + n + 8), acc1);
+                _mm256_storeu_si256((__m256i*)(y_acc + n + 16), acc2);
+                _mm256_storeu_si256((__m256i*)(y_acc + n + 24), acc3);
             }
 
-            // Handle remaining
+            // Handle remaining with scalar code
+            alignas(32) int16_t lut[16];
+            build_tl2_lut_int16(x_vals, lut);
             for (; n < N; n++) {
                 uint8_t p = packed_row[n];
                 uint8_t idx = p & 0x0F;
