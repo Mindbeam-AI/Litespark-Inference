@@ -13,6 +13,8 @@ import yaml
 from pathlib import Path
 import psutil
 import platform
+import os
+import gc
 
 # Import CPU-optimized components
 from src.cpu_ops import (
@@ -110,11 +112,16 @@ def benchmark_cpu_operations(model_config: dict, num_runs: int = 10):
         
         # Benchmark MatMul-free operation
         from src.cpu_ops.matmul_free_cpu import matmul_free_cpu
-        
+
         # Warmup
         for _ in range(3):
             _ = matmul_free_cpu(x, w_ternary)
-        
+
+        # Measure actual memory before benchmark
+        gc.collect()
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / (1024 * 1024)
+
         # Benchmark
         times = []
         for _ in range(num_runs):
@@ -122,13 +129,16 @@ def benchmark_cpu_operations(model_config: dict, num_runs: int = 10):
             result = matmul_free_cpu(x, w_ternary)
             end_time = time.perf_counter()
             times.append(end_time - start_time)
-        
+
+        # Measure actual memory after benchmark
+        mem_after = process.memory_info().rss / (1024 * 1024)
+
         avg_time = sum(times) / len(times)
         throughput = (batch_size * seq_len * hidden_size * hidden_size) / avg_time / 1e9
-        
+
         print(f"  Average time: {avg_time*1000:.2f} ms")
         print(f"  Throughput: {throughput:.2f} GFLOPS")
-        print(f"  Memory usage: {result.numel() * 4 / 1024**2:.1f} MB")
+        print(f"  Memory usage (actual): {mem_after - mem_before:.1f} MB delta")
 
 
 def run_inference_demo(model_config: dict):

@@ -4,12 +4,20 @@ Quick test of T-MAC approach
 import torch
 import time
 import numpy as np
+import psutil
+import gc
 from src.cpu_ops.setup_extensions import compile_cpu_kernels
 
 # Compile with T-MAC kernel
 import os
 from pathlib import Path
 from torch.utils.cpp_extension import load
+
+
+def get_process_memory_mb():
+    """Get current process memory usage in MB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024)
 
 CURRENT_DIR = Path(__file__).parent
 KERNELS_DIR = CURRENT_DIR / "src" / "cpu_ops" / "kernels"
@@ -41,12 +49,27 @@ w_ternary = torch.zeros_like(w_float)
 w_ternary[w_float > 0.5] = 1.0
 w_ternary[w_float < -0.5] = -1.0
 
+# Measure actual memory for unpacked weights
+gc.collect()
+mem_before_unpacked = get_process_memory_mb()
+w_ternary_copy = w_ternary.clone()
+mem_after_unpacked = get_process_memory_mb()
+unpacked_mem_mb = mem_after_unpacked - mem_before_unpacked
+
 # Pack weights T-MAC style
+gc.collect()
+mem_before_packed = get_process_memory_mb()
 K_bytes = (K + 7) // 8
 w_packed = torch.zeros(N, 2 * K_bytes, dtype=torch.uint8)
 tmac_kernels.pack_ternary_tmac(w_ternary, w_packed, N, K)
+mem_after_packed = get_process_memory_mb()
+packed_mem_mb = mem_after_packed - mem_before_packed
 
-print(f"Packed size: {w_packed.numel()} bytes ({w_packed.numel() / (N * K * 4):.2f}x compression)")
+print(f"Memory (actual):")
+print(f"  Unpacked: {unpacked_mem_mb:.2f} MB")
+print(f"  Packed:   {packed_mem_mb:.2f} MB")
+if packed_mem_mb > 0:
+    print(f"  Compression: {unpacked_mem_mb / packed_mem_mb:.2f}x")
 
 # Allocate output
 y = torch.zeros(M, N, dtype=torch.float32)

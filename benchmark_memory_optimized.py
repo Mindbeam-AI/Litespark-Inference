@@ -113,13 +113,8 @@ for name, M, N, K in configs:
     mem_after_unpacked = get_process_memory_mb()
     actual_unpacked_mem_mb = mem_after_unpacked - mem_before_unpacked
 
-    # Theoretical memory for comparison
-    theoretical_unpacked_mb = N * K * 4 / (1024 * 1024)  # float32
-    theoretical_packed_mb = packed.get_packed_memory_bytes(N, K) / (1024 * 1024)
-
     print(f"Memory (Unpacked Weights):")
     print(f"  Actual measured:    {actual_unpacked_mem_mb:.2f} MB")
-    print(f"  Theoretical:        {theoretical_unpacked_mb:.2f} MB")
 
     # Benchmark unpacked
     y_unpacked = torch.zeros(M, N, dtype=torch.float32)
@@ -162,13 +157,14 @@ for name, M, N, K in configs:
 
     print(f"\nMemory (Packed Weights):")
     print(f"  Actual measured:    {actual_packed_mem_mb:.2f} MB")
-    print(f"  Theoretical:        {theoretical_packed_mb:.2f} MB")
 
     # Calculate actual memory reduction
-    if actual_packed_mem_mb > 0:
+    if actual_packed_mem_mb > 0 and actual_unpacked_mem_mb > 0:
         actual_mem_reduction = actual_unpacked_mem_mb / actual_packed_mem_mb
     else:
-        actual_mem_reduction = theoretical_unpacked_mb / theoretical_packed_mb
+        # If memory delta is 0 or negative (unlikely), report 1.0
+        actual_mem_reduction = 1.0
+        print(f"  Warning: Could not measure memory reduction accurately")
 
     print(f"  Actual reduction:   {actual_mem_reduction:.2f}x")
 
@@ -217,8 +213,6 @@ for name, M, N, K in configs:
         'M': M, 'N': N, 'K': K,
         'actual_unpacked_mem_mb': actual_unpacked_mem_mb,
         'actual_packed_mem_mb': actual_packed_mem_mb,
-        'theoretical_unpacked_mb': theoretical_unpacked_mb,
-        'theoretical_packed_mb': theoretical_packed_mb,
         'actual_mem_reduction': actual_mem_reduction,
         'unpacked_gflops': unpacked_gflops,
         'packed_gflops': packed_gflops,
@@ -248,10 +242,9 @@ print(f"  • Average memory reduction: {avg_mem_reduction:.1f}x")
 print(f"  • Average performance cost:  {avg_slowdown:.2f}x slower")
 print(f"  • Trade-off: {avg_mem_reduction/avg_slowdown:.1f}x memory saved per 1x slowdown")
 
-print("\nTheoretical vs Actual Comparison:")
+print("\nPer-config Memory Reduction:")
 for r in results:
-    theoretical_reduction = r['theoretical_unpacked_mb'] / r['theoretical_packed_mb']
-    print(f"  {r['name']}: theoretical {theoretical_reduction:.1f}x vs actual {r['actual_mem_reduction']:.1f}x")
+    print(f"  {r['name']}: {r['actual_mem_reduction']:.1f}x reduction")
 
 print("\nRecommendation:")
 if avg_mem_reduction > 10 and avg_slowdown < 3:

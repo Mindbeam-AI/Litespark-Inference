@@ -134,12 +134,8 @@ for name, M, N, K in configs:
     mem_after_alloc = get_process_memory_mb()
     tensor_memory_mb = mem_after_alloc - mem_before
 
-    # Calculate theoretical memory for comparison
-    theoretical_mb = (M * K + N * K + N * K + M * N + N) * 4 / (1024 * 1024)  # x, w_float, w_ternary, y, bias
-
     print(f"\nMemory Usage:")
     print(f"  Actual tensor allocation: {tensor_memory_mb:.2f} MB")
-    print(f"  Theoretical (float32):    {theoretical_mb:.2f} MB")
 
     # Warmup
     for _ in range(10):

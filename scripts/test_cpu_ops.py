@@ -9,6 +9,9 @@ across different architectures.
 import torch
 import numpy as np
 import sys
+import psutil
+import os
+import gc
 from pathlib import Path
 
 # Add src to path
@@ -166,13 +169,30 @@ def test_performance_comparison():
     print(f"  PyTorch time: {pytorch_time*1000:.2f}ms")
     print(f"  MatMul-free time: {matmul_free_time*1000:.2f}ms")
     print(f"  Speedup: {speedup:.2f}x")
-    
-    # Memory usage comparison
-    pytorch_params = w_full.numel() * 4  # float32
-    matmul_free_params = w_ternary.numel() * 0.25  # 2 bits per weight
-    memory_reduction = pytorch_params / matmul_free_params
-    
-    print(f"  Memory reduction: {memory_reduction:.1f}x")
+
+    # Memory usage comparison - measure actual memory
+    gc.collect()
+    process = psutil.Process(os.getpid())
+    mem_before = process.memory_info().rss / (1024 * 1024)
+
+    # Create fresh tensors to measure actual allocation
+    w_full_test = torch.randn(N, K)
+    mem_after_full = process.memory_info().rss / (1024 * 1024)
+    pytorch_mem = mem_after_full - mem_before
+
+    gc.collect()
+    mem_before_ternary = process.memory_info().rss / (1024 * 1024)
+    w_ternary_test = weight_quant_cpu(torch.randn(N, K))
+    mem_after_ternary = process.memory_info().rss / (1024 * 1024)
+    matmul_free_mem = mem_after_ternary - mem_before_ternary
+
+    if matmul_free_mem > 0:
+        memory_reduction = pytorch_mem / matmul_free_mem
+        print(f"  Memory (actual): PyTorch {pytorch_mem:.2f} MB, MatMul-free {matmul_free_mem:.2f} MB")
+        print(f"  Memory reduction: {memory_reduction:.1f}x")
+    else:
+        print(f"  Memory measurement: Could not accurately measure (small tensors)")
+
     print("  ✅ Performance comparison completed")
 
 
