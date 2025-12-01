@@ -234,75 +234,63 @@ void matmul_free_tl2_int8(
             alignas(16) uint8_t lut_hi[16];
             build_tl2_lut_split(x_vals, lut_lo, lut_hi);
 
-            // Broadcast LUTs to 256-bit for PSHUFB
-            __m256i lut_lo_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut_lo));
-            __m256i lut_hi_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut_hi));
-
             const uint8_t* __restrict__ packed_row = packed + kg * N;
 
-            // Process 32 outputs at a time with PSHUFB
+            // Process 16 outputs at a time with PSHUFB (using 128-bit for correct ordering)
             int n = 0;
-            for (; n + 31 < N; n += 32) {
-                // Load 32 packed values (index + sign bit)
-                __m256i packed_vals = _mm256_loadu_si256((__m256i*)(packed_row + n));
+            for (; n + 15 < N; n += 16) {
+                // Load 16 packed values (index + sign bit)
+                __m128i packed_vals = _mm_loadu_si128((__m128i*)(packed_row + n));
 
                 // Extract indices (lower 4 bits)
-                __m256i mask_0f = _mm256_set1_epi8(0x0F);
-                __m256i indices = _mm256_and_si256(packed_vals, mask_0f);
+                __m128i mask_0f = _mm_set1_epi8(0x0F);
+                __m128i indices = _mm_and_si128(packed_vals, mask_0f);
 
                 // Extract sign bits (bit 4) -> 0x10 where sign is set
-                __m256i sign_mask = _mm256_set1_epi8(0x10);
-                __m256i sign_bits = _mm256_and_si256(packed_vals, sign_mask);
+                __m128i sign_mask = _mm_set1_epi8(0x10);
+                __m128i sign_bits = _mm_and_si128(packed_vals, sign_mask);
+
+                // Load 128-bit LUTs
+                __m128i lut_lo_128 = _mm_load_si128((__m128i*)lut_lo);
+                __m128i lut_hi_128 = _mm_load_si128((__m128i*)lut_hi);
 
                 // PSHUFB lookups (low and high bytes)
-                __m256i val_lo = _mm256_shuffle_epi8(lut_lo_vec, indices);
-                __m256i val_hi = _mm256_shuffle_epi8(lut_hi_vec, indices);
+                __m128i val_lo = _mm_shuffle_epi8(lut_lo_128, indices);
+                __m128i val_hi = _mm_shuffle_epi8(lut_hi_128, indices);
 
                 // Unpack to int16: interleave low and high bytes
-                __m256i val_16_0 = _mm256_unpacklo_epi8(val_lo, val_hi);
-                __m256i val_16_1 = _mm256_unpackhi_epi8(val_lo, val_hi);
+                __m128i val_16_lo = _mm_unpacklo_epi8(val_lo, val_hi);
+                __m128i val_16_hi = _mm_unpackhi_epi8(val_lo, val_hi);
 
                 // Apply sign: negate where sign bit is set
-                // Create mask: 0xFF where sign bit set, 0x00 otherwise
-                __m256i zero = _mm256_setzero_si256();
-                __m256i sign_cmp = _mm256_cmpeq_epi8(sign_bits, zero);  // 0xFF where sign=0
+                __m128i zero = _mm_setzero_si128();
+                __m128i sign_cmp = _mm_cmpeq_epi8(sign_bits, zero);  // 0xFF where sign=0
 
-                // Expand sign mask from 32 bytes to 32 int16 (matching val_16_0/1 layout)
-                // After unpack, we have interleaved bytes, so sign pattern needs adjustment
-                // Actually, sign_bits are still in original positions, need to unpack them too
-                __m256i sign_lo = _mm256_unpacklo_epi8(sign_cmp, sign_cmp);  // Expand to 16-bit
-                __m256i sign_hi = _mm256_unpackhi_epi8(sign_cmp, sign_cmp);
+                // Expand sign mask to 16-bit (unpack with itself)
+                __m128i sign_mask_lo = _mm_unpacklo_epi8(sign_cmp, sign_cmp);
+                __m128i sign_mask_hi = _mm_unpackhi_epi8(sign_cmp, sign_cmp);
 
                 // Negate: compute -val where sign is set
-                __m256i neg_val_0 = _mm256_sub_epi16(zero, val_16_0);
-                __m256i neg_val_1 = _mm256_sub_epi16(zero, val_16_1);
+                __m128i neg_val_lo = _mm_sub_epi16(zero, val_16_lo);
+                __m128i neg_val_hi = _mm_sub_epi16(zero, val_16_hi);
 
                 // Blend: select val or -val based on sign
-                // sign_lo/hi has 0xFFFF where we keep positive, 0x0000 where we negate
-                __m256i res_16_0 = _mm256_blendv_epi8(neg_val_0, val_16_0, sign_lo);
-                __m256i res_16_1 = _mm256_blendv_epi8(neg_val_1, val_16_1, sign_hi);
+                __m128i res_16_lo = _mm_blendv_epi8(neg_val_lo, val_16_lo, sign_mask_lo);
+                __m128i res_16_hi = _mm_blendv_epi8(neg_val_hi, val_16_hi, sign_mask_hi);
 
-                // Extend to int32 and accumulate
-                __m256i res_32_0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_0, 0));
-                __m256i res_32_1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_0, 1));
-                __m256i res_32_2 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_1, 0));
-                __m256i res_32_3 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_1, 1));
+                // Extend to int32 and accumulate using AVX2
+                __m256i res_32_0 = _mm256_cvtepi16_epi32(res_16_lo);
+                __m256i res_32_1 = _mm256_cvtepi16_epi32(res_16_hi);
 
                 // Load current accumulators and add
                 __m256i acc0 = _mm256_loadu_si256((__m256i*)(y_acc + n));
                 __m256i acc1 = _mm256_loadu_si256((__m256i*)(y_acc + n + 8));
-                __m256i acc2 = _mm256_loadu_si256((__m256i*)(y_acc + n + 16));
-                __m256i acc3 = _mm256_loadu_si256((__m256i*)(y_acc + n + 24));
 
                 acc0 = _mm256_add_epi32(acc0, res_32_0);
                 acc1 = _mm256_add_epi32(acc1, res_32_1);
-                acc2 = _mm256_add_epi32(acc2, res_32_2);
-                acc3 = _mm256_add_epi32(acc3, res_32_3);
 
                 _mm256_storeu_si256((__m256i*)(y_acc + n), acc0);
                 _mm256_storeu_si256((__m256i*)(y_acc + n + 8), acc1);
-                _mm256_storeu_si256((__m256i*)(y_acc + n + 16), acc2);
-                _mm256_storeu_si256((__m256i*)(y_acc + n + 24), acc3);
             }
 
             // Handle remaining with scalar code

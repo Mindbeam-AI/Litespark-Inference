@@ -224,68 +224,58 @@ void matmul_free_tmac_int8(
             alignas(16) uint8_t lut_hi[16];
             build_lut_16_split(x_vals, lut_lo, lut_hi);
 
-            // Broadcast LUTs to 256-bit for PSHUFB
-            __m256i lut_lo_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut_lo));
-            __m256i lut_hi_vec = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i*)lut_hi));
-
             const uint8_t* __restrict__ sign_row = sign_plane + kg * N;
             const uint8_t* __restrict__ value_row = value_plane + kg * N;
 
-            // Process 32 outputs at a time with PSHUFB
+            // Process 16 outputs at a time with PSHUFB (using 128-bit operations for correct ordering)
             int n = 0;
-            for (; n + 31 < N; n += 32) {
-                // Load 32 sign and value indices
-                __m256i sign_idx = _mm256_loadu_si256((__m256i*)(sign_row + n));
-                __m256i value_idx = _mm256_loadu_si256((__m256i*)(value_row + n));
+            for (; n + 15 < N; n += 16) {
+                // Load 16 sign and value indices
+                __m128i sign_idx = _mm_loadu_si128((__m128i*)(sign_row + n));
+                __m128i value_idx = _mm_loadu_si128((__m128i*)(value_row + n));
 
                 // Mask to 4 bits (indices 0-15)
-                __m256i mask_0f = _mm256_set1_epi8(0x0F);
-                sign_idx = _mm256_and_si256(sign_idx, mask_0f);
-                value_idx = _mm256_and_si256(value_idx, mask_0f);
+                __m128i mask_0f = _mm_set1_epi8(0x0F);
+                sign_idx = _mm_and_si128(sign_idx, mask_0f);
+                value_idx = _mm_and_si128(value_idx, mask_0f);
+
+                // Load 128-bit LUTs
+                __m128i lut_lo_128 = _mm_load_si128((__m128i*)lut_lo);
+                __m128i lut_hi_128 = _mm_load_si128((__m128i*)lut_hi);
 
                 // PSHUFB lookups for sign (low and high bytes)
-                __m256i sign_lo = _mm256_shuffle_epi8(lut_lo_vec, sign_idx);
-                __m256i sign_hi = _mm256_shuffle_epi8(lut_hi_vec, sign_idx);
+                __m128i sign_lo = _mm_shuffle_epi8(lut_lo_128, sign_idx);
+                __m128i sign_hi = _mm_shuffle_epi8(lut_hi_128, sign_idx);
 
                 // PSHUFB lookups for value (low and high bytes)
-                __m256i value_lo = _mm256_shuffle_epi8(lut_lo_vec, value_idx);
-                __m256i value_hi = _mm256_shuffle_epi8(lut_hi_vec, value_idx);
+                __m128i value_lo = _mm_shuffle_epi8(lut_lo_128, value_idx);
+                __m128i value_hi = _mm_shuffle_epi8(lut_hi_128, value_idx);
 
                 // Unpack to int16: interleave low and high bytes
-                // For first 16 elements (low half of each 128-bit lane)
-                __m256i sign_16_0 = _mm256_unpacklo_epi8(sign_lo, sign_hi);
-                __m256i sign_16_1 = _mm256_unpackhi_epi8(sign_lo, sign_hi);
-                __m256i value_16_0 = _mm256_unpacklo_epi8(value_lo, value_hi);
-                __m256i value_16_1 = _mm256_unpackhi_epi8(value_lo, value_hi);
+                // unpacklo gives elements 0-7, unpackhi gives elements 8-15
+                __m128i sign_16_lo = _mm_unpacklo_epi8(sign_lo, sign_hi);
+                __m128i sign_16_hi = _mm_unpackhi_epi8(sign_lo, sign_hi);
+                __m128i value_16_lo = _mm_unpacklo_epi8(value_lo, value_hi);
+                __m128i value_16_hi = _mm_unpackhi_epi8(value_lo, value_hi);
 
                 // Compute 2*value - sign for each int16
-                // First batch (16 int16 values)
-                __m256i two = _mm256_set1_epi16(2);
-                __m256i res_16_0 = _mm256_sub_epi16(_mm256_mullo_epi16(value_16_0, two), sign_16_0);
-                __m256i res_16_1 = _mm256_sub_epi16(_mm256_mullo_epi16(value_16_1, two), sign_16_1);
+                __m128i two = _mm_set1_epi16(2);
+                __m128i res_16_lo = _mm_sub_epi16(_mm_mullo_epi16(value_16_lo, two), sign_16_lo);
+                __m128i res_16_hi = _mm_sub_epi16(_mm_mullo_epi16(value_16_hi, two), sign_16_hi);
 
-                // Extend to int32 and accumulate
-                // res_16_0 has 16 int16 values, need to extend to 4 groups of 8 int32
-                __m256i res_32_0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_0, 0));
-                __m256i res_32_1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_0, 1));
-                __m256i res_32_2 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_1, 0));
-                __m256i res_32_3 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(res_16_1, 1));
+                // Extend to int32 and accumulate using AVX2
+                __m256i res_32_0 = _mm256_cvtepi16_epi32(res_16_lo);
+                __m256i res_32_1 = _mm256_cvtepi16_epi32(res_16_hi);
 
                 // Load current accumulators and add
                 __m256i acc0 = _mm256_loadu_si256((__m256i*)(y_acc + n));
                 __m256i acc1 = _mm256_loadu_si256((__m256i*)(y_acc + n + 8));
-                __m256i acc2 = _mm256_loadu_si256((__m256i*)(y_acc + n + 16));
-                __m256i acc3 = _mm256_loadu_si256((__m256i*)(y_acc + n + 24));
 
                 acc0 = _mm256_add_epi32(acc0, res_32_0);
                 acc1 = _mm256_add_epi32(acc1, res_32_1);
-                acc2 = _mm256_add_epi32(acc2, res_32_2);
-                acc3 = _mm256_add_epi32(acc3, res_32_3);
 
                 _mm256_storeu_si256((__m256i*)(y_acc + n), acc0);
                 _mm256_storeu_si256((__m256i*)(y_acc + n + 8), acc1);
-                _mm256_storeu_si256((__m256i*)(y_acc + n + 16), acc2);
-                _mm256_storeu_si256((__m256i*)(y_acc + n + 24), acc3);
             }
 
             // Handle remaining outputs with scalar code
