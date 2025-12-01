@@ -65,7 +65,7 @@ except Exception as e:
 print("  [2/2] AVX-512 kernel...", end=' ', flush=True)
 try:
     avx512_kernel = load(
-        name="avx512_matmul_free_test3",
+        name="avx512_matmul_free_test4",
         sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_avx512.cpp")],
         extra_cflags=['-O3', '-mavx512f', '-mavx512bw', '-mavx512dq', '-mbmi2',
                       '-fopenmp', '-std=c++17', '-march=native'],

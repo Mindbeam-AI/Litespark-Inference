@@ -241,13 +241,11 @@ void matmul_free_avx512_packed_v1(
 
 /**
  * AVX-512 MatMul-free kernel with 2-bit packed weights
- * VERSION 2: Cache blocking + Prefetching + 8-way N-blocking
+ * VERSION 2: Single accumulator approach (subtract neg from pos inline)
  *
- * Optimizations:
- * - K-blocking: Process K in L2-cache-friendly chunks
- * - N-blocking: Process 8 outputs together (more work per x_row load)
- * - Prefetching: Prefetch next K-block of weights and inputs
- * - Software pipelining: Overlap computation with memory access
+ * Key insight: Instead of two accumulators (pos/neg) per output,
+ * use one accumulator and do: acc += x (pos) or acc -= x (neg)
+ * This halves register pressure and reduces hsum calls.
  */
 void matmul_free_avx512_packed(
     torch::Tensor x_tensor,
@@ -265,14 +263,6 @@ void matmul_free_avx512_packed(
 
     const int K_packed = (K + 15) / 16;
 
-    // Tuning parameters for Ice Lake
-    // L1 cache: 48KB, L2 cache: 1.25MB per core
-    // K_BLOCK: number of packed K elements to process together
-    // Should fit: 8 outputs * 2 accumulators * 64 bytes = 1KB registers
-    //           + K_BLOCK * 16 * 4 bytes (x values) in L1
-    const int K_BLOCK = 16;  // Process 16*16=256 K elements at a time
-    const int N_BLOCK = 8;   // Process 8 outputs together
-
     omp_set_num_threads(num_threads);
 
     #pragma omp parallel for schedule(static)
@@ -280,124 +270,90 @@ void matmul_free_avx512_packed(
         const float* __restrict__ x_row = x + m * K;
         float* __restrict__ y_row = y + m * N;
 
-        // Process N_BLOCK outputs at a time
+        // Process 6 outputs at a time (sweet spot for register usage)
+        // 6 accumulators = 6 ZMM, leaves room for x_vals and temporaries
         int n = 0;
-        for (; n <= N - N_BLOCK; n += N_BLOCK) {
-            // Weight pointers for 8 outputs
+        for (; n <= N - 6; n += 6) {
             const uint32_t* __restrict__ wp0 = w_packed + (n + 0) * K_packed;
             const uint32_t* __restrict__ wp1 = w_packed + (n + 1) * K_packed;
             const uint32_t* __restrict__ wp2 = w_packed + (n + 2) * K_packed;
             const uint32_t* __restrict__ wp3 = w_packed + (n + 3) * K_packed;
             const uint32_t* __restrict__ wp4 = w_packed + (n + 4) * K_packed;
             const uint32_t* __restrict__ wp5 = w_packed + (n + 5) * K_packed;
-            const uint32_t* __restrict__ wp6 = w_packed + (n + 6) * K_packed;
-            const uint32_t* __restrict__ wp7 = w_packed + (n + 7) * K_packed;
 
-            // Accumulators for 8 outputs (pos/neg pairs)
-            __m512 sum_pos0 = _mm512_setzero_ps(), sum_neg0 = _mm512_setzero_ps();
-            __m512 sum_pos1 = _mm512_setzero_ps(), sum_neg1 = _mm512_setzero_ps();
-            __m512 sum_pos2 = _mm512_setzero_ps(), sum_neg2 = _mm512_setzero_ps();
-            __m512 sum_pos3 = _mm512_setzero_ps(), sum_neg3 = _mm512_setzero_ps();
-            __m512 sum_pos4 = _mm512_setzero_ps(), sum_neg4 = _mm512_setzero_ps();
-            __m512 sum_pos5 = _mm512_setzero_ps(), sum_neg5 = _mm512_setzero_ps();
-            __m512 sum_pos6 = _mm512_setzero_ps(), sum_neg6 = _mm512_setzero_ps();
-            __m512 sum_pos7 = _mm512_setzero_ps(), sum_neg7 = _mm512_setzero_ps();
+            // Single accumulator per output (not pos/neg split)
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+            __m512 acc4 = _mm512_setzero_ps();
+            __m512 acc5 = _mm512_setzero_ps();
 
-            // Process K in blocks for better cache locality
-            for (int kp_base = 0; kp_base < K_packed; kp_base += K_BLOCK) {
-                const int kp_end = std::min(kp_base + K_BLOCK, K_packed);
+            for (int kp = 0; kp < K_packed; kp++) {
+                __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
+                __m512 neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x_vals);  // -x
 
-                // Prefetch next K-block of weights
-                if (kp_base + K_BLOCK < K_packed) {
-                    _mm_prefetch((const char*)(wp0 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(wp1 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(wp2 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(wp3 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(wp4 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(wp5 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(wp6 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(wp7 + kp_base + K_BLOCK), _MM_HINT_T0);
-                    // Prefetch input data
-                    _mm_prefetch((const char*)(x_row + (kp_base + K_BLOCK) * 16), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(x_row + (kp_base + K_BLOCK) * 16 + 64), _MM_HINT_T0);
-                }
+                __mmask16 pm0, nm0, pm1, nm1, pm2, nm2;
+                __mmask16 pm3, nm3, pm4, nm4, pm5, nm5;
 
-                // Inner loop over K-block
-                for (int kp = kp_base; kp < kp_end; kp++) {
-                    // Load 16 input values (reused across all 8 outputs)
-                    __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
+                extract_masks_fast(wp0[kp], pm0, nm0);
+                extract_masks_fast(wp1[kp], pm1, nm1);
+                extract_masks_fast(wp2[kp], pm2, nm2);
+                extract_masks_fast(wp3[kp], pm3, nm3);
+                extract_masks_fast(wp4[kp], pm4, nm4);
+                extract_masks_fast(wp5[kp], pm5, nm5);
 
-                    // Extract masks for all 8 outputs
-                    __mmask16 pm0, nm0, pm1, nm1, pm2, nm2, pm3, nm3;
-                    __mmask16 pm4, nm4, pm5, nm5, pm6, nm6, pm7, nm7;
-
-                    extract_masks_fast(wp0[kp], pm0, nm0);
-                    extract_masks_fast(wp1[kp], pm1, nm1);
-                    extract_masks_fast(wp2[kp], pm2, nm2);
-                    extract_masks_fast(wp3[kp], pm3, nm3);
-                    extract_masks_fast(wp4[kp], pm4, nm4);
-                    extract_masks_fast(wp5[kp], pm5, nm5);
-                    extract_masks_fast(wp6[kp], pm6, nm6);
-                    extract_masks_fast(wp7[kp], pm7, nm7);
-
-                    // Accumulate with masked adds
-                    sum_pos0 = _mm512_mask_add_ps(sum_pos0, pm0, sum_pos0, x_vals);
-                    sum_neg0 = _mm512_mask_add_ps(sum_neg0, nm0, sum_neg0, x_vals);
-                    sum_pos1 = _mm512_mask_add_ps(sum_pos1, pm1, sum_pos1, x_vals);
-                    sum_neg1 = _mm512_mask_add_ps(sum_neg1, nm1, sum_neg1, x_vals);
-                    sum_pos2 = _mm512_mask_add_ps(sum_pos2, pm2, sum_pos2, x_vals);
-                    sum_neg2 = _mm512_mask_add_ps(sum_neg2, nm2, sum_neg2, x_vals);
-                    sum_pos3 = _mm512_mask_add_ps(sum_pos3, pm3, sum_pos3, x_vals);
-                    sum_neg3 = _mm512_mask_add_ps(sum_neg3, nm3, sum_neg3, x_vals);
-                    sum_pos4 = _mm512_mask_add_ps(sum_pos4, pm4, sum_pos4, x_vals);
-                    sum_neg4 = _mm512_mask_add_ps(sum_neg4, nm4, sum_neg4, x_vals);
-                    sum_pos5 = _mm512_mask_add_ps(sum_pos5, pm5, sum_pos5, x_vals);
-                    sum_neg5 = _mm512_mask_add_ps(sum_neg5, nm5, sum_neg5, x_vals);
-                    sum_pos6 = _mm512_mask_add_ps(sum_pos6, pm6, sum_pos6, x_vals);
-                    sum_neg6 = _mm512_mask_add_ps(sum_neg6, nm6, sum_neg6, x_vals);
-                    sum_pos7 = _mm512_mask_add_ps(sum_pos7, pm7, sum_pos7, x_vals);
-                    sum_neg7 = _mm512_mask_add_ps(sum_neg7, nm7, sum_neg7, x_vals);
-                }
+                // Add +x where positive, add -x where negative
+                acc0 = _mm512_mask_add_ps(acc0, pm0, acc0, x_vals);
+                acc0 = _mm512_mask_add_ps(acc0, nm0, acc0, neg_x);
+                acc1 = _mm512_mask_add_ps(acc1, pm1, acc1, x_vals);
+                acc1 = _mm512_mask_add_ps(acc1, nm1, acc1, neg_x);
+                acc2 = _mm512_mask_add_ps(acc2, pm2, acc2, x_vals);
+                acc2 = _mm512_mask_add_ps(acc2, nm2, acc2, neg_x);
+                acc3 = _mm512_mask_add_ps(acc3, pm3, acc3, x_vals);
+                acc3 = _mm512_mask_add_ps(acc3, nm3, acc3, neg_x);
+                acc4 = _mm512_mask_add_ps(acc4, pm4, acc4, x_vals);
+                acc4 = _mm512_mask_add_ps(acc4, nm4, acc4, neg_x);
+                acc5 = _mm512_mask_add_ps(acc5, pm5, acc5, x_vals);
+                acc5 = _mm512_mask_add_ps(acc5, nm5, acc5, neg_x);
             }
 
-            // Horizontal sum and store all 8 results
-            float r0 = hsum_avx512(sum_pos0) - hsum_avx512(sum_neg0);
-            float r1 = hsum_avx512(sum_pos1) - hsum_avx512(sum_neg1);
-            float r2 = hsum_avx512(sum_pos2) - hsum_avx512(sum_neg2);
-            float r3 = hsum_avx512(sum_pos3) - hsum_avx512(sum_neg3);
-            float r4 = hsum_avx512(sum_pos4) - hsum_avx512(sum_neg4);
-            float r5 = hsum_avx512(sum_pos5) - hsum_avx512(sum_neg5);
-            float r6 = hsum_avx512(sum_pos6) - hsum_avx512(sum_neg6);
-            float r7 = hsum_avx512(sum_pos7) - hsum_avx512(sum_neg7);
+            // Only 6 hsum calls instead of 12
+            float r0 = hsum_avx512(acc0);
+            float r1 = hsum_avx512(acc1);
+            float r2 = hsum_avx512(acc2);
+            float r3 = hsum_avx512(acc3);
+            float r4 = hsum_avx512(acc4);
+            float r5 = hsum_avx512(acc5);
 
             if (bias != nullptr) {
                 r0 += bias[n + 0]; r1 += bias[n + 1];
                 r2 += bias[n + 2]; r3 += bias[n + 3];
                 r4 += bias[n + 4]; r5 += bias[n + 5];
-                r6 += bias[n + 6]; r7 += bias[n + 7];
             }
 
             y_row[n + 0] = r0; y_row[n + 1] = r1;
             y_row[n + 2] = r2; y_row[n + 3] = r3;
             y_row[n + 4] = r4; y_row[n + 5] = r5;
-            y_row[n + 6] = r6; y_row[n + 7] = r7;
         }
 
-        // Handle remaining outputs (< 8)
+        // Handle remaining outputs
         for (; n < N; n++) {
             const uint32_t* __restrict__ wp = w_packed + n * K_packed;
-            __m512 sum_pos = _mm512_setzero_ps();
-            __m512 sum_neg = _mm512_setzero_ps();
+            __m512 acc = _mm512_setzero_ps();
 
             for (int kp = 0; kp < K_packed; kp++) {
                 __m512 x_vals = _mm512_loadu_ps(x_row + kp * 16);
+                __m512 neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x_vals);
+
                 __mmask16 pos_mask, neg_mask;
                 extract_masks_fast(wp[kp], pos_mask, neg_mask);
-                sum_pos = _mm512_mask_add_ps(sum_pos, pos_mask, sum_pos, x_vals);
-                sum_neg = _mm512_mask_add_ps(sum_neg, neg_mask, sum_neg, x_vals);
+
+                acc = _mm512_mask_add_ps(acc, pos_mask, acc, x_vals);
+                acc = _mm512_mask_add_ps(acc, neg_mask, acc, neg_x);
             }
 
-            float result = hsum_avx512(sum_pos) - hsum_avx512(sum_neg);
+            float result = hsum_avx512(acc);
             if (bias != nullptr) result += bias[n];
             y_row[n] = result;
         }
