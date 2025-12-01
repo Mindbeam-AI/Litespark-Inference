@@ -23,6 +23,7 @@ einops>=0.6.1
 pybind11>=2.10.0  # For C++ extensions
 setuptools>=65.0.0
 wheel>=0.38.0
+ninja>=1.11.0  # Required for PyTorch C++ extension compilation
 
 # Data handling and utilities
 safetensors>=0.3.0

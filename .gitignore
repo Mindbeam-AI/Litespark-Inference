@@ -1,6 +1,22 @@
 # Jupyter Notebooks
 v2.ipynb
 
+# Virtual environments
+cpu-matmul-env/
+.venv/
+venv/
+env/
+
+# Profiling output
+prof.out
+*.prof
+
+# Claude Code
+.claude/
+
+# Benchmark cache
+.benchmarks/
+
 # Python
 __pycache__/
 *.py[cod]
