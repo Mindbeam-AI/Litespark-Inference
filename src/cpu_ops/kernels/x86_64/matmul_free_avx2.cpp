@@ -210,7 +210,5 @@ bool has_avx2_support() {
 #endif
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_free_avx2", &matmul_free_avx2, "AVX2-optimized MatMul-free kernel");
-    m.def("has_avx2_support", &has_avx2_support, "Check if AVX2 is supported");
-}
+// Note: PYBIND11_MODULE is defined in matmul_free_generic.cpp which serves as the main entry point
+// The generic module conditionally exports AVX2 functions when HAS_AVX2_SUPPORT is defined
