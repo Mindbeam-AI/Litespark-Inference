@@ -11,6 +11,13 @@
 #include <omp.h>
 #include <torch/extension.h>
 
+// Cross-platform CPUID support
+#ifdef _MSC_VER
+    #include <intrin.h>
+#else
+    #include <cpuid.h>
+#endif
+
 /**
  * Horizontal sum of __m256 vector
  */
@@ -188,10 +195,19 @@ void matmul_free_avx2(
  * Check if AVX2 is supported on this CPU
  */
 bool has_avx2_support() {
-    // Simple CPUID check for AVX2
+#ifdef _MSC_VER
+    // Windows/MSVC
     int cpuinfo[4];
     __cpuid(cpuinfo, 7);
-    return (cpuinfo[1] & (1 << 5)) != 0;  // Check AVX2 bit
+    return (cpuinfo[1] & (1 << 5)) != 0;  // Check AVX2 bit (EBX bit 5)
+#else
+    // Linux/macOS with GCC/Clang
+    unsigned int eax, ebx, ecx, edx;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        return (ebx & (1 << 5)) != 0;  // Check AVX2 bit (EBX bit 5)
+    }
+    return false;
+#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
