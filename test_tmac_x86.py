@@ -29,6 +29,8 @@ import os
 import gc
 from pathlib import Path
 from torch.utils.cpp_extension import load
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 
 def get_process_memory_mb():
@@ -190,6 +192,9 @@ num_threads = 8
 print(f"\nTesting with {num_threads} threads")
 print("="*70)
 
+# Store all results across configs for final summary
+all_results = {}
+
 for name, M, N, K in configs:
     print(f"\n{name}: {M}x{K} @ {K}x{N}")
     print("-"*70)
@@ -264,6 +269,9 @@ for name, M, N, K in configs:
 
     bias = torch.zeros(N, dtype=torch.float32)
     results = {}
+
+    # Store config info
+    config_info = {'M': M, 'N': N, 'K': K, 'flops': 2.0 * M * N * K}
 
     # Weight memory comparison
     float_mem = N * K * 4 / (1024 * 1024)
@@ -712,16 +720,253 @@ for name, M, N, K in configs:
             ratio = gflops / avx512_gflops if avx512_gflops > 0 else 0
             print(f"    {label:<30} {gflops:>10.1f} {ratio:>11.2f}x")
 
+    # Store results for this config (excluding large tensor data)
+    all_results[name] = {
+        'config': config_info,
+        'kernels': {k: {'time': v['time'], 'gflops': v['gflops']} for k, v in results.items()}
+    }
+
 print("\n" + "="*70)
 print("T-MAC / TL2 Test Complete!")
 print("="*70)
-print("\nKey Insights:")
-print("  1. Float32 LUT = SLOW (scalar lookups, ~50 GFLOPS)")
-print("  2. Int8 LUT + PSHUFB = FAST (32 parallel lookups)")
-print("  3. AVX-512 packed (direct computation) = baseline (~145 GFLOPS)")
-print("\nMicrosoft's approach (BitNet.cpp):")
-print("  - Int8 activations (per-row quantization)")
-print("  - Int8 LUT values")
-print("  - PSHUFB for 32 parallel lookups per instruction")
-print("  - Int32 accumulation, float32 output")
+
+# =============================================================================
+# FINAL SUMMARY TABLE
+# =============================================================================
+print("\n")
+print("="*100)
+print("FINAL SUMMARY TABLE")
+print("="*100)
+
+# Define kernel display order and labels
+kernel_order = [
+    ('tmac_int8', 'T-MAC int8 PSHUFB'),
+    ('tmac_int8_avx512_v2', 'T-MAC int8 AVX-512 v2'),
+    ('vnni', 'VNNI simple'),
+    ('vnni_v2', 'VNNI v2 (reg block)'),
+    ('vnni_v3', 'VNNI v3 (tiled)'),
+    ('pytorch', 'PyTorch (MKL)'),
+]
+
+# Print header
+print(f"\n{'Kernel':<25}", end='')
+for cfg_name, M, N, K in configs:
+    print(f" | {cfg_name:^20}", end='')
+print()
+print("-"*25, end='')
+for _ in configs:
+    print("-"*23, end='')
+print()
+
+# Print each kernel row
+for key, label in kernel_order:
+    print(f"{label:<25}", end='')
+    for cfg_name, M, N, K in configs:
+        if cfg_name in all_results and key in all_results[cfg_name]['kernels']:
+            data = all_results[cfg_name]['kernels'][key]
+            gflops = data['gflops']
+            time_ms = data['time']
+            print(f" | {gflops:>6.0f} GFLOPS {time_ms:>5.2f}ms", end='')
+        else:
+            print(f" | {'N/A':^20}", end='')
+    print()
+
+# Print speedup vs PyTorch
+print()
+print(f"{'Speedup vs PyTorch':<25}", end='')
+for cfg_name, M, N, K in configs:
+    print(f" | {cfg_name:^20}", end='')
+print()
+print("-"*25, end='')
+for _ in configs:
+    print("-"*23, end='')
+print()
+
+for key, label in kernel_order:
+    if key == 'pytorch':
+        continue
+    print(f"{label:<25}", end='')
+    for cfg_name, M, N, K in configs:
+        if cfg_name in all_results:
+            kernels = all_results[cfg_name]['kernels']
+            if key in kernels and 'pytorch' in kernels:
+                speedup = kernels[key]['gflops'] / kernels['pytorch']['gflops']
+                print(f" | {speedup:>10.2f}x         ", end='')
+            else:
+                print(f" | {'N/A':^20}", end='')
+        else:
+            print(f" | {'N/A':^20}", end='')
+    print()
+
+# =============================================================================
+# GENERATE PLOTS
+# =============================================================================
+print("\n" + "="*70)
+print("Generating plots...")
+print("="*70)
+
+# Create output directory for plots
+plots_dir = Path(__file__).parent / "benchmark_plots"
+plots_dir.mkdir(exist_ok=True)
+
+# Color scheme for kernels
+colors = {
+    'tmac_int8': '#1f77b4',
+    'tmac_int8_avx512_v2': '#ff7f0e',
+    'vnni': '#2ca02c',
+    'vnni_v2': '#d62728',
+    'vnni_v3': '#9467bd',
+    'pytorch': '#8c564b',
+}
+
+# Plot 1: GFLOPS comparison bar chart
+fig, axes = plt.subplots(1, len(configs), figsize=(16, 5), sharey=True)
+fig.suptitle('GFLOPS Performance by Matrix Size', fontsize=14, fontweight='bold')
+
+for idx, (cfg_name, M, N, K) in enumerate(configs):
+    ax = axes[idx] if len(configs) > 1 else axes
+    if cfg_name not in all_results:
+        continue
+
+    kernels_data = all_results[cfg_name]['kernels']
+    kernel_names = []
+    gflops_values = []
+    bar_colors = []
+
+    for key, label in kernel_order:
+        if key in kernels_data:
+            kernel_names.append(label.replace(' ', '\n'))
+            gflops_values.append(kernels_data[key]['gflops'])
+            bar_colors.append(colors.get(key, '#333333'))
+
+    bars = ax.bar(range(len(kernel_names)), gflops_values, color=bar_colors)
+    ax.set_xticks(range(len(kernel_names)))
+    ax.set_xticklabels(kernel_names, fontsize=8)
+    ax.set_title(f"{cfg_name}\n({M}x{K} @ {K}x{N})", fontsize=10)
+    ax.set_ylabel('GFLOPS' if idx == 0 else '')
+    ax.grid(axis='y', alpha=0.3)
+
+    # Add value labels on bars
+    for bar, val in zip(bars, gflops_values):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
+                f'{val:.0f}', ha='center', va='bottom', fontsize=7)
+
+plt.tight_layout()
+plot_path = plots_dir / 'gflops_comparison.png'
+plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+print(f"  Saved: {plot_path}")
+plt.close()
+
+# Plot 2: Speedup vs PyTorch
+fig, ax = plt.subplots(figsize=(12, 6))
+fig.suptitle('Speedup vs PyTorch (MKL) by Matrix Size', fontsize=14, fontweight='bold')
+
+config_names = [cfg[0] for cfg in configs]
+x = np.arange(len(config_names))
+width = 0.15
+offset = 0
+
+speedup_kernels = [(k, l) for k, l in kernel_order if k != 'pytorch']
+
+for i, (key, label) in enumerate(speedup_kernels):
+    speedups = []
+    for cfg_name, M, N, K in configs:
+        if cfg_name in all_results:
+            kernels = all_results[cfg_name]['kernels']
+            if key in kernels and 'pytorch' in kernels:
+                speedups.append(kernels[key]['gflops'] / kernels['pytorch']['gflops'])
+            else:
+                speedups.append(0)
+        else:
+            speedups.append(0)
+
+    bars = ax.bar(x + (i - len(speedup_kernels)/2 + 0.5) * width, speedups,
+                  width, label=label, color=colors.get(key, '#333333'))
+
+ax.axhline(y=1.0, color='black', linestyle='--', linewidth=1, label='PyTorch baseline')
+ax.set_xlabel('Matrix Size')
+ax.set_ylabel('Speedup (higher is better)')
+ax.set_xticks(x)
+ax.set_xticklabels([f"{cfg[0]}\n({cfg[1]}x{cfg[2]}x{cfg[3]})" for cfg in configs])
+ax.legend(loc='upper right', fontsize=8)
+ax.grid(axis='y', alpha=0.3)
+
+plt.tight_layout()
+plot_path = plots_dir / 'speedup_vs_pytorch.png'
+plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+print(f"  Saved: {plot_path}")
+plt.close()
+
+# Plot 3: Time comparison
+fig, axes = plt.subplots(1, len(configs), figsize=(16, 5), sharey=False)
+fig.suptitle('Execution Time by Matrix Size (lower is better)', fontsize=14, fontweight='bold')
+
+for idx, (cfg_name, M, N, K) in enumerate(configs):
+    ax = axes[idx] if len(configs) > 1 else axes
+    if cfg_name not in all_results:
+        continue
+
+    kernels_data = all_results[cfg_name]['kernels']
+    kernel_names = []
+    time_values = []
+    bar_colors = []
+
+    for key, label in kernel_order:
+        if key in kernels_data:
+            kernel_names.append(label.replace(' ', '\n'))
+            time_values.append(kernels_data[key]['time'])
+            bar_colors.append(colors.get(key, '#333333'))
+
+    bars = ax.bar(range(len(kernel_names)), time_values, color=bar_colors)
+    ax.set_xticks(range(len(kernel_names)))
+    ax.set_xticklabels(kernel_names, fontsize=8)
+    ax.set_title(f"{cfg_name}\n({M}x{K} @ {K}x{N})", fontsize=10)
+    ax.set_ylabel('Time (ms)' if idx == 0 else '')
+    ax.grid(axis='y', alpha=0.3)
+
+    # Add value labels on bars
+    for bar, val in zip(bars, time_values):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f'{val:.2f}', ha='center', va='bottom', fontsize=7)
+
+plt.tight_layout()
+plot_path = plots_dir / 'time_comparison.png'
+plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+print(f"  Saved: {plot_path}")
+plt.close()
+
+# Plot 4: Scaling across matrix sizes (line plot)
+fig, ax = plt.subplots(figsize=(10, 6))
+fig.suptitle('GFLOPS Scaling Across Matrix Sizes', fontsize=14, fontweight='bold')
+
+matrix_sizes = [M * N * K for (_, M, N, K) in configs]
+config_labels = [cfg[0] for cfg in configs]
+
+for key, label in kernel_order:
+    gflops_list = []
+    for cfg_name, M, N, K in configs:
+        if cfg_name in all_results and key in all_results[cfg_name]['kernels']:
+            gflops_list.append(all_results[cfg_name]['kernels'][key]['gflops'])
+        else:
+            gflops_list.append(np.nan)
+
+    ax.plot(range(len(configs)), gflops_list, 'o-', label=label,
+            color=colors.get(key, '#333333'), linewidth=2, markersize=8)
+
+ax.set_xticks(range(len(configs)))
+ax.set_xticklabels([f"{cfg[0]}\n{cfg[1]}x{cfg[2]}x{cfg[3]}" for cfg in configs])
+ax.set_xlabel('Matrix Size')
+ax.set_ylabel('GFLOPS')
+ax.legend(loc='best', fontsize=9)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plot_path = plots_dir / 'gflops_scaling.png'
+plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+print(f"  Saved: {plot_path}")
+plt.close()
+
+print(f"\nAll plots saved to: {plots_dir}")
+print("\n" + "="*70)
+print("Benchmark Complete!")
 print("="*70)
