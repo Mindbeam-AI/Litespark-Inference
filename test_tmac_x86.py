@@ -9,8 +9,9 @@ This script benchmarks:
 5. T-MAC int8 AVX-512 with PSHUFB (64 parallel lookups)
 6. T-MAC int8 AVX-512 v2 (optimized lane handling)
 7. T-MAC int8 AVX-512 tiled (cache-aware)
-8. VNNI kernel (direct dot product)
-9. AVX-512 packed (direct computation baseline)
+8. VNNI simple (direct dot product)
+9. VNNI v2 (N tiling + register blocking + vectorized conversion)
+10. AVX-512 packed (direct computation baseline)
 
 Key insight from Microsoft:
 - Int8 activations + int8 LUT + PSHUFB = 32 parallel lookups per instruction (AVX2)
@@ -571,6 +572,32 @@ for name, M, N, K in configs:
         print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
         results['vnni'] = {'time': avg_time, 'gflops': gflops, 'y': y_vnni.clone()}
 
+        # Test VNNI v2 (register blocking)
+        print("\n  VNNI v2 (register blocking):")
+        y_vnni_v2 = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            vnni_kernel.matmul_free_vnni_v2(
+                x_int8, scales, w_int8_vnni, w_sum_vnni,
+                y_vnni_v2, bias, M, N, K, num_threads
+            )
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            vnni_kernel.matmul_free_vnni_v2(
+                x_int8, scales, w_int8_vnni, w_sum_vnni,
+                y_vnni_v2, bias, M, N, K, num_threads
+            )
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['vnni_v2'] = {'time': avg_time, 'gflops': gflops, 'y': y_vnni_v2.clone()}
+
     # Test AVX-512 packed v1 for comparison
     if avx512_kernel is not None:
         print("\n  AVX-512 packed v1 (baseline):")
@@ -621,7 +648,7 @@ for name, M, N, K in configs:
             print(f"    {key}: max_diff={max_diff:.6f} {status}")
 
     # Int8 kernels - allow quantization error (~1-2% relative)
-    for key in ['tmac_int8', 'tl2_int8', 'tmac_int8_avx512', 'tmac_int8_avx512_v2', 'tmac_int8_avx512_tiled', 'vnni']:
+    for key in ['tmac_int8', 'tl2_int8', 'tmac_int8_avx512', 'tmac_int8_avx512_v2', 'tmac_int8_avx512_tiled', 'vnni', 'vnni_v2']:
         if key in results:
             max_diff = torch.max(torch.abs(results[key]['y'] - y_pt)).item()
             rel_error = max_diff / (torch.max(torch.abs(y_pt)).item() + 1e-6)
@@ -647,6 +674,7 @@ for name, M, N, K in configs:
         ('tmac_int8_avx512_v2', 'T-MAC int8 AVX-512 v2'),
         ('tmac_int8_avx512_tiled', 'T-MAC int8 AVX-512 tiled'),
         ('vnni', 'VNNI simple'),
+        ('vnni_v2', 'VNNI v2 (optimized)'),
         ('tl2_int8', 'TL2 int8 PSHUFB'),
         ('avx512_packed', 'AVX-512 packed'),
         ('pytorch', 'PyTorch'),
