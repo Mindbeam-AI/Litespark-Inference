@@ -6,10 +6,12 @@ This script benchmarks:
 2. TL2 float32 (element-wise LUT)
 3. T-MAC int8 with PSHUFB (CORRECT Microsoft approach)
 4. TL2 int8 with PSHUFB (CORRECT Microsoft approach)
-5. AVX-512 packed (direct computation baseline)
+5. T-MAC int8 AVX-512 with PSHUFB (64 parallel lookups)
+6. AVX-512 packed (direct computation baseline)
 
 Key insight from Microsoft:
-- Int8 activations + int8 LUT + PSHUFB = 32 parallel lookups per instruction
+- Int8 activations + int8 LUT + PSHUFB = 32 parallel lookups per instruction (AVX2)
+- AVX-512 PSHUFB = 64 parallel lookups per instruction
 - Float32 LUT = scalar lookups (slow!)
 """
 import torch
@@ -120,6 +122,22 @@ try:
 except Exception as e:
     print(f"FAILED: {e}")
     avx512_kernel = None
+
+# Compile T-MAC int8 AVX-512 kernel
+print("Compiling T-MAC int8 AVX-512 kernel...", end=' ', flush=True)
+try:
+    tmac_int8_avx512_kernel = load(
+        name="tmac_int8_avx512_for_main_test",
+        sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_tmac_int8_avx512.cpp")],
+        extra_cflags=['-O3', '-mavx512f', '-mavx512bw', '-mavx512dq', '-mavx512vl',
+                      '-fopenmp', '-std=c++17', '-march=native'],
+        extra_ldflags=['-fopenmp', '-lgomp'],
+        verbose=False
+    )
+    print("OK")
+except Exception as e:
+    print(f"FAILED: {e}")
+    tmac_int8_avx512_kernel = None
 
 # Test configurations
 configs = [
@@ -397,6 +415,33 @@ for name, M, N, K in configs:
         print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
         results['tl2_int8'] = {'time': avg_time, 'gflops': gflops, 'y': y_tl2_int8.clone()}
 
+    # Test T-MAC int8 AVX-512 PSHUFB (64 parallel lookups)
+    if tmac_int8_avx512_kernel is not None and tmac_int8_kernel is not None:
+        print("\n  T-MAC int8 AVX-512 PSHUFB:")
+        y_tmac_int8_avx512 = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            tmac_int8_avx512_kernel.matmul_free_tmac_int8_avx512(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_tmac_int8_avx512, bias, M, N, K, num_threads
+            )
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            tmac_int8_avx512_kernel.matmul_free_tmac_int8_avx512(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_tmac_int8_avx512, bias, M, N, K, num_threads
+            )
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['tmac_int8_avx512'] = {'time': avg_time, 'gflops': gflops, 'y': y_tmac_int8_avx512.clone()}
+
     # Test AVX-512 packed v1 for comparison
     if avx512_kernel is not None:
         print("\n  AVX-512 packed v1 (baseline):")
@@ -447,7 +492,7 @@ for name, M, N, K in configs:
             print(f"    {key}: max_diff={max_diff:.6f} {status}")
 
     # Int8 kernels - allow quantization error (~1-2% relative)
-    for key in ['tmac_int8', 'tl2_int8']:
+    for key in ['tmac_int8', 'tl2_int8', 'tmac_int8_avx512']:
         if key in results:
             max_diff = torch.max(torch.abs(results[key]['y'] - y_pt)).item()
             rel_error = max_diff / (torch.max(torch.abs(y_pt)).item() + 1e-6)
@@ -469,6 +514,7 @@ for name, M, N, K in configs:
         ('tmac_gather', 'T-MAC float32 Gather'),
         ('tl2_float32', 'TL2 float32'),
         ('tmac_int8', 'T-MAC int8 PSHUFB'),
+        ('tmac_int8_avx512', 'T-MAC int8 AVX-512'),
         ('tl2_int8', 'TL2 int8 PSHUFB'),
         ('avx512_packed', 'AVX-512 packed'),
         ('pytorch', 'PyTorch'),

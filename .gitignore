@@ -1,3 +1,11 @@
+# Documentation (keep local only)
+ARCHITECTURE_ROADMAP.md
+AVX2_OPTIMIZATION.md
+AVX2_SUMMARY.md
+CPU_DEVELOPMENT_PLAN.md
+OPTIMIZATION_RESULTS.md
+docs/
+
 # Jupyter Notebooks
 v2.ipynb
 
