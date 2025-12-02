@@ -7,11 +7,15 @@ This script benchmarks:
 3. T-MAC int8 with PSHUFB (CORRECT Microsoft approach)
 4. TL2 int8 with PSHUFB (CORRECT Microsoft approach)
 5. T-MAC int8 AVX-512 with PSHUFB (64 parallel lookups)
-6. AVX-512 packed (direct computation baseline)
+6. T-MAC int8 AVX-512 v2 (optimized lane handling)
+7. T-MAC int8 AVX-512 tiled (cache-aware)
+8. VNNI kernel (direct dot product)
+9. AVX-512 packed (direct computation baseline)
 
 Key insight from Microsoft:
 - Int8 activations + int8 LUT + PSHUFB = 32 parallel lookups per instruction (AVX2)
 - AVX-512 PSHUFB = 64 parallel lookups per instruction
+- VNNI dpbusd = 64 int8 multiplies per instruction
 - Float32 LUT = scalar lookups (slow!)
 """
 import torch
@@ -139,6 +143,38 @@ except Exception as e:
     print(f"FAILED: {e}")
     tmac_int8_avx512_kernel = None
 
+# Compile T-MAC int8 AVX-512 v2 kernel (optimized)
+print("Compiling T-MAC int8 AVX-512 v2 kernel...", end=' ', flush=True)
+try:
+    tmac_int8_avx512_v2_kernel = load(
+        name="tmac_int8_avx512_v2_for_main_test",
+        sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_tmac_int8_avx512_v2.cpp")],
+        extra_cflags=['-O3', '-mavx512f', '-mavx512bw', '-mavx512dq', '-mavx512vl',
+                      '-fopenmp', '-std=c++17', '-march=native'],
+        extra_ldflags=['-fopenmp', '-lgomp'],
+        verbose=False
+    )
+    print("OK")
+except Exception as e:
+    print(f"FAILED: {e}")
+    tmac_int8_avx512_v2_kernel = None
+
+# Compile VNNI kernel
+print("Compiling VNNI kernel...", end=' ', flush=True)
+try:
+    vnni_kernel = load(
+        name="vnni_for_main_test",
+        sources=[str(KERNELS_DIR / "x86_64" / "matmul_free_tmac_vnni.cpp")],
+        extra_cflags=['-O3', '-mavx512f', '-mavx512bw', '-mavx512dq', '-mavx512vl',
+                      '-mavx512vnni', '-fopenmp', '-std=c++17', '-march=native'],
+        extra_ldflags=['-fopenmp', '-lgomp'],
+        verbose=False
+    )
+    print("OK")
+except Exception as e:
+    print(f"FAILED: {e}")
+    vnni_kernel = None
+
 # Test configurations
 configs = [
     ("Small", 128, 1024, 1024),
@@ -210,6 +246,19 @@ for name, M, N, K in configs:
         K_packed_avx512 = (K + 15) // 16
         w_packed_avx512 = torch.zeros(N, K_packed_avx512 * 4, dtype=torch.uint8)
         avx512_kernel.pack_weights_2bit_avx512(w_ternary, w_packed_avx512, N, K)
+
+    # Pack weights for VNNI kernel
+    if vnni_kernel is not None:
+        K_padded = ((K + 63) // 64) * 64
+        w_int8_vnni = torch.zeros(N, K_padded, dtype=torch.int8)
+        w_sum_vnni = torch.zeros(N, dtype=torch.int32)
+        vnni_kernel.pack_weights_vnni(w_ternary, w_int8_vnni, w_sum_vnni, N, K)
+
+        # Quantize activations for VNNI (reuse existing if available)
+        if tmac_int8_kernel is None:
+            x_int8 = torch.zeros(M, K, dtype=torch.int8)
+            scales = torch.zeros(M, dtype=torch.float32)
+            vnni_kernel.quantize_activations_int8_vnni(x, x_int8, scales, M, K)
 
     bias = torch.zeros(N, dtype=torch.float32)
     results = {}
@@ -442,6 +491,86 @@ for name, M, N, K in configs:
         print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
         results['tmac_int8_avx512'] = {'time': avg_time, 'gflops': gflops, 'y': y_tmac_int8_avx512.clone()}
 
+    # Test T-MAC int8 AVX-512 v2 (optimized lane handling)
+    if tmac_int8_avx512_v2_kernel is not None and tmac_int8_kernel is not None:
+        print("\n  T-MAC int8 AVX-512 v2:")
+        y_avx512_v2 = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            tmac_int8_avx512_v2_kernel.matmul_free_tmac_int8_avx512_v2(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_avx512_v2, bias, M, N, K, num_threads
+            )
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            tmac_int8_avx512_v2_kernel.matmul_free_tmac_int8_avx512_v2(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_avx512_v2, bias, M, N, K, num_threads
+            )
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['tmac_int8_avx512_v2'] = {'time': avg_time, 'gflops': gflops, 'y': y_avx512_v2.clone()}
+
+        # Test tiled version
+        print("\n  T-MAC int8 AVX-512 tiled:")
+        y_avx512_tiled = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            tmac_int8_avx512_v2_kernel.matmul_free_tmac_int8_avx512_tiled(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_avx512_tiled, bias, M, N, K, num_threads
+            )
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            tmac_int8_avx512_v2_kernel.matmul_free_tmac_int8_avx512_tiled(
+                x_int8, scales, sign_plane_int8, value_plane_int8,
+                y_avx512_tiled, bias, M, N, K, num_threads
+            )
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['tmac_int8_avx512_tiled'] = {'time': avg_time, 'gflops': gflops, 'y': y_avx512_tiled.clone()}
+
+    # Test VNNI kernel
+    if vnni_kernel is not None:
+        print("\n  VNNI simple:")
+        y_vnni = torch.zeros(M, N, dtype=torch.float32)
+
+        for _ in range(5):
+            vnni_kernel.matmul_free_vnni_simple(
+                x_int8, scales, w_int8_vnni, w_sum_vnni,
+                y_vnni, bias, M, N, K, num_threads
+            )
+
+        gc.collect()
+        times = []
+        for _ in range(30):
+            start = time.perf_counter()
+            vnni_kernel.matmul_free_vnni_simple(
+                x_int8, scales, w_int8_vnni, w_sum_vnni,
+                y_vnni, bias, M, N, K, num_threads
+            )
+            times.append(time.perf_counter() - start)
+
+        avg_time = np.mean(times) * 1000
+        std_time = np.std(times) * 1000
+        gflops = (2.0 * M * N * K / 1e9) / (avg_time / 1000)
+        print(f"    Time: {avg_time:.2f} +/- {std_time:.2f} ms, GFLOPS: {gflops:.1f}")
+        results['vnni'] = {'time': avg_time, 'gflops': gflops, 'y': y_vnni.clone()}
+
     # Test AVX-512 packed v1 for comparison
     if avx512_kernel is not None:
         print("\n  AVX-512 packed v1 (baseline):")
@@ -492,7 +621,7 @@ for name, M, N, K in configs:
             print(f"    {key}: max_diff={max_diff:.6f} {status}")
 
     # Int8 kernels - allow quantization error (~1-2% relative)
-    for key in ['tmac_int8', 'tl2_int8', 'tmac_int8_avx512']:
+    for key in ['tmac_int8', 'tl2_int8', 'tmac_int8_avx512', 'tmac_int8_avx512_v2', 'tmac_int8_avx512_tiled', 'vnni']:
         if key in results:
             max_diff = torch.max(torch.abs(results[key]['y'] - y_pt)).item()
             rel_error = max_diff / (torch.max(torch.abs(y_pt)).item() + 1e-6)
@@ -515,6 +644,9 @@ for name, M, N, K in configs:
         ('tl2_float32', 'TL2 float32'),
         ('tmac_int8', 'T-MAC int8 PSHUFB'),
         ('tmac_int8_avx512', 'T-MAC int8 AVX-512'),
+        ('tmac_int8_avx512_v2', 'T-MAC int8 AVX-512 v2'),
+        ('tmac_int8_avx512_tiled', 'T-MAC int8 AVX-512 tiled'),
+        ('vnni', 'VNNI simple'),
         ('tl2_int8', 'TL2 int8 PSHUFB'),
         ('avx512_packed', 'AVX-512 packed'),
         ('pytorch', 'PyTorch'),
