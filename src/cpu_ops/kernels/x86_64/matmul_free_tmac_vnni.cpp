@@ -442,9 +442,7 @@ void pack_weights_vnni(
  * 2. Vectorized uint8 conversion
  * 3. Per-thread activation buffers
  *
- * Note: N-tiling was removed as it requires per-row buffers which
- * would be memory-prohibitive for large M. The simple M-parallel
- * approach with register blocking provides excellent performance.
+ * This version parallelizes across M rows, good for small/medium matrices.
  */
 void matmul_free_vnni_v2(
     torch::Tensor x_int8_tensor,    // [M, K] int8
@@ -546,6 +544,152 @@ void matmul_free_vnni_v2(
     free(x_uint8_buffers);
 }
 
+/**
+ * VNNI v3 - Cache-optimized tiled kernel for large matrices
+ *
+ * Based on Microsoft T-MAC's tiling strategy (https://arxiv.org/html/2407.00088v1):
+ * - M tiling: Process M_TILE rows at a time
+ * - N tiling: Process N_TILE outputs at a time (fit weights in L2 cache)
+ * - Precompute uint8 activations for M_TILE rows before iterating N tiles
+ *
+ * This ensures weight tiles stay in L2 cache while being reused across M rows.
+ *
+ * Memory layout:
+ * - For each M tile: allocate M_TILE * K_padded uint8 buffer
+ * - Process all N tiles, reusing the activation buffer
+ * - Move to next M tile
+ */
+void matmul_free_vnni_v3(
+    torch::Tensor x_int8_tensor,    // [M, K] int8
+    torch::Tensor scale_tensor,     // [M] float32
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8
+    torch::Tensor w_sum_tensor,     // [N] int32
+    torch::Tensor y_tensor,         // [M, N] float32 output
+    torch::Tensor bias_tensor,
+    int M, int N, int K,
+    int num_threads
+) {
+    const int8_t* __restrict__ x_int8 = x_int8_tensor.data_ptr<int8_t>();
+    const float* __restrict__ scales = scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ w_sum = w_sum_tensor.data_ptr<int32_t>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_padded = ((K + 63) / 64) * 64;
+
+    // Tile sizes for cache efficiency
+    // N_TILE * K_padded should fit in L2 cache (~256KB-1MB per core)
+    // For K=2048, K_padded=2048: N_TILE=64 -> 128KB weight tile per N tile
+    // M_TILE should be large enough to amortize activation conversion
+    constexpr int N_TILE = 64;
+    constexpr int M_TILE = 32;
+    constexpr int N_BLOCK = 4;  // Register blocking
+
+    omp_set_num_threads(num_threads);
+
+    // Process M in tiles
+    for (int m_tile = 0; m_tile < M; m_tile += M_TILE) {
+        const int m_end = std::min(m_tile + M_TILE, M);
+        const int m_tile_size = m_end - m_tile;
+
+        // Allocate activation buffer for this M tile
+        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+
+        // Step 1: Convert all activations in this M tile to uint8 (parallelized)
+        #pragma omp parallel for schedule(static)
+        for (int m = m_tile; m < m_end; m++) {
+            const int m_local = m - m_tile;
+            uint8_t* x_uint8 = x_uint8_tile + m_local * K_padded;
+            const int8_t* x_row = x_int8 + m * K;
+
+            const __m512i offset_vec = _mm512_set1_epi8((char)128);
+            int k = 0;
+            for (; k + 63 < K; k += 64) {
+                __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+                __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+                _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+            }
+            for (; k < K; k++) {
+                x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+            }
+            for (; k < K_padded; k++) {
+                x_uint8[k] = 128;
+            }
+        }
+
+        // Step 2: Process N in tiles (weights stay in L2 cache)
+        for (int n_tile = 0; n_tile < N; n_tile += N_TILE) {
+            const int n_end = std::min(n_tile + N_TILE, N);
+
+            // Prefetch weight tile into L2
+            for (int n = n_tile; n < n_end; n++) {
+                for (int k = 0; k < K_padded; k += 64) {
+                    _mm_prefetch((const char*)(w_int8 + n * K_padded + k), _MM_HINT_T1);
+                }
+            }
+
+            // Process all M rows in this tile against the N tile
+            #pragma omp parallel for schedule(static)
+            for (int m = m_tile; m < m_end; m++) {
+                const int m_local = m - m_tile;
+                const uint8_t* x_uint8 = x_uint8_tile + m_local * K_padded;
+                float scale = scales[m];
+                float* y_row = y + m * N;
+
+                // Process N tile with register blocking
+                int n = n_tile;
+                for (; n + N_BLOCK - 1 < n_end; n += N_BLOCK) {
+                    __m512i acc0 = _mm512_setzero_si512();
+                    __m512i acc1 = _mm512_setzero_si512();
+                    __m512i acc2 = _mm512_setzero_si512();
+                    __m512i acc3 = _mm512_setzero_si512();
+
+                    const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                    const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                    const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                    const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+
+                    for (int kk = 0; kk < K_padded; kk += 64) {
+                        __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+
+                        acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                        acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                        acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                        acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+                    }
+
+                    int32_t sum0 = _mm512_reduce_add_epi32(acc0) - 128 * w_sum[n + 0];
+                    int32_t sum1 = _mm512_reduce_add_epi32(acc1) - 128 * w_sum[n + 1];
+                    int32_t sum2 = _mm512_reduce_add_epi32(acc2) - 128 * w_sum[n + 2];
+                    int32_t sum3 = _mm512_reduce_add_epi32(acc3) - 128 * w_sum[n + 3];
+
+                    y_row[n + 0] = static_cast<float>(sum0) * scale + (bias ? bias[n + 0] : 0.0f);
+                    y_row[n + 1] = static_cast<float>(sum1) * scale + (bias ? bias[n + 1] : 0.0f);
+                    y_row[n + 2] = static_cast<float>(sum2) * scale + (bias ? bias[n + 2] : 0.0f);
+                    y_row[n + 3] = static_cast<float>(sum3) * scale + (bias ? bias[n + 3] : 0.0f);
+                }
+
+                // Remainder
+                for (; n < n_end; n++) {
+                    const int8_t* w_row = w_int8 + n * K_padded;
+                    __m512i acc = _mm512_setzero_si512();
+
+                    for (int kk = 0; kk < K_padded; kk += 64) {
+                        __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                        acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                    }
+
+                    int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * w_sum[n];
+                    y_row[n] = static_cast<float>(sum) * scale + (bias ? bias[n] : 0.0f);
+                }
+            }
+        }
+
+        free(x_uint8_tile);
+    }
+}
+
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_activations_int8_vnni", &quantize_activations_int8_vnni,
@@ -556,4 +700,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "VNNI-based ternary matmul (simple)");
     m.def("matmul_free_vnni_v2", &matmul_free_vnni_v2,
           "VNNI v2 optimized");
+    m.def("matmul_free_vnni_v3", &matmul_free_vnni_v3,
+          "VNNI v3 cache-optimized tiled");
 }
