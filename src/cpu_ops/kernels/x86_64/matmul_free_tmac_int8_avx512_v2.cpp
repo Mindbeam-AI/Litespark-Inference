@@ -221,10 +221,8 @@ void matmul_free_tmac_int8_avx512_v2(
                 // Use permute to gather same-position elements across lanes
 
                 // For even results (positions 0,2,4,6,... within each group of 16)
-                __m256i even_lo_256 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(res_16_even));
-                __m256i even_hi_256 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(res_16_even, 1));
-                __m256i odd_lo_256 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(res_16_odd));
-                __m256i odd_hi_256 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(res_16_odd, 1));
+                // _mm512_cvtepi16_epi32 takes __m256i (16 int16) and returns __m512i (16 int32)
+                // These lines were incorrect - removing unused variables
 
                 // The layout after unpack is tricky. Let me explain:
                 // Input: 64 bytes [0..63] across 4 lanes of 16 bytes each
