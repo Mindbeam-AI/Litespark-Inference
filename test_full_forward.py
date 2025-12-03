@@ -32,9 +32,18 @@ N_LAYERS = 24
 
 # Model dimensions (matching previous transformer configs)
 HIDDEN_DIM = 2048
-QKV_DIM = 2560      # Q + K + V fused
+HEAD_DIM = 64       # Dimension per attention head
+NUM_HEADS = 32      # Number of attention heads (2048 / 64 = 32)
+QKV_DIM = 2560      # Q + K + V fused (could be 3*2048=6144 for equal Q,K,V or custom)
 MLP_HIDDEN = 16384  # Gate-Up output (will be split for SwiGLU)
 MLP_INTERMEDIATE = 8192  # After SwiGLU split
+
+# For proper attention, we need Q, K, V dimensions
+# QKV_DIM = 2560 suggests: Q=2048, K=256, V=256 (GQA style) or similar
+# We'll use: Q_DIM = K_DIM = V_DIM = HIDDEN_DIM = 2048 for standard attention
+Q_DIM = HIDDEN_DIM
+K_DIM = HIDDEN_DIM
+V_DIM = HIDDEN_DIM
 
 # Test batch sizes
 BATCH_SIZES = [1, 32, 128]
@@ -97,7 +106,8 @@ else:
     )
 
     KERNEL_NAME = "VNNI v3"
-    num_threads = 8
+    # Use PyTorch's detected thread count for consistency
+    num_threads = torch.get_num_threads()
 
 print(f"Loaded kernel: {KERNEL_NAME}")
 print(f"Using {num_threads} threads")
@@ -185,20 +195,32 @@ def matmul_pytorch(x, w):
 class TransformerLayerTernary:
     """Single transformer layer using ternary kernels"""
 
-    def __init__(self, hidden_dim, qkv_dim, mlp_hidden):
+    def __init__(self, hidden_dim, qkv_dim, mlp_hidden, num_heads, head_dim):
         self.hidden_dim = hidden_dim
         self.qkv_dim = qkv_dim
         self.mlp_hidden = mlp_hidden
         self.mlp_intermediate = mlp_hidden // 2  # After SwiGLU split
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = 1.0 / (head_dim ** 0.5)  # Attention scale factor
 
-        # Create ternary weights
-        self.w_qkv_ternary, self.w_qkv = prepare_ternary_weights(qkv_dim, hidden_dim)
+        # Create ternary weights for projections
+        # Q projection: [hidden_dim, hidden_dim]
+        self.w_q_ternary, self.w_q = prepare_ternary_weights(hidden_dim, hidden_dim)
+        # K projection: [hidden_dim, hidden_dim]
+        self.w_k_ternary, self.w_k = prepare_ternary_weights(hidden_dim, hidden_dim)
+        # V projection: [hidden_dim, hidden_dim]
+        self.w_v_ternary, self.w_v = prepare_ternary_weights(hidden_dim, hidden_dim)
+        # Output projection: [hidden_dim, hidden_dim]
         self.w_o_ternary, self.w_o = prepare_ternary_weights(hidden_dim, hidden_dim)
+        # MLP projections
         self.w_up_ternary, self.w_up = prepare_ternary_weights(mlp_hidden, hidden_dim)
         self.w_down_ternary, self.w_down = prepare_ternary_weights(hidden_dim, self.mlp_intermediate)
 
         # Biases (zeros for simplicity)
-        self.bias_qkv = torch.zeros(qkv_dim, dtype=torch.float32)
+        self.bias_q = torch.zeros(hidden_dim, dtype=torch.float32)
+        self.bias_k = torch.zeros(hidden_dim, dtype=torch.float32)
+        self.bias_v = torch.zeros(hidden_dim, dtype=torch.float32)
         self.bias_o = torch.zeros(hidden_dim, dtype=torch.float32)
         self.bias_up = torch.zeros(mlp_hidden, dtype=torch.float32)
         self.bias_down = torch.zeros(hidden_dim, dtype=torch.float32)
@@ -207,28 +229,58 @@ class TransformerLayerTernary:
         """Forward pass through one transformer layer"""
         M = x.shape[0]
 
-        # QKV Projection + Softmax
-        x_int8, scales = quantize_activations(x)
-        qkv = matmul_ternary(x_int8, scales, self.w_qkv, self.bias_qkv,
-                            M, self.qkv_dim, self.hidden_dim)
-        qkv = softmax(qkv)
+        # === ATTENTION BLOCK ===
 
-        # Output Projection + Softmax (simplified - normally this is after attention)
-        qkv_int8, qkv_scales = quantize_activations(qkv)
-        out = matmul_ternary(qkv_int8, qkv_scales, self.w_o, self.bias_o,
+        # Q Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        x_int8, scales = quantize_activations(x)
+        q = matmul_ternary(x_int8, scales, self.w_q, self.bias_q,
+                          M, self.hidden_dim, self.hidden_dim)
+
+        # K Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        k = matmul_ternary(x_int8, scales, self.w_k, self.bias_k,
+                          M, self.hidden_dim, self.hidden_dim)
+
+        # V Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        v = matmul_ternary(x_int8, scales, self.w_v, self.bias_v,
+                          M, self.hidden_dim, self.hidden_dim)
+
+        # Reshape for multi-head attention: [M, num_heads, head_dim]
+        q = q.view(M, self.num_heads, self.head_dim)
+        k = k.view(M, self.num_heads, self.head_dim)
+        v = v.view(M, self.num_heads, self.head_dim)
+
+        # Attention scores: Q @ K^T -> [M, num_heads, num_heads] per position
+        # For single sequence: [num_heads, head_dim] @ [head_dim, num_heads] per batch
+        # Simplified: compute attention per head
+        attn_scores = torch.einsum('mhd,nhd->mhn', q, k) * self.scale
+
+        # Softmax over keys
+        attn_probs = F.softmax(attn_scores, dim=-1)
+
+        # Apply attention to values: [M, num_heads, M] @ [M, num_heads, head_dim]
+        attn_out = torch.einsum('mhn,nhd->mhd', attn_probs, v)
+
+        # Reshape back: [M, hidden_dim]
+        attn_out = attn_out.reshape(M, self.hidden_dim)
+
+        # Output Projection + Softmax: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        attn_int8, attn_scales = quantize_activations(attn_out)
+        out = matmul_ternary(attn_int8, attn_scales, self.w_o, self.bias_o,
                            M, self.hidden_dim, self.hidden_dim)
         out = softmax(out)
 
         # Residual connection
         x = x + out
 
-        # MLP Gate-Up + SwiGLU
+        # === MLP BLOCK ===
+
+        # MLP Gate-Up + SwiGLU: [M, hidden_dim] @ [hidden_dim, mlp_hidden] -> [M, mlp_hidden]
         x_int8, scales = quantize_activations(x)
         mlp_up = matmul_ternary(x_int8, scales, self.w_up, self.bias_up,
                                M, self.mlp_hidden, self.hidden_dim)
-        mlp_act = swiglu(mlp_up)
+        mlp_act = swiglu(mlp_up)  # Output: [M, mlp_intermediate]
 
-        # MLP Down
+        # MLP Down: [M, mlp_intermediate] @ [mlp_intermediate, hidden_dim] -> [M, hidden_dim]
         mlp_int8, mlp_scales = quantize_activations(mlp_act)
         mlp_out = matmul_ternary(mlp_int8, mlp_scales, self.w_down, self.bias_down,
                                 M, self.hidden_dim, self.mlp_intermediate)
@@ -242,36 +294,73 @@ class TransformerLayerTernary:
 class TransformerLayerPyTorch:
     """Single transformer layer using PyTorch (float32 baseline)"""
 
-    def __init__(self, hidden_dim, qkv_dim, mlp_hidden):
+    def __init__(self, hidden_dim, qkv_dim, mlp_hidden, num_heads, head_dim):
         self.hidden_dim = hidden_dim
         self.qkv_dim = qkv_dim
         self.mlp_hidden = mlp_hidden
         self.mlp_intermediate = mlp_hidden // 2
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = 1.0 / (head_dim ** 0.5)
 
         # Float32 weights
-        self.w_qkv = torch.randn(hidden_dim, qkv_dim, dtype=torch.float32) * 0.02
+        # Q, K, V projections: [hidden_dim, hidden_dim]
+        self.w_q = torch.randn(hidden_dim, hidden_dim, dtype=torch.float32) * 0.02
+        self.w_k = torch.randn(hidden_dim, hidden_dim, dtype=torch.float32) * 0.02
+        self.w_v = torch.randn(hidden_dim, hidden_dim, dtype=torch.float32) * 0.02
+        # Output: [hidden_dim, hidden_dim]
         self.w_o = torch.randn(hidden_dim, hidden_dim, dtype=torch.float32) * 0.02
+        # MLP Up: [hidden_dim, mlp_hidden]
         self.w_up = torch.randn(hidden_dim, mlp_hidden, dtype=torch.float32) * 0.02
+        # MLP Down: [mlp_intermediate, hidden_dim]
         self.w_down = torch.randn(self.mlp_intermediate, hidden_dim, dtype=torch.float32) * 0.02
 
     def forward(self, x):
         """Forward pass through one transformer layer"""
-        # QKV Projection + Softmax
-        qkv = torch.mm(x, self.w_qkv)
-        qkv = softmax(qkv)
+        M = x.shape[0]
 
-        # Output Projection + Softmax
-        out = torch.mm(qkv, self.w_o)
+        # === ATTENTION BLOCK ===
+
+        # Q Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        q = torch.mm(x, self.w_q)
+
+        # K Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        k = torch.mm(x, self.w_k)
+
+        # V Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        v = torch.mm(x, self.w_v)
+
+        # Reshape for multi-head attention: [M, num_heads, head_dim]
+        q = q.view(M, self.num_heads, self.head_dim)
+        k = k.view(M, self.num_heads, self.head_dim)
+        v = v.view(M, self.num_heads, self.head_dim)
+
+        # Attention scores: Q @ K^T
+        attn_scores = torch.einsum('mhd,nhd->mhn', q, k) * self.scale
+
+        # Softmax over keys
+        attn_probs = F.softmax(attn_scores, dim=-1)
+
+        # Apply attention to values
+        attn_out = torch.einsum('mhn,nhd->mhd', attn_probs, v)
+
+        # Reshape back: [M, hidden_dim]
+        attn_out = attn_out.reshape(M, self.hidden_dim)
+
+        # Output Projection + Softmax: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
+        out = torch.mm(attn_out, self.w_o)
         out = softmax(out)
 
         # Residual
         x = x + out
 
-        # MLP Gate-Up + SwiGLU
-        mlp_up = torch.mm(x, self.w_up)
-        mlp_act = swiglu(mlp_up)
+        # === MLP BLOCK ===
 
-        # MLP Down
+        # MLP Gate-Up + SwiGLU: [M, hidden_dim] @ [hidden_dim, mlp_hidden] -> [M, mlp_hidden]
+        mlp_up = torch.mm(x, self.w_up)
+        mlp_act = swiglu(mlp_up)  # Output: [M, mlp_intermediate]
+
+        # MLP Down: [M, mlp_intermediate] @ [mlp_intermediate, hidden_dim] -> [M, hidden_dim]
         mlp_out = torch.mm(mlp_act, self.w_down)
 
         # Residual
@@ -287,10 +376,10 @@ class TransformerLayerPyTorch:
 class FullTransformerTernary:
     """Full 24-layer transformer using ternary kernels"""
 
-    def __init__(self, n_layers, hidden_dim, qkv_dim, mlp_hidden):
+    def __init__(self, n_layers, hidden_dim, qkv_dim, mlp_hidden, num_heads, head_dim):
         print(f"Initializing {n_layers}-layer ternary transformer...")
         self.layers = [
-            TransformerLayerTernary(hidden_dim, qkv_dim, mlp_hidden)
+            TransformerLayerTernary(hidden_dim, qkv_dim, mlp_hidden, num_heads, head_dim)
             for _ in range(n_layers)
         ]
         print(f"  Initialized {n_layers} layers")
@@ -304,10 +393,10 @@ class FullTransformerTernary:
 class FullTransformerPyTorch:
     """Full 24-layer transformer using PyTorch baseline"""
 
-    def __init__(self, n_layers, hidden_dim, qkv_dim, mlp_hidden):
+    def __init__(self, n_layers, hidden_dim, qkv_dim, mlp_hidden, num_heads, head_dim):
         print(f"Initializing {n_layers}-layer PyTorch transformer...")
         self.layers = [
-            TransformerLayerPyTorch(hidden_dim, qkv_dim, mlp_hidden)
+            TransformerLayerPyTorch(hidden_dim, qkv_dim, mlp_hidden, num_heads, head_dim)
             for _ in range(n_layers)
         ]
         print(f"  Initialized {n_layers} layers")
@@ -347,17 +436,24 @@ def benchmark_forward(model, x, warmup=WARMUP_ITERS, iters=BENCH_ITERS):
     }
 
 
-def calculate_flops(M, n_layers, hidden_dim, qkv_dim, mlp_hidden):
+def calculate_flops(M, n_layers, hidden_dim, mlp_hidden, num_heads, head_dim):
     """Calculate total FLOPs for forward pass"""
     mlp_intermediate = mlp_hidden // 2
 
     # Per layer FLOPs (2 * M * N * K for matmul)
-    flops_qkv = 2 * M * qkv_dim * hidden_dim
+    # Q, K, V projections: 3 * (2 * M * hidden_dim * hidden_dim)
+    flops_qkv = 3 * 2 * M * hidden_dim * hidden_dim
+    # Attention: Q @ K^T and attn @ V
+    # Q @ K^T: M * num_heads * head_dim * M (for each head)
+    # attn @ V: M * num_heads * M * head_dim
+    flops_attention = 2 * M * M * hidden_dim  # Simplified
+    # Output projection
     flops_o = 2 * M * hidden_dim * hidden_dim
+    # MLP
     flops_up = 2 * M * mlp_hidden * hidden_dim
     flops_down = 2 * M * hidden_dim * mlp_intermediate
 
-    flops_per_layer = flops_qkv + flops_o + flops_up + flops_down
+    flops_per_layer = flops_qkv + flops_attention + flops_o + flops_up + flops_down
     total_flops = flops_per_layer * n_layers
 
     return total_flops
@@ -376,15 +472,16 @@ def run_benchmarks():
     print(f"Architecture: {ARCH}")
     print(f"Kernel: {KERNEL_NAME}")
     print(f"Hidden dim: {HIDDEN_DIM}")
-    print(f"QKV dim: {QKV_DIM}")
+    print(f"Num heads: {NUM_HEADS}")
+    print(f"Head dim: {HEAD_DIM}")
     print(f"MLP hidden: {MLP_HIDDEN}")
     print(f"Layers: {N_LAYERS}")
     print()
 
     # Initialize models
     print("Initializing models...")
-    model_ternary = FullTransformerTernary(N_LAYERS, HIDDEN_DIM, QKV_DIM, MLP_HIDDEN)
-    model_pytorch = FullTransformerPyTorch(N_LAYERS, HIDDEN_DIM, QKV_DIM, MLP_HIDDEN)
+    model_ternary = FullTransformerTernary(N_LAYERS, HIDDEN_DIM, QKV_DIM, MLP_HIDDEN, NUM_HEADS, HEAD_DIM)
+    model_pytorch = FullTransformerPyTorch(N_LAYERS, HIDDEN_DIM, QKV_DIM, MLP_HIDDEN, NUM_HEADS, HEAD_DIM)
     print()
 
     results = {}
@@ -398,7 +495,7 @@ def run_benchmarks():
         x = torch.randn(M, HIDDEN_DIM, dtype=torch.float32)
 
         # Calculate FLOPs
-        total_flops = calculate_flops(M, N_LAYERS, HIDDEN_DIM, QKV_DIM, MLP_HIDDEN)
+        total_flops = calculate_flops(M, N_LAYERS, HIDDEN_DIM, MLP_HIDDEN, NUM_HEADS, HEAD_DIM)
 
         print(f"\nTotal FLOPs: {total_flops / 1e9:.2f} GFLOP")
         print()
