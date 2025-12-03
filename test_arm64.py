@@ -75,7 +75,8 @@ print()
 # Parse command line args
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--tbl-only', action='store_true', help='Run only TBL (true MatMul-free) benchmarks')
+parser.add_argument('--tbl-only', action='store_true', help='Run only TBL benchmarks')
+parser.add_argument('--transformer', action='store_true', help='Use transformer layer shapes instead of default configs')
 args, _ = parser.parse_known_args()
 
 # Load SDOT int8 kernel
@@ -126,12 +127,47 @@ except Exception as e:
     hybrid_kernel = None
 
 # Test configurations
+# Original test configurations
 TEST_CONFIGS = [
     ("Small",   128, 1024, 1024),
     ("Medium",  256, 1024, 1024),
     ("Large",   512, 1024, 1024),
     ("XLarge", 1024, 2048, 2048),
 ]
+
+# Transformer layer configurations (realistic LLM shapes)
+# Format: (name, M, N, K) where M=batch*seq, weights are [K, N]
+TRANSFORMER_CONFIGS = [
+    # QKV Projection: [2048, 2560] - Q+K+V fused
+    ("QKV_M1",     1,   2560,  2048),   # Single token (autoregressive)
+    ("QKV_M32",    32,  2560,  2048),   # Small batch
+    ("QKV_M128",   128, 2560,  2048),   # Medium batch
+
+    # Output Projection: [2048, 2048]
+    ("Out_M1",     1,   2048,  2048),
+    ("Out_M32",    32,  2048,  2048),
+    ("Out_M128",   128, 2048,  2048),
+
+    # MLP Gate-Up Projection: [2048, 16384] - Large N
+    ("MLP_Up_M1",  1,   16384, 2048),
+    ("MLP_Up_M32", 32,  16384, 2048),
+
+    # MLP Down Projection: [8192, 2048] - Large K
+    ("MLP_Down_M1",  1,   2048, 8192),
+    ("MLP_Down_M32", 32,  2048, 8192),
+
+    # LM Head: [2048, 32064] - Vocabulary size
+    ("LMHead_M1",  1,   32064, 2048),
+    ("LMHead_M32", 32,  32064, 2048),
+]
+
+# Select which configs to use
+if args.transformer:
+    ACTIVE_CONFIGS = TRANSFORMER_CONFIGS
+    print("Using TRANSFORMER layer configurations")
+else:
+    ACTIVE_CONFIGS = TEST_CONFIGS
+    print("Using DEFAULT test configurations (use --transformer for LLM layer shapes)")
 
 # Number of threads
 num_threads = os.cpu_count() or 8
@@ -180,7 +216,7 @@ def run_benchmarks():
     """Run all benchmarks"""
     all_results = {}
 
-    for config_name, M, N, K in TEST_CONFIGS:
+    for config_name, M, N, K in ACTIVE_CONFIGS:
         print("=" * 70)
         print(f"Test: {config_name} (M={M}, N={N}, K={K})")
         print("=" * 70)
@@ -932,7 +968,7 @@ def print_summary(all_results):
 
     # Header
     print(f"{'Kernel':<20}", end="")
-    for config_name, _, _, _ in TEST_CONFIGS:
+    for config_name, _, _, _ in ACTIVE_CONFIGS:
         print(f"{config_name:>12}", end="")
     print()
     print("-" * 80)
@@ -940,7 +976,7 @@ def print_summary(all_results):
     # Data rows
     for kernel, name in zip(kernels, kernel_names):
         print(f"{name:<20}", end="")
-        for config_name, _, _, _ in TEST_CONFIGS:
+        for config_name, _, _, _ in ACTIVE_CONFIGS:
             if kernel in all_results[config_name]:
                 gflops = all_results[config_name][kernel]['gflops']
                 print(f"{gflops:>12.1f}", end="")
@@ -955,14 +991,14 @@ def print_summary(all_results):
     print("=" * 80)
 
     print(f"{'Kernel':<20}", end="")
-    for config_name, _, _, _ in TEST_CONFIGS:
+    for config_name, _, _, _ in ACTIVE_CONFIGS:
         print(f"{config_name:>12}", end="")
     print()
     print("-" * 80)
 
     for kernel, name in zip(kernels[1:], kernel_names[1:]):
         print(f"{name:<20}", end="")
-        for config_name, _, _, _ in TEST_CONFIGS:
+        for config_name, _, _, _ in ACTIVE_CONFIGS:
             if kernel in all_results[config_name]:
                 pt_time = all_results[config_name]['pytorch']['time']
                 kernel_time = all_results[config_name][kernel]['time']
@@ -979,7 +1015,7 @@ def print_summary(all_results):
         print("MEMORY COMPARISON: Weight Storage per Matrix")
         print("=" * 80)
         print(f"{'Format':<20}{'Bytes/Weight':<15}", end="")
-        for config_name, _, N, K in TEST_CONFIGS:
+        for config_name, _, N, K in ACTIVE_CONFIGS:
             print(f"{config_name:>12}", end="")
         print()
         print("-" * 80)
@@ -991,7 +1027,7 @@ def print_summary(all_results):
         ]
         for fmt_name, bytes_per in formats:
             print(f"{fmt_name:<20}{bytes_per:<15.2f}", end="")
-            for _, _, N, K in TEST_CONFIGS:
+            for _, _, N, K in ACTIVE_CONFIGS:
                 mem_kb = N * K * bytes_per / 1024
                 print(f"{mem_kb:>10.1f}KB", end="")
             print()
@@ -1002,7 +1038,7 @@ def print_summary(all_results):
     print("BEST KERNEL per Configuration")
     print("=" * 80)
 
-    for config_name, _, _, _ in TEST_CONFIGS:
+    for config_name, _, _, _ in ACTIVE_CONFIGS:
         best_kernel = None
         best_gflops = 0
         for kernel in kernels[1:]:  # Exclude PyTorch
@@ -1024,7 +1060,7 @@ def print_summary(all_results):
         print("=" * 80)
         print(f"{'Config':<12}{'TBL Best':>14}{'SDOT Direct':>14}{'Speed Ratio':>14}{'Memory Saved':>14}")
         print("-" * 80)
-        for config_name, _, N, K in TEST_CONFIGS:
+        for config_name, _, N, K in ACTIVE_CONFIGS:
             # Get best TBL kernel
             tbl_gflops = max(
                 all_results[config_name].get('tbl_v10', {}).get('gflops', 0),
@@ -1062,7 +1098,7 @@ def generate_plots(all_results):
 
     os.makedirs("benchmark_plots_arm64", exist_ok=True)
 
-    configs = [c[0] for c in TEST_CONFIGS]
+    configs = [c[0] for c in ACTIVE_CONFIGS]
     first_config = list(all_results.values())[0]
 
     # Build list of available kernels

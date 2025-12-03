@@ -180,12 +180,47 @@ except Exception as e:
     vnni_kernel = None
 
 # Test configurations
-configs = [
+DEFAULT_CONFIGS = [
     ("Small", 128, 1024, 1024),
     ("Medium", 256, 1024, 1024),
     ("Large", 512, 1024, 1024),
     ("XLarge", 1024, 2048, 2048),
 ]
+
+# Transformer layer configurations (realistic LLM shapes)
+# Format: (name, M, N, K) where M=batch*seq, weights are [K, N]
+TRANSFORMER_CONFIGS = [
+    # QKV Projection: [2048, 2560] - Q+K+V fused
+    ("QKV_M1",     1,   2560,  2048),   # Single token (autoregressive)
+    ("QKV_M32",    32,  2560,  2048),   # Small batch
+    ("QKV_M128",   128, 2560,  2048),   # Medium batch
+
+    # Output Projection: [2048, 2048]
+    ("Out_M1",     1,   2048,  2048),
+    ("Out_M32",    32,  2048,  2048),
+    ("Out_M128",   128, 2048,  2048),
+
+    # MLP Gate-Up Projection: [2048, 16384] - Large N
+    ("MLP_Up_M1",  1,   16384, 2048),
+    ("MLP_Up_M32", 32,  16384, 2048),
+
+    # MLP Down Projection: [8192, 2048] - Large K
+    ("MLP_Down_M1",  1,   2048, 8192),
+    ("MLP_Down_M32", 32,  2048, 8192),
+
+    # LM Head: [2048, 32064] - Vocabulary size
+    ("LMHead_M1",  1,   32064, 2048),
+    ("LMHead_M32", 32,  32064, 2048),
+]
+
+# Select configs based on command line arg
+import sys
+if '--transformer' in sys.argv:
+    configs = TRANSFORMER_CONFIGS
+    print("Using TRANSFORMER layer configurations")
+else:
+    configs = DEFAULT_CONFIGS
+    print("Using DEFAULT test configurations (use --transformer for LLM layer shapes)")
 
 num_threads = 8
 
