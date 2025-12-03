@@ -142,18 +142,25 @@ def swiglu(x):
 
 def prepare_ternary_weights(N, K):
     """Create random ternary weights and prepare for kernel"""
-    # Random ternary weights: -1, 0, +1
-    w_ternary = torch.randint(-1, 2, (K, N), dtype=torch.int8)
+    # Random ternary weights: -1, 0, +1 as float32
+    # For PyTorch matmul: x @ W where x is [M, K] and W is [K, N]
+    w_float = torch.randn(K, N, dtype=torch.float32)
+    w_ternary = torch.zeros_like(w_float)
+    w_ternary[w_float > 0.5] = 1.0
+    w_ternary[w_float < -0.5] = -1.0
 
     if ARCH == 'arm64':
-        # For SDOT: just use int8 weights directly
-        return w_ternary, w_ternary.clone(), None
+        # For SDOT: convert to int8
+        w_int8 = w_ternary.to(torch.int8)
+        return w_ternary, w_int8, None
     else:
-        # For VNNI: pack weights and compute weight sums
+        # For VNNI: kernel expects [N, K] layout, so transpose
+        # pack_weights_vnni takes [N, K] float32 and outputs [N, K_padded] int8
+        w_for_kernel = w_ternary.t().contiguous()  # [K, N] -> [N, K]
         K_padded = ((K + 63) // 64) * 64
         w_int8_vnni = torch.zeros(N, K_padded, dtype=torch.int8)
         w_sum_vnni = torch.zeros(N, dtype=torch.int32)
-        kernel.pack_weights_vnni(w_ternary, w_int8_vnni, w_sum_vnni, N, K)
+        kernel.pack_weights_vnni(w_for_kernel, w_int8_vnni, w_sum_vnni, N, K)
         return w_ternary, w_int8_vnni, w_sum_vnni
 
 
