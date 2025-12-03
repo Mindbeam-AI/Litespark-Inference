@@ -20,7 +20,9 @@ import gc
 import os
 import platform
 import sys
+import json
 from pathlib import Path
+from datetime import datetime
 
 # Check architecture
 machine = platform.machine().lower()
@@ -77,6 +79,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--tbl-only', action='store_true', help='Run only TBL benchmarks')
 parser.add_argument('--transformer', action='store_true', help='Use transformer layer shapes instead of default configs')
+parser.add_argument('--output-json', type=str, help='Save results to JSON file')
 args, _ = parser.parse_known_args()
 
 # Load SDOT int8 kernel
@@ -1096,100 +1099,226 @@ def generate_plots(all_results):
         print("\nMatplotlib not installed, skipping plots")
         return
 
-    os.makedirs("benchmark_plots_arm64", exist_ok=True)
+    from collections import defaultdict
 
-    configs = [c[0] for c in ACTIVE_CONFIGS]
+    plots_dir = Path("benchmark_plots_arm64")
+    plots_dir.mkdir(exist_ok=True)
+
+    config_names = [c[0] for c in ACTIVE_CONFIGS]
     first_config = list(all_results.values())[0]
 
-    # Build list of available kernels
-    kernels = ['pytorch']
-    colors = ['gray']
-    labels = ['PyTorch']
+    # Build list of available kernels with colors
+    kernel_info = [('pytorch', 'PyTorch', '#8c564b')]
 
     if 'sdot_simple' in first_config:
-        kernels.extend(['sdot_simple', 'sdot_v2', 'sdot_v3', 'sdot_v4'])
-        colors.extend(['blue', 'green', 'orange', 'red'])
-        labels.extend(['SDOT Simple', 'SDOT v2', 'SDOT v3', 'SDOT v4'])
+        kernel_info.extend([
+            ('sdot_simple', 'SDOT Simple', '#1f77b4'),
+            ('sdot_v2', 'SDOT v2', '#2ca02c'),
+            ('sdot_v3', 'SDOT v3', '#ff7f0e'),
+            ('sdot_v4', 'SDOT v4', '#d62728'),
+        ])
 
     if 'tbl' in first_config:
-        kernels.extend(['tbl', 'tbl_v2'])
-        colors.extend(['purple', 'magenta'])
-        labels.extend(['TBL (2-bit)', 'TBL v2'])
+        kernel_info.extend([
+            ('tbl', 'TBL v1', '#9467bd'),
+            ('tbl_v10', 'TBL v10', '#e377c2'),
+        ])
+
+    if 'sdot_direct_v4' in first_config:
+        kernel_info.append(('sdot_direct_v4', 'SDOT Direct v4', '#17becf'))
 
     if 'hybrid' in first_config:
-        kernels.extend(['hybrid', 'hybrid_v2'])
-        colors.extend(['cyan', 'teal'])
-        labels.extend(['Hybrid (2-bit+SDOT)', 'Hybrid v2'])
+        kernel_info.extend([
+            ('hybrid', 'Hybrid', '#bcbd22'),
+            ('hybrid_v2', 'Hybrid v2', '#7f7f7f'),
+        ])
 
-    # GFLOPS comparison
-    fig, ax = plt.subplots(figsize=(14, 7))
-    x = np.arange(len(configs))
-    width = 0.8 / len(kernels)
+    kernels = [k[0] for k in kernel_info]
+    labels = [k[1] for k in kernel_info]
+    colors = {k[0]: k[2] for k in kernel_info}
 
-    for i, (kernel, color, label) in enumerate(zip(kernels, colors, labels)):
-        gflops = []
-        for c in configs:
-            if kernel in all_results[c]:
-                gflops.append(all_results[c][kernel]['gflops'])
+    # Group configs by M value
+    configs_by_m = defaultdict(list)
+    for cfg in ACTIVE_CONFIGS:
+        cfg_name, M, N, K = cfg
+        configs_by_m[M].append(cfg)
+
+    print("\nGenerating plots...")
+
+    # Generate separate plots for each M value
+    for M_val, m_configs in configs_by_m.items():
+        print(f"  Generating plots for M={M_val}...")
+        n_configs = len(m_configs)
+        m_config_names = [c[0] for c in m_configs]
+
+        # Plot 1: GFLOPS comparison for this M value
+        fig, axes = plt.subplots(1, n_configs, figsize=(5 * n_configs, 6), sharey=True)
+        if n_configs == 1:
+            axes = [axes]
+        fig.suptitle(f'GFLOPS Performance (M={M_val})', fontsize=14, fontweight='bold')
+
+        for idx, (cfg_name, M, N, K) in enumerate(m_configs):
+            ax = axes[idx]
+            if cfg_name not in all_results:
+                continue
+
+            cfg_results = all_results[cfg_name]
+            kernel_names_plot = []
+            gflops_values = []
+            bar_colors = []
+
+            for kernel, label in zip(kernels, labels):
+                if kernel in cfg_results:
+                    kernel_names_plot.append(label)
+                    gflops_values.append(cfg_results[kernel]['gflops'])
+                    bar_colors.append(colors.get(kernel, '#333333'))
+
+            bars = ax.bar(range(len(kernel_names_plot)), gflops_values, color=bar_colors)
+            ax.set_xticks(range(len(kernel_names_plot)))
+            ax.set_xticklabels(kernel_names_plot, fontsize=9, rotation=45, ha='right')
+            ax.set_title(f"{cfg_name}\n[K={K}, N={N}]", fontsize=11)
+            ax.set_ylabel('GFLOPS' if idx == 0 else '')
+            ax.grid(axis='y', alpha=0.3)
+
+            # Add value labels on bars
+            for bar, val in zip(bars, gflops_values):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{val:.0f}', ha='center', va='bottom', fontsize=8)
+
+        plt.tight_layout()
+        plot_path = plots_dir / f'gflops_M{M_val}.png'
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"    Saved: {plot_path}")
+        plt.close()
+
+        # Plot 2: Speedup vs PyTorch for this M value
+        fig, ax = plt.subplots(figsize=(max(10, 3 * n_configs), 6))
+        fig.suptitle(f'Speedup vs PyTorch (M={M_val})', fontsize=14, fontweight='bold')
+
+        x = np.arange(len(m_config_names))
+        speedup_kernels = [(k, l) for k, l in zip(kernels, labels) if k != 'pytorch']
+        width = 0.8 / len(speedup_kernels) if speedup_kernels else 0.8
+
+        for i, (kernel, label) in enumerate(speedup_kernels):
+            speedups = []
+            for cfg_name, M, N, K in m_configs:
+                if cfg_name in all_results:
+                    cfg_results = all_results[cfg_name]
+                    if kernel in cfg_results and 'pytorch' in cfg_results:
+                        speedups.append(cfg_results[kernel]['gflops'] / cfg_results['pytorch']['gflops'])
+                    else:
+                        speedups.append(0)
+                else:
+                    speedups.append(0)
+
+            bars = ax.bar(x + (i - len(speedup_kernels)/2 + 0.5) * width, speedups,
+                          width, label=label, color=colors.get(kernel, '#333333'))
+
+        ax.axhline(y=1.0, color='black', linestyle='--', linewidth=1, label='PyTorch baseline')
+        ax.set_xlabel('Configuration')
+        ax.set_ylabel('Speedup (higher is better)')
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{cfg[0]}\n[K={cfg[3]}, N={cfg[2]}]" for cfg in m_configs])
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(axis='y', alpha=0.3)
+
+        plt.tight_layout()
+        plot_path = plots_dir / f'speedup_M{M_val}.png'
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"    Saved: {plot_path}")
+        plt.close()
+
+        # Plot 3: Time comparison for this M value
+        fig, axes = plt.subplots(1, n_configs, figsize=(5 * n_configs, 6), sharey=False)
+        if n_configs == 1:
+            axes = [axes]
+        fig.suptitle(f'Execution Time (M={M_val}) - Lower is Better', fontsize=14, fontweight='bold')
+
+        for idx, (cfg_name, M, N, K) in enumerate(m_configs):
+            ax = axes[idx]
+            if cfg_name not in all_results:
+                continue
+
+            cfg_results = all_results[cfg_name]
+            kernel_names_plot = []
+            time_values = []
+            bar_colors = []
+
+            for kernel, label in zip(kernels, labels):
+                if kernel in cfg_results:
+                    kernel_names_plot.append(label)
+                    time_values.append(cfg_results[kernel]['time'])
+                    bar_colors.append(colors.get(kernel, '#333333'))
+
+            bars = ax.bar(range(len(kernel_names_plot)), time_values, color=bar_colors)
+            ax.set_xticks(range(len(kernel_names_plot)))
+            ax.set_xticklabels(kernel_names_plot, fontsize=9, rotation=45, ha='right')
+            ax.set_title(f"{cfg_name}\n[K={K}, N={N}]", fontsize=11)
+            ax.set_ylabel('Time (ms)' if idx == 0 else '')
+            ax.grid(axis='y', alpha=0.3)
+
+            # Add value labels on bars
+            for bar, val in zip(bars, time_values):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+
+        plt.tight_layout()
+        plot_path = plots_dir / f'time_M{M_val}.png'
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"    Saved: {plot_path}")
+        plt.close()
+
+    # Overall scaling plot across all configurations
+    fig, ax = plt.subplots(figsize=(max(12, len(ACTIVE_CONFIGS) * 0.8), 7))
+    fig.suptitle('GFLOPS Scaling Across All Configurations', fontsize=14, fontweight='bold')
+
+    for kernel, label in zip(kernels, labels):
+        gflops_list = []
+        for cfg_name, M, N, K in ACTIVE_CONFIGS:
+            if cfg_name in all_results and kernel in all_results[cfg_name]:
+                gflops_list.append(all_results[cfg_name][kernel]['gflops'])
             else:
-                gflops.append(0)
-        ax.bar(x + i * width, gflops, width, label=label, color=color)
+                gflops_list.append(np.nan)
 
-    ax.set_xlabel('Matrix Size')
+        ax.plot(range(len(ACTIVE_CONFIGS)), gflops_list, 'o-', label=label,
+                color=colors.get(kernel, '#333333'), linewidth=2, markersize=6)
+
+    ax.set_xticks(range(len(ACTIVE_CONFIGS)))
+    ax.set_xticklabels([cfg[0] for cfg in ACTIVE_CONFIGS], rotation=45, ha='right', fontsize=9)
+    ax.set_xlabel('Configuration')
     ax.set_ylabel('GFLOPS')
-    ax.set_title('ARM64 NEON Kernel Performance (SDOT vs TBL)')
-    ax.set_xticks(x + width * (len(kernels) - 1) / 2)
-    ax.set_xticklabels(configs)
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig('benchmark_plots_arm64/gflops_comparison.png', dpi=150)
-    print("\nSaved: benchmark_plots_arm64/gflops_comparison.png")
-
-    # Speedup vs PyTorch
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    for i, (kernel, color, label) in enumerate(zip(kernels[1:], colors[1:], labels[1:])):
-        speedups = []
-        for c in configs:
-            if kernel in all_results[c]:
-                pt_time = all_results[c]['pytorch']['time']
-                k_time = all_results[c][kernel]['time']
-                speedups.append(pt_time / k_time)
-            else:
-                speedups.append(0)
-        ax.plot(configs, speedups, marker='o', color=color, label=label, linewidth=2)
-
-    ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='PyTorch baseline')
-    ax.set_xlabel('Matrix Size')
-    ax.set_ylabel('Speedup vs PyTorch')
-    ax.set_title('ARM64 NEON Speedup vs PyTorch')
-    ax.legend()
+    ax.legend(loc='best', fontsize=9)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('benchmark_plots_arm64/speedup_vs_pytorch.png', dpi=150)
-    print("Saved: benchmark_plots_arm64/speedup_vs_pytorch.png")
+    plot_path = plots_dir / 'gflops_scaling.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"  Saved: {plot_path}")
+    plt.close()
 
     # Memory vs Performance trade-off plot (if TBL available)
-    if 'tbl' in first_config and 'sdot_v2' in first_config:
+    if 'tbl' in first_config:
         fig, ax = plt.subplots(figsize=(10, 6))
+        fig.suptitle('Memory vs Performance Trade-off', fontsize=14, fontweight='bold')
 
         # Data points: (memory per weight in bytes, GFLOPS)
-        for c in configs:
+        for c in config_names:
+            if c not in all_results:
+                continue
             # Float32 baseline
-            ax.scatter(4.0, all_results[c]['pytorch']['gflops'], s=100, c='gray', marker='s', label='Float32' if c == configs[0] else '')
+            ax.scatter(4.0, all_results[c]['pytorch']['gflops'], s=100, c='gray', marker='s',
+                      label='Float32' if c == config_names[0] else '')
             # Int8 (SDOT)
-            if 'sdot_v2' in all_results[c]:
-                ax.scatter(1.0, all_results[c]['sdot_v2']['gflops'], s=100, c='blue', marker='o', label='Int8 (SDOT)' if c == configs[0] else '')
+            if 'sdot_v4' in all_results[c]:
+                ax.scatter(1.0, all_results[c]['sdot_v4']['gflops'], s=100, c='blue', marker='o',
+                          label='Int8 (SDOT)' if c == config_names[0] else '')
             # 2-bit (TBL)
-            if 'tbl_v2' in all_results[c]:
-                ax.scatter(0.25, all_results[c]['tbl_v2']['gflops'], s=100, c='purple', marker='^', label='2-bit (TBL)' if c == configs[0] else '')
+            if 'tbl_v10' in all_results[c]:
+                ax.scatter(0.25, all_results[c]['tbl_v10']['gflops'], s=100, c='purple', marker='^',
+                          label='2-bit (TBL)' if c == config_names[0] else '')
 
         ax.set_xlabel('Bytes per Weight')
         ax.set_ylabel('GFLOPS')
-        ax.set_title('Memory vs Performance Trade-off')
         ax.set_xscale('log')
         ax.set_xticks([0.25, 1.0, 4.0])
         ax.set_xticklabels(['0.25 (2-bit)', '1.0 (int8)', '4.0 (float32)'])
@@ -1197,16 +1326,50 @@ def generate_plots(all_results):
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig('benchmark_plots_arm64/memory_vs_performance.png', dpi=150)
-        print("Saved: benchmark_plots_arm64/memory_vs_performance.png")
+        plot_path = plots_dir / 'memory_vs_performance.png'
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {plot_path}")
 
     plt.close('all')
+    print(f"\nAll plots saved to: {plots_dir}")
+
+
+def save_json_results(all_results, output_path):
+    """Save benchmark results to JSON file"""
+    # Convert results to JSON-serializable format (remove tensors)
+    json_results = {}
+    for config_name, results in all_results.items():
+        json_results[config_name] = {}
+        for kernel_name, kernel_data in results.items():
+            json_results[config_name][kernel_name] = {
+                k: v for k, v in kernel_data.items() if k != 'y'  # Exclude tensor data
+            }
+
+    json_output = {
+        'metadata': {
+            'timestamp': datetime.now().isoformat(),
+            'platform': platform.system(),
+            'architecture': machine,
+            'num_threads': num_threads,
+            'config_type': 'transformer' if args.transformer else 'default',
+            'tbl_only': args.tbl_only
+        },
+        'results': json_results
+    }
+
+    json_path = Path(output_path)
+    with open(json_path, 'w') as f:
+        json.dump(json_output, f, indent=2)
+    print(f"\nResults saved to: {json_path}")
 
 
 if __name__ == "__main__":
     all_results = run_benchmarks()
     print_summary(all_results)
     generate_plots(all_results)
+
+    if args.output_json:
+        save_json_results(all_results, args.output_json)
 
     print("\n" + "=" * 70)
     print("Benchmark complete!")

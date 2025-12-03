@@ -27,6 +27,7 @@ import platform
 import psutil
 import os
 import gc
+import json
 from pathlib import Path
 from torch.utils.cpp_extension import load
 import matplotlib.pyplot as plt
@@ -215,7 +216,13 @@ TRANSFORMER_CONFIGS = [
 
 # Select configs based on command line arg
 import sys
-if '--transformer' in sys.argv:
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--transformer', action='store_true', help='Use transformer layer shapes')
+parser.add_argument('--output-json', type=str, help='Save results to JSON file')
+args, _ = parser.parse_known_args()
+
+if args.transformer:
     configs = TRANSFORMER_CONFIGS
     print("Using TRANSFORMER layer configurations")
 else:
@@ -854,128 +861,139 @@ colors = {
     'pytorch': '#8c564b',
 }
 
-# Plot 1: GFLOPS comparison bar chart
-fig, axes = plt.subplots(1, len(configs), figsize=(16, 5), sharey=True)
-fig.suptitle('GFLOPS Performance by Matrix Size', fontsize=14, fontweight='bold')
+# Group configs by M value
+from collections import defaultdict
+configs_by_m = defaultdict(list)
+for cfg in configs:
+    cfg_name, M, N, K = cfg
+    configs_by_m[M].append(cfg)
 
-for idx, (cfg_name, M, N, K) in enumerate(configs):
-    ax = axes[idx] if len(configs) > 1 else axes
-    if cfg_name not in all_results:
-        continue
+# Generate separate plots for each M value
+for M_val, m_configs in configs_by_m.items():
+    print(f"\n  Generating plots for M={M_val}...")
 
-    kernels_data = all_results[cfg_name]['kernels']
-    kernel_names = []
-    gflops_values = []
-    bar_colors = []
+    # Plot 1: GFLOPS comparison for this M value
+    n_configs = len(m_configs)
+    fig, axes = plt.subplots(1, n_configs, figsize=(5 * n_configs, 6), sharey=True)
+    if n_configs == 1:
+        axes = [axes]
+    fig.suptitle(f'GFLOPS Performance (M={M_val})', fontsize=14, fontweight='bold')
 
-    for key, label in kernel_order:
-        if key in kernels_data:
-            kernel_names.append(label.replace(' ', '\n'))
-            gflops_values.append(kernels_data[key]['gflops'])
-            bar_colors.append(colors.get(key, '#333333'))
+    for idx, (cfg_name, M, N, K) in enumerate(m_configs):
+        ax = axes[idx]
+        if cfg_name not in all_results:
+            continue
 
-    bars = ax.bar(range(len(kernel_names)), gflops_values, color=bar_colors)
-    ax.set_xticks(range(len(kernel_names)))
-    ax.set_xticklabels(kernel_names, fontsize=8)
-    ax.set_title(f"{cfg_name}\n({M}x{K} @ {K}x{N})", fontsize=10)
-    ax.set_ylabel('GFLOPS' if idx == 0 else '')
-    ax.grid(axis='y', alpha=0.3)
+        kernels_data = all_results[cfg_name]['kernels']
+        kernel_names = []
+        gflops_values = []
+        bar_colors = []
 
-    # Add value labels on bars
-    for bar, val in zip(bars, gflops_values):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
-                f'{val:.0f}', ha='center', va='bottom', fontsize=7)
+        for key, label in kernel_order:
+            if key in kernels_data:
+                kernel_names.append(label)
+                gflops_values.append(kernels_data[key]['gflops'])
+                bar_colors.append(colors.get(key, '#333333'))
 
-plt.tight_layout()
-plot_path = plots_dir / 'gflops_comparison.png'
-plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-print(f"  Saved: {plot_path}")
-plt.close()
+        bars = ax.bar(range(len(kernel_names)), gflops_values, color=bar_colors)
+        ax.set_xticks(range(len(kernel_names)))
+        ax.set_xticklabels(kernel_names, fontsize=9, rotation=45, ha='right')
+        ax.set_title(f"{cfg_name}\n[K={K}, N={N}]", fontsize=11)
+        ax.set_ylabel('GFLOPS' if idx == 0 else '')
+        ax.grid(axis='y', alpha=0.3)
 
-# Plot 2: Speedup vs PyTorch
-fig, ax = plt.subplots(figsize=(12, 6))
-fig.suptitle('Speedup vs PyTorch (MKL) by Matrix Size', fontsize=14, fontweight='bold')
+        # Add value labels on bars
+        for bar, val in zip(bars, gflops_values):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.0f}', ha='center', va='bottom', fontsize=8)
 
-config_names = [cfg[0] for cfg in configs]
-x = np.arange(len(config_names))
-width = 0.15
-offset = 0
+    plt.tight_layout()
+    plot_path = plots_dir / f'gflops_M{M_val}.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"    Saved: {plot_path}")
+    plt.close()
 
-speedup_kernels = [(k, l) for k, l in kernel_order if k != 'pytorch']
+    # Plot 2: Speedup vs PyTorch for this M value
+    fig, ax = plt.subplots(figsize=(max(10, 3 * n_configs), 6))
+    fig.suptitle(f'Speedup vs PyTorch (M={M_val})', fontsize=14, fontweight='bold')
 
-for i, (key, label) in enumerate(speedup_kernels):
-    speedups = []
-    for cfg_name, M, N, K in configs:
-        if cfg_name in all_results:
-            kernels = all_results[cfg_name]['kernels']
-            if key in kernels and 'pytorch' in kernels:
-                speedups.append(kernels[key]['gflops'] / kernels['pytorch']['gflops'])
+    config_names = [cfg[0] for cfg in m_configs]
+    x = np.arange(len(config_names))
+    speedup_kernels = [(k, l) for k, l in kernel_order if k != 'pytorch']
+    width = 0.8 / len(speedup_kernels)
+
+    for i, (key, label) in enumerate(speedup_kernels):
+        speedups = []
+        for cfg_name, M, N, K in m_configs:
+            if cfg_name in all_results:
+                kernels = all_results[cfg_name]['kernels']
+                if key in kernels and 'pytorch' in kernels:
+                    speedups.append(kernels[key]['gflops'] / kernels['pytorch']['gflops'])
+                else:
+                    speedups.append(0)
             else:
                 speedups.append(0)
-        else:
-            speedups.append(0)
 
-    bars = ax.bar(x + (i - len(speedup_kernels)/2 + 0.5) * width, speedups,
-                  width, label=label, color=colors.get(key, '#333333'))
+        bars = ax.bar(x + (i - len(speedup_kernels)/2 + 0.5) * width, speedups,
+                      width, label=label, color=colors.get(key, '#333333'))
 
-ax.axhline(y=1.0, color='black', linestyle='--', linewidth=1, label='PyTorch baseline')
-ax.set_xlabel('Matrix Size')
-ax.set_ylabel('Speedup (higher is better)')
-ax.set_xticks(x)
-ax.set_xticklabels([f"{cfg[0]}\n({cfg[1]}x{cfg[2]}x{cfg[3]})" for cfg in configs])
-ax.legend(loc='upper right', fontsize=8)
-ax.grid(axis='y', alpha=0.3)
-
-plt.tight_layout()
-plot_path = plots_dir / 'speedup_vs_pytorch.png'
-plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-print(f"  Saved: {plot_path}")
-plt.close()
-
-# Plot 3: Time comparison
-fig, axes = plt.subplots(1, len(configs), figsize=(16, 5), sharey=False)
-fig.suptitle('Execution Time by Matrix Size (lower is better)', fontsize=14, fontweight='bold')
-
-for idx, (cfg_name, M, N, K) in enumerate(configs):
-    ax = axes[idx] if len(configs) > 1 else axes
-    if cfg_name not in all_results:
-        continue
-
-    kernels_data = all_results[cfg_name]['kernels']
-    kernel_names = []
-    time_values = []
-    bar_colors = []
-
-    for key, label in kernel_order:
-        if key in kernels_data:
-            kernel_names.append(label.replace(' ', '\n'))
-            time_values.append(kernels_data[key]['time'])
-            bar_colors.append(colors.get(key, '#333333'))
-
-    bars = ax.bar(range(len(kernel_names)), time_values, color=bar_colors)
-    ax.set_xticks(range(len(kernel_names)))
-    ax.set_xticklabels(kernel_names, fontsize=8)
-    ax.set_title(f"{cfg_name}\n({M}x{K} @ {K}x{N})", fontsize=10)
-    ax.set_ylabel('Time (ms)' if idx == 0 else '')
+    ax.axhline(y=1.0, color='black', linestyle='--', linewidth=1, label='PyTorch baseline')
+    ax.set_xlabel('Configuration')
+    ax.set_ylabel('Speedup (higher is better)')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{cfg[0]}\n[K={cfg[3]}, N={cfg[2]}]" for cfg in m_configs])
+    ax.legend(loc='upper right', fontsize=8)
     ax.grid(axis='y', alpha=0.3)
 
-    # Add value labels on bars
-    for bar, val in zip(bars, time_values):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                f'{val:.2f}', ha='center', va='bottom', fontsize=7)
+    plt.tight_layout()
+    plot_path = plots_dir / f'speedup_M{M_val}.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"    Saved: {plot_path}")
+    plt.close()
 
-plt.tight_layout()
-plot_path = plots_dir / 'time_comparison.png'
-plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-print(f"  Saved: {plot_path}")
-plt.close()
+    # Plot 3: Time comparison for this M value
+    fig, axes = plt.subplots(1, n_configs, figsize=(5 * n_configs, 6), sharey=False)
+    if n_configs == 1:
+        axes = [axes]
+    fig.suptitle(f'Execution Time (M={M_val}) - Lower is Better', fontsize=14, fontweight='bold')
 
-# Plot 4: Scaling across matrix sizes (line plot)
-fig, ax = plt.subplots(figsize=(10, 6))
-fig.suptitle('GFLOPS Scaling Across Matrix Sizes', fontsize=14, fontweight='bold')
+    for idx, (cfg_name, M, N, K) in enumerate(m_configs):
+        ax = axes[idx]
+        if cfg_name not in all_results:
+            continue
 
-matrix_sizes = [M * N * K for (_, M, N, K) in configs]
-config_labels = [cfg[0] for cfg in configs]
+        kernels_data = all_results[cfg_name]['kernels']
+        kernel_names = []
+        time_values = []
+        bar_colors = []
+
+        for key, label in kernel_order:
+            if key in kernels_data:
+                kernel_names.append(label)
+                time_values.append(kernels_data[key]['time'])
+                bar_colors.append(colors.get(key, '#333333'))
+
+        bars = ax.bar(range(len(kernel_names)), time_values, color=bar_colors)
+        ax.set_xticks(range(len(kernel_names)))
+        ax.set_xticklabels(kernel_names, fontsize=9, rotation=45, ha='right')
+        ax.set_title(f"{cfg_name}\n[K={K}, N={N}]", fontsize=11)
+        ax.set_ylabel('Time (ms)' if idx == 0 else '')
+        ax.grid(axis='y', alpha=0.3)
+
+        # Add value labels on bars
+        for bar, val in zip(bars, time_values):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    plot_path = plots_dir / f'time_M{M_val}.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"    Saved: {plot_path}")
+    plt.close()
+
+# Plot 4: Overall scaling across all matrix sizes (line plot)
+fig, ax = plt.subplots(figsize=(max(12, len(configs) * 0.8), 7))
+fig.suptitle('GFLOPS Scaling Across All Configurations', fontsize=14, fontweight='bold')
 
 for key, label in kernel_order:
     gflops_list = []
@@ -986,11 +1004,11 @@ for key, label in kernel_order:
             gflops_list.append(np.nan)
 
     ax.plot(range(len(configs)), gflops_list, 'o-', label=label,
-            color=colors.get(key, '#333333'), linewidth=2, markersize=8)
+            color=colors.get(key, '#333333'), linewidth=2, markersize=6)
 
 ax.set_xticks(range(len(configs)))
-ax.set_xticklabels([f"{cfg[0]}\n{cfg[1]}x{cfg[2]}x{cfg[3]}" for cfg in configs])
-ax.set_xlabel('Matrix Size')
+ax.set_xticklabels([f"{cfg[0]}" for cfg in configs], rotation=45, ha='right', fontsize=9)
+ax.set_xlabel('Configuration')
 ax.set_ylabel('GFLOPS')
 ax.legend(loc='best', fontsize=9)
 ax.grid(True, alpha=0.3)
@@ -1002,6 +1020,27 @@ print(f"  Saved: {plot_path}")
 plt.close()
 
 print(f"\nAll plots saved to: {plots_dir}")
+
+# =============================================================================
+# SAVE JSON RESULTS
+# =============================================================================
+if args.output_json:
+    json_output = {
+        'metadata': {
+            'timestamp': datetime.now().isoformat(),
+            'platform': platform.system(),
+            'architecture': arch,
+            'num_threads': num_threads,
+            'config_type': 'transformer' if args.transformer else 'default'
+        },
+        'results': all_results
+    }
+
+    json_path = Path(args.output_json)
+    with open(json_path, 'w') as f:
+        json.dump(json_output, f, indent=2)
+    print(f"\nResults saved to: {json_path}")
+
 print("\n" + "="*70)
 print("Benchmark Complete!")
 print("="*70)
