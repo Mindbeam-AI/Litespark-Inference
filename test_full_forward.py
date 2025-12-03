@@ -176,7 +176,7 @@ def matmul_ternary(x_int8, scales, w_int8, bias, M, N, K):
             x_int8, scales, w_int8, y, bias, M, N, K, num_threads
         )
     else:
-        kernel.matmul_ternary_vnni_v3(
+        kernel.matmul_free_vnni_v3(
             x_int8, scales, w_int8, y, bias, M, N, K, num_threads
         )
 
