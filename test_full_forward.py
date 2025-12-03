@@ -147,11 +147,14 @@ def prepare_ternary_weights(N, K):
 
     if ARCH == 'arm64':
         # For SDOT: just use int8 weights directly
-        return w_ternary, w_ternary.clone()
+        return w_ternary, w_ternary.clone(), None
     else:
-        # For VNNI: convert to uint8 format (add 128 bias)
-        w_int8 = w_ternary.clone()
-        return w_ternary, w_int8
+        # For VNNI: pack weights and compute weight sums
+        K_padded = ((K + 63) // 64) * 64
+        w_int8_vnni = torch.zeros(N, K_padded, dtype=torch.int8)
+        w_sum_vnni = torch.zeros(N, dtype=torch.int32)
+        kernel.pack_weights_vnni(w_ternary, w_int8_vnni, w_sum_vnni, N, K)
+        return w_ternary, w_int8_vnni, w_sum_vnni
 
 
 def quantize_activations(x):
@@ -167,7 +170,7 @@ def quantize_activations(x):
 # Single Layer Forward Pass
 # ============================================================================
 
-def matmul_ternary(x_int8, scales, w_int8, bias, M, N, K):
+def matmul_ternary(x_int8, scales, w_int8, w_sum, bias, M, N, K):
     """Run ternary matmul using our kernel"""
     y = torch.zeros(M, N, dtype=torch.float32)
 
@@ -177,7 +180,7 @@ def matmul_ternary(x_int8, scales, w_int8, bias, M, N, K):
         )
     else:
         kernel.matmul_free_vnni_v3(
-            x_int8, scales, w_int8, y, bias, M, N, K, num_threads
+            x_int8, scales, w_int8, w_sum, y, bias, M, N, K, num_threads
         )
 
     return y
@@ -206,16 +209,16 @@ class TransformerLayerTernary:
 
         # Create ternary weights for projections
         # Q projection: [hidden_dim, hidden_dim]
-        self.w_q_ternary, self.w_q = prepare_ternary_weights(hidden_dim, hidden_dim)
+        self.w_q_ternary, self.w_q, self.w_q_sum = prepare_ternary_weights(hidden_dim, hidden_dim)
         # K projection: [hidden_dim, hidden_dim]
-        self.w_k_ternary, self.w_k = prepare_ternary_weights(hidden_dim, hidden_dim)
+        self.w_k_ternary, self.w_k, self.w_k_sum = prepare_ternary_weights(hidden_dim, hidden_dim)
         # V projection: [hidden_dim, hidden_dim]
-        self.w_v_ternary, self.w_v = prepare_ternary_weights(hidden_dim, hidden_dim)
+        self.w_v_ternary, self.w_v, self.w_v_sum = prepare_ternary_weights(hidden_dim, hidden_dim)
         # Output projection: [hidden_dim, hidden_dim]
-        self.w_o_ternary, self.w_o = prepare_ternary_weights(hidden_dim, hidden_dim)
+        self.w_o_ternary, self.w_o, self.w_o_sum = prepare_ternary_weights(hidden_dim, hidden_dim)
         # MLP projections
-        self.w_up_ternary, self.w_up = prepare_ternary_weights(mlp_hidden, hidden_dim)
-        self.w_down_ternary, self.w_down = prepare_ternary_weights(hidden_dim, self.mlp_intermediate)
+        self.w_up_ternary, self.w_up, self.w_up_sum = prepare_ternary_weights(mlp_hidden, hidden_dim)
+        self.w_down_ternary, self.w_down, self.w_down_sum = prepare_ternary_weights(hidden_dim, self.mlp_intermediate)
 
         # Biases (zeros for simplicity)
         self.bias_q = torch.zeros(hidden_dim, dtype=torch.float32)
@@ -233,15 +236,15 @@ class TransformerLayerTernary:
 
         # Q Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
         x_int8, scales = quantize_activations(x)
-        q = matmul_ternary(x_int8, scales, self.w_q, self.bias_q,
+        q = matmul_ternary(x_int8, scales, self.w_q, self.w_q_sum, self.bias_q,
                           M, self.hidden_dim, self.hidden_dim)
 
         # K Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
-        k = matmul_ternary(x_int8, scales, self.w_k, self.bias_k,
+        k = matmul_ternary(x_int8, scales, self.w_k, self.w_k_sum, self.bias_k,
                           M, self.hidden_dim, self.hidden_dim)
 
         # V Projection: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
-        v = matmul_ternary(x_int8, scales, self.w_v, self.bias_v,
+        v = matmul_ternary(x_int8, scales, self.w_v, self.w_v_sum, self.bias_v,
                           M, self.hidden_dim, self.hidden_dim)
 
         # Reshape for multi-head attention: [M, num_heads, head_dim]
@@ -265,7 +268,7 @@ class TransformerLayerTernary:
 
         # Output Projection + Softmax: [M, hidden_dim] @ [hidden_dim, hidden_dim] -> [M, hidden_dim]
         attn_int8, attn_scales = quantize_activations(attn_out)
-        out = matmul_ternary(attn_int8, attn_scales, self.w_o, self.bias_o,
+        out = matmul_ternary(attn_int8, attn_scales, self.w_o, self.w_o_sum, self.bias_o,
                            M, self.hidden_dim, self.hidden_dim)
         out = softmax(out)
 
@@ -276,13 +279,13 @@ class TransformerLayerTernary:
 
         # MLP Gate-Up + SwiGLU: [M, hidden_dim] @ [hidden_dim, mlp_hidden] -> [M, mlp_hidden]
         x_int8, scales = quantize_activations(x)
-        mlp_up = matmul_ternary(x_int8, scales, self.w_up, self.bias_up,
+        mlp_up = matmul_ternary(x_int8, scales, self.w_up, self.w_up_sum, self.bias_up,
                                M, self.mlp_hidden, self.hidden_dim)
         mlp_act = swiglu(mlp_up)  # Output: [M, mlp_intermediate]
 
         # MLP Down: [M, mlp_intermediate] @ [mlp_intermediate, hidden_dim] -> [M, hidden_dim]
         mlp_int8, mlp_scales = quantize_activations(mlp_act)
-        mlp_out = matmul_ternary(mlp_int8, mlp_scales, self.w_down, self.bias_down,
+        mlp_out = matmul_ternary(mlp_int8, mlp_scales, self.w_down, self.w_down_sum, self.bias_down,
                                 M, self.hidden_dim, self.mlp_intermediate)
 
         # Residual connection
