@@ -140,7 +140,8 @@ def quantize_activations_initial(x):
     scales = x.abs().max(dim=1, keepdim=True)[0] / 127.0
     scales = scales.clamp(min=1e-8)
     x_int8 = (x / scales).round().clamp(-127, 127).to(torch.int8)
-    return x_int8, scales.squeeze()
+    # Keep scales as 1D tensor [M], don't squeeze to scalar when M=1
+    return x_int8, scales.view(M)
 
 
 # ============================================================================
