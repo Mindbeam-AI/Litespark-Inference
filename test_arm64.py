@@ -79,8 +79,9 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--tbl-only', action='store_true', help='Run only TBL benchmarks')
 parser.add_argument('--transformer', action='store_true', help='Use transformer layer shapes instead of default configs')
-parser.add_argument('--output-json', type=str, help='Save results to JSON file')
 args, _ = parser.parse_known_args()
+
+config_type = 'transformer' if args.transformer else 'default'
 
 # Load SDOT int8 kernel
 sdot_kernel = None
@@ -1334,8 +1335,8 @@ def generate_plots(all_results):
     print(f"\nAll plots saved to: {plots_dir}")
 
 
-def save_json_results(all_results, output_path):
-    """Save benchmark results to JSON file"""
+def save_json_results(all_results):
+    """Save benchmark results to JSON file (automatic)"""
     # Convert results to JSON-serializable format (remove tensors)
     json_results = {}
     for config_name, results in all_results.items():
@@ -1345,19 +1346,20 @@ def save_json_results(all_results, output_path):
                 k: v for k, v in kernel_data.items() if k != 'y'  # Exclude tensor data
             }
 
+    json_filename = f"arm64_{config_type}_{datetime.now().strftime('%m%d%y')}.json"
     json_output = {
         'metadata': {
             'timestamp': datetime.now().isoformat(),
             'platform': platform.system(),
             'architecture': machine,
             'num_threads': num_threads,
-            'config_type': 'transformer' if args.transformer else 'default',
+            'config_type': config_type,
             'tbl_only': args.tbl_only
         },
         'results': json_results
     }
 
-    json_path = Path(output_path)
+    json_path = Path(__file__).parent / json_filename
     with open(json_path, 'w') as f:
         json.dump(json_output, f, indent=2)
     print(f"\nResults saved to: {json_path}")
@@ -1367,9 +1369,7 @@ if __name__ == "__main__":
     all_results = run_benchmarks()
     print_summary(all_results)
     generate_plots(all_results)
-
-    if args.output_json:
-        save_json_results(all_results, args.output_json)
+    save_json_results(all_results)
 
     print("\n" + "=" * 70)
     print("Benchmark complete!")

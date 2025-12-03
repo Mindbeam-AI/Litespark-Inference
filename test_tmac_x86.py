@@ -219,8 +219,9 @@ import sys
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--transformer', action='store_true', help='Use transformer layer shapes')
-parser.add_argument('--output-json', type=str, help='Save results to JSON file')
 args, _ = parser.parse_known_args()
+
+config_type = 'transformer' if args.transformer else 'default'
 
 if args.transformer:
     configs = TRANSFORMER_CONFIGS
@@ -1022,24 +1023,24 @@ plt.close()
 print(f"\nAll plots saved to: {plots_dir}")
 
 # =============================================================================
-# SAVE JSON RESULTS
+# SAVE JSON RESULTS (automatic)
 # =============================================================================
-if args.output_json:
-    json_output = {
-        'metadata': {
-            'timestamp': datetime.now().isoformat(),
-            'platform': platform.system(),
-            'architecture': arch,
-            'num_threads': num_threads,
-            'config_type': 'transformer' if args.transformer else 'default'
-        },
-        'results': all_results
-    }
+json_filename = f"x86_{config_type}_{datetime.now().strftime('%m%d%y')}.json"
+json_output = {
+    'metadata': {
+        'timestamp': datetime.now().isoformat(),
+        'platform': platform.system(),
+        'architecture': arch,
+        'num_threads': num_threads,
+        'config_type': config_type
+    },
+    'results': all_results
+}
 
-    json_path = Path(args.output_json)
-    with open(json_path, 'w') as f:
-        json.dump(json_output, f, indent=2)
-    print(f"\nResults saved to: {json_path}")
+json_path = Path(__file__).parent / json_filename
+with open(json_path, 'w') as f:
+    json.dump(json_output, f, indent=2)
+print(f"\nResults saved to: {json_path}")
 
 print("\n" + "="*70)
 print("Benchmark Complete!")
