@@ -217,13 +217,23 @@ def native_attention(q_int8, k_int8, v_int8, q_scales, k_scales, v_scales, M, nu
     out_int8 = torch.zeros(M, hidden_dim, dtype=torch.int8)
     out_scales = torch.zeros(M, dtype=torch.float32)
 
-    # Use Flash Attention style kernel for better cache utilization
-    kernel.attention_int8_flash(
-        q_int8, k_int8, v_int8,
-        q_scales, k_scales, v_scales,
-        out_int8, out_scales,
-        M, num_heads, head_dim, scale, num_threads
-    )
+    # For large M, use v2 kernel that parallelizes over M×heads
+    # This gives better thread utilization (M×heads work units vs just M)
+    if M >= 64:
+        kernel.attention_int8_v2(
+            q_int8, k_int8, v_int8,
+            q_scales, k_scales, v_scales,
+            out_int8, out_scales,
+            M, num_heads, head_dim, scale, num_threads
+        )
+    else:
+        # For small M, use Flash Attention style kernel
+        kernel.attention_int8_flash(
+            q_int8, k_int8, v_int8,
+            q_scales, k_scales, v_scales,
+            out_int8, out_scales,
+            M, num_heads, head_dim, scale, num_threads
+        )
 
     return out_int8, out_scales
 
