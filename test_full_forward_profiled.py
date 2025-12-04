@@ -171,11 +171,16 @@ def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K, op_name):
     profiler.start(op_name)
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
 
-    # Use v4 kernel for large N or large K (better parallelization)
-    # - Large N (up_matmul): parallelize over N
-    # - Large K with small M: v4 still helps with better blocking
-    if N >= 4096 or (K >= 4096 and M <= 32):
+    # Kernel selection:
+    # - v4: Large N (parallelizes over N blocks) - good for up_matmul
+    # - v5: Large M (parallelizes over M×N tiles) - good for down_matmul
+    # - v3: Default for small M and small N
+    if N >= 4096:
         kernel.matmul_free_vnni_v4_large_n(
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
+        )
+    elif M >= 64:
+        kernel.matmul_free_vnni_v5_large_m(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
         )
     else:
