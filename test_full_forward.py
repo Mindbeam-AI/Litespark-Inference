@@ -201,6 +201,52 @@ def native_swiglu(x_int32, x_scales, M, N):
     return y_int8, y_scales
 
 
+def native_attention(q_int8, k_int8, v_int8, q_scales, k_scales, v_scales, M, num_heads, head_dim, scale):
+    """
+    Native multi-head attention in int8.
+    Q @ K^T -> softmax -> @ V, all in int8/int32.
+    """
+    hidden_dim = num_heads * head_dim
+    out_int8 = torch.zeros(M, hidden_dim, dtype=torch.int8)
+    out_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.attention_int8(
+        q_int8, k_int8, v_int8,
+        q_scales, k_scales, v_scales,
+        out_int8, out_scales,
+        M, num_heads, head_dim, scale, num_threads
+    )
+
+    return out_int8, out_scales
+
+
+def native_fused_residual(x1_int8, x1_scales, x2_int8, x2_scales, M, N):
+    """
+    Fused residual add + quantize: y = x1 + x2, quantized to int8.
+    """
+    y_int8 = torch.zeros(M, N, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.fused_residual_quantize(
+        x1_int8, x1_scales, x2_int8, x2_scales,
+        y_int8, y_scales, M, N, num_threads
+    )
+
+    return y_int8, y_scales
+
+
+def native_quantize_int32(x_int32, x_scales, M, N):
+    """
+    Quantize int32 matmul output to int8.
+    """
+    y_int8 = torch.zeros(M, N, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.quantize_int32_to_int8(x_int32, x_scales, y_int8, y_scales, M, N, num_threads)
+
+    return y_int8, y_scales
+
+
 # ============================================================================
 # Native Transformer Layer
 # ============================================================================
@@ -242,6 +288,8 @@ class TransformerLayerNative:
         Forward pass through one transformer layer.
         Input: x_int8 [M, hidden_dim] int8, x_scales [M] float32
         Output: y_int8 [M, hidden_dim] int8, y_scales [M] float32
+
+        ALL operations in int8/int32 - NO float32 except for scales.
         """
         M = x_int8.shape[0]
 
@@ -259,32 +307,17 @@ class TransformerLayerNative:
         v_int32 = matmul_int32_out(x_int8, x_scales, self.w_v, self.w_v_sum,
                                    M, self.hidden_dim, self.hidden_dim)
 
-        # Apply softmax to Q (as per requirement: softmax after QKV)
-        # This produces int8 output ready for attention computation
-        q_int8, q_scales = native_softmax(q_int32, x_scales, M, self.hidden_dim)
-        k_int8, k_scales = native_softmax(k_int32, x_scales, M, self.hidden_dim)
-        v_int8, v_scales = native_softmax(v_int32, x_scales, M, self.hidden_dim)
+        # Apply softmax to Q, K, V (as per requirement: softmax after QKV)
+        q_int8_sm, q_scales_sm = native_softmax(q_int32, x_scales, M, self.hidden_dim)
+        k_int8_sm, k_scales_sm = native_softmax(k_int32, x_scales, M, self.hidden_dim)
+        v_int8_sm, v_scales_sm = native_softmax(v_int32, x_scales, M, self.hidden_dim)
 
-        # For attention: Q @ K^T @ V - simplified version
-        # In a full implementation, this would be another native kernel
-        # For now, we do the attention in a simplified way
-        # Reshape for multi-head: [M, num_heads, head_dim]
-        q_float = q_int8.float() * q_scales.unsqueeze(1)
-        k_float = k_int8.float() * k_scales.unsqueeze(1)
-        v_float = v_int8.float() * v_scales.unsqueeze(1)
-
-        q_mh = q_float.view(M, self.num_heads, self.head_dim)
-        k_mh = k_float.view(M, self.num_heads, self.head_dim)
-        v_mh = v_float.view(M, self.num_heads, self.head_dim)
-
-        # Attention: Q @ K^T -> softmax -> @ V
-        attn_scores = torch.einsum('mhd,nhd->mhn', q_mh, k_mh) * self.scale
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_out = torch.einsum('mhn,nhd->mhd', attn_probs, v_mh)
-        attn_out = attn_out.reshape(M, self.hidden_dim)
-
-        # Quantize attention output for O projection
-        attn_int8, attn_scales = quantize_activations_initial(attn_out)
+        # Native attention: Q @ K^T -> softmax -> @ V (all in int8/int32)
+        attn_int8, attn_scales = native_attention(
+            q_int8_sm, k_int8_sm, v_int8_sm,
+            q_scales_sm, k_scales_sm, v_scales_sm,
+            M, self.num_heads, self.head_dim, self.scale
+        )
 
         # Output Projection: [M, hidden_dim] -> [M, hidden_dim] int32
         o_int32 = matmul_int32_out(attn_int8, attn_scales, self.w_o, self.w_o_sum,
@@ -293,35 +326,34 @@ class TransformerLayerNative:
         # Softmax after O projection
         o_int8, o_scales = native_softmax(o_int32, attn_scales, M, self.hidden_dim)
 
-        # Convert to float for residual
-        o_float = o_int8.float() * o_scales.unsqueeze(1)
-
-        # Need original x in float for residual - reconstruct from int8
-        x_float = x_int8.float() * x_scales.unsqueeze(1)
-        x_residual = x_float + o_float
-
-        # Quantize for MLP
-        x_int8_mlp, x_scales_mlp = quantize_activations_initial(x_residual)
+        # Fused residual: x + o -> int8 (no float32 intermediate)
+        x_res_int8, x_res_scales = native_fused_residual(
+            x_int8, x_scales, o_int8, o_scales, M, self.hidden_dim
+        )
 
         # === MLP BLOCK ===
 
         # MLP Gate-Up: [M, hidden_dim] -> [M, mlp_hidden] int32
-        mlp_up_int32 = matmul_int32_out(x_int8_mlp, x_scales_mlp, self.w_up, self.w_up_sum,
+        mlp_up_int32 = matmul_int32_out(x_res_int8, x_res_scales, self.w_up, self.w_up_sum,
                                         M, self.mlp_hidden, self.hidden_dim)
 
         # SwiGLU: [M, mlp_hidden] int32 -> [M, mlp_intermediate] int8
-        mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_scales_mlp,
+        mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_res_scales,
                                                      M, self.mlp_hidden)
 
-        # MLP Down: [M, mlp_intermediate] -> [M, hidden_dim] float32 (final output)
-        mlp_out = matmul_float_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
-                                   self.bias_down, M, self.hidden_dim, self.mlp_intermediate)
+        # MLP Down: [M, mlp_intermediate] -> [M, hidden_dim] int32
+        mlp_down_int32 = matmul_int32_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
+                                          M, self.hidden_dim, self.mlp_intermediate)
 
-        # Residual connection
-        y_float = x_residual + mlp_out
+        # Quantize int32 output to int8 (native kernel)
+        mlp_down_int8, mlp_down_scales = native_quantize_int32(
+            mlp_down_int32, mlp_act_scales, M, self.hidden_dim
+        )
 
-        # Quantize output for next layer
-        y_int8, y_scales = quantize_activations_initial(y_float)
+        # Fused residual: x_res + mlp_down -> int8
+        y_int8, y_scales = native_fused_residual(
+            x_res_int8, x_res_scales, mlp_down_int8, mlp_down_scales, M, self.hidden_dim
+        )
 
         return y_int8, y_scales
 

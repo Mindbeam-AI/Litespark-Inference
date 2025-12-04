@@ -928,6 +928,246 @@ void swiglu_int8(
     }
 }
 
+/**
+ * Native Multi-Head Attention in int8/int32
+ *
+ * Computes: Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
+ *
+ * All operations stay in int8/int32:
+ * - Q, K, V inputs are int8 [M, num_heads, head_dim]
+ * - Q @ K^T computed in int32
+ * - Softmax outputs int8 attention weights
+ * - attn_weights @ V computed in int32
+ * - Final output quantized to int8
+ *
+ * This avoids float32 conversions in the attention computation.
+ */
+void attention_int8(
+    torch::Tensor q_tensor,         // [M, num_heads * head_dim] int8
+    torch::Tensor k_tensor,         // [M, num_heads * head_dim] int8
+    torch::Tensor v_tensor,         // [M, num_heads * head_dim] int8
+    torch::Tensor q_scale_tensor,   // [M] float32
+    torch::Tensor k_scale_tensor,   // [M] float32
+    torch::Tensor v_scale_tensor,   // [M] float32
+    torch::Tensor out_tensor,       // [M, num_heads * head_dim] int8 output
+    torch::Tensor out_scale_tensor, // [M] float32 output scales
+    int M, int num_heads, int head_dim,
+    float scale,                    // 1/sqrt(head_dim)
+    int num_threads
+) {
+    const int8_t* __restrict__ q = q_tensor.data_ptr<int8_t>();
+    const int8_t* __restrict__ k = k_tensor.data_ptr<int8_t>();
+    const int8_t* __restrict__ v = v_tensor.data_ptr<int8_t>();
+    const float* __restrict__ q_scales = q_scale_tensor.data_ptr<float>();
+    const float* __restrict__ k_scales = k_scale_tensor.data_ptr<float>();
+    const float* __restrict__ v_scales = v_scale_tensor.data_ptr<float>();
+    int8_t* __restrict__ out = out_tensor.data_ptr<int8_t>();
+    float* __restrict__ out_scales = out_scale_tensor.data_ptr<float>();
+
+    const int hidden_dim = num_heads * head_dim;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const int8_t* q_row = q + m * hidden_dim;
+        float q_scale = q_scales[m];
+        int8_t* out_row = out + m * hidden_dim;
+
+        // Allocate per-row buffers
+        float* attn_scores = (float*)aligned_alloc(64, M * num_heads * sizeof(float));
+        float* attn_probs = (float*)aligned_alloc(64, M * num_heads * sizeof(float));
+        float* attn_out = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
+
+        // For each head
+        for (int h = 0; h < num_heads; h++) {
+            const int8_t* q_head = q_row + h * head_dim;
+
+            // Step 1: Compute Q @ K^T for this head
+            // attn_scores[h, n] = sum_d(Q[m, h, d] * K[n, h, d]) * scale
+            for (int n = 0; n < M; n++) {
+                const int8_t* k_row = k + n * hidden_dim;
+                const int8_t* k_head = k_row + h * head_dim;
+                float k_scale = k_scales[n];
+
+                int32_t dot = 0;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += static_cast<int32_t>(q_head[d]) * static_cast<int32_t>(k_head[d]);
+                }
+
+                // Convert to float with scaling
+                float score = static_cast<float>(dot) * q_scale * k_scale * scale;
+                attn_scores[n * num_heads + h] = score;
+            }
+
+            // Step 2: Softmax over keys (dimension n) for this head
+            float max_score = -INFINITY;
+            for (int n = 0; n < M; n++) {
+                if (attn_scores[n * num_heads + h] > max_score) {
+                    max_score = attn_scores[n * num_heads + h];
+                }
+            }
+
+            float sum_exp = 0.0f;
+            for (int n = 0; n < M; n++) {
+                attn_probs[n * num_heads + h] = std::exp(attn_scores[n * num_heads + h] - max_score);
+                sum_exp += attn_probs[n * num_heads + h];
+            }
+
+            float inv_sum = 1.0f / sum_exp;
+            for (int n = 0; n < M; n++) {
+                attn_probs[n * num_heads + h] *= inv_sum;
+            }
+
+            // Step 3: Compute attn_probs @ V for this head
+            // out[m, h, d] = sum_n(attn_probs[m, h, n] * V[n, h, d])
+            for (int d = 0; d < head_dim; d++) {
+                float sum = 0.0f;
+                for (int n = 0; n < M; n++) {
+                    const int8_t* v_row = v + n * hidden_dim;
+                    float v_scale = v_scales[n];
+                    float v_val = static_cast<float>(v_row[h * head_dim + d]) * v_scale;
+                    sum += attn_probs[n * num_heads + h] * v_val;
+                }
+                attn_out[h * head_dim + d] = sum;
+            }
+        }
+
+        // Step 4: Quantize output to int8
+        float max_abs = 0.0f;
+        for (int i = 0; i < hidden_dim; i++) {
+            float abs_val = std::abs(attn_out[i]);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+
+        float out_scale = max_abs / 127.0f;
+        if (out_scale == 0.0f) out_scale = 1.0f;
+        out_scales[m] = out_scale;
+
+        float inv_scale = 1.0f / out_scale;
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = attn_out[i] * inv_scale;
+            val = std::max(-127.0f, std::min(127.0f, val));
+            out_row[i] = static_cast<int8_t>(std::round(val));
+        }
+
+        free(attn_scores);
+        free(attn_probs);
+        free(attn_out);
+    }
+}
+
+/**
+ * Fused residual add + quantize
+ *
+ * Computes: y = x1 + x2, then quantizes to int8
+ * Both inputs are int8 with their own scales.
+ */
+void fused_residual_quantize(
+    torch::Tensor x1_tensor,        // [M, N] int8
+    torch::Tensor x1_scale_tensor,  // [M] float32
+    torch::Tensor x2_tensor,        // [M, N] int8
+    torch::Tensor x2_scale_tensor,  // [M] float32
+    torch::Tensor y_tensor,         // [M, N] int8 output
+    torch::Tensor y_scale_tensor,   // [M] float32 output scales
+    int M, int N,
+    int num_threads
+) {
+    const int8_t* __restrict__ x1 = x1_tensor.data_ptr<int8_t>();
+    const float* __restrict__ x1_scales = x1_scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ x2 = x2_tensor.data_ptr<int8_t>();
+    const float* __restrict__ x2_scales = x2_scale_tensor.data_ptr<float>();
+    int8_t* __restrict__ y = y_tensor.data_ptr<int8_t>();
+    float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const int8_t* x1_row = x1 + m * N;
+        const int8_t* x2_row = x2 + m * N;
+        int8_t* y_row = y + m * N;
+
+        float x1_scale = x1_scales[m];
+        float x2_scale = x2_scales[m];
+
+        // First pass: compute sum and find max for quantization
+        float max_abs = 0.0f;
+        float* temp = (float*)aligned_alloc(64, N * sizeof(float));
+
+        for (int n = 0; n < N; n++) {
+            float val = static_cast<float>(x1_row[n]) * x1_scale +
+                       static_cast<float>(x2_row[n]) * x2_scale;
+            temp[n] = val;
+            float abs_val = std::abs(val);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+
+        // Quantize
+        float y_scale = max_abs / 127.0f;
+        if (y_scale == 0.0f) y_scale = 1.0f;
+        y_scales[m] = y_scale;
+
+        float inv_scale = 1.0f / y_scale;
+        for (int n = 0; n < N; n++) {
+            float val = temp[n] * inv_scale;
+            val = std::max(-127.0f, std::min(127.0f, val));
+            y_row[n] = static_cast<int8_t>(std::round(val));
+        }
+
+        free(temp);
+    }
+}
+
+/**
+ * Quantize int32 matmul output to int8
+ *
+ * Takes int32 accumulator output and input scale, produces int8 output.
+ */
+void quantize_int32_to_int8(
+    torch::Tensor x_tensor,         // [M, N] int32 input
+    torch::Tensor x_scale_tensor,   // [M] float32 input scales (from activations)
+    torch::Tensor y_tensor,         // [M, N] int8 output
+    torch::Tensor y_scale_tensor,   // [M] float32 output scales
+    int M, int N,
+    int num_threads
+) {
+    const int32_t* __restrict__ x = x_tensor.data_ptr<int32_t>();
+    const float* __restrict__ x_scales = x_scale_tensor.data_ptr<float>();
+    int8_t* __restrict__ y = y_tensor.data_ptr<int8_t>();
+    float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const int32_t* x_row = x + m * N;
+        int8_t* y_row = y + m * N;
+        float x_scale = x_scales[m];
+
+        // First pass: convert to float and find max
+        float max_abs = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float val = static_cast<float>(x_row[n]) * x_scale;
+            float abs_val = std::abs(val);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+
+        // Compute output scale
+        float y_scale = max_abs / 127.0f;
+        if (y_scale == 0.0f) y_scale = 1.0f;
+        y_scales[m] = y_scale;
+
+        // Second pass: quantize
+        float inv_scale = 1.0f / y_scale;
+        for (int n = 0; n < N; n++) {
+            float val = static_cast<float>(x_row[n]) * x_scale * inv_scale;
+            val = std::max(-127.0f, std::min(127.0f, val));
+            y_row[n] = static_cast<int8_t>(std::round(val));
+        }
+    }
+}
+
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_activations_int8_vnni", &quantize_activations_int8_vnni,
@@ -946,4 +1186,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Softmax with int8 output");
     m.def("swiglu_int8", &swiglu_int8,
           "SwiGLU activation with int8 output");
+    m.def("attention_int8", &attention_int8,
+          "Multi-head attention in int8");
+    m.def("fused_residual_quantize", &fused_residual_quantize,
+          "Fused residual add + quantize");
+    m.def("quantize_int32_to_int8", &quantize_int32_to_int8,
+          "Quantize int32 to int8");
 }
