@@ -203,14 +203,15 @@ def native_swiglu(x_int32, x_scales, M, N):
 
 def native_attention(q_int8, k_int8, v_int8, q_scales, k_scales, v_scales, M, num_heads, head_dim, scale):
     """
-    Native multi-head attention in int8.
+    Native multi-head attention in int8 using Flash Attention style tiling.
     Q @ K^T -> softmax -> @ V, all in int8/int32.
     """
     hidden_dim = num_heads * head_dim
     out_int8 = torch.zeros(M, hidden_dim, dtype=torch.int8)
     out_scales = torch.zeros(M, dtype=torch.float32)
 
-    kernel.attention_int8(
+    # Use Flash Attention style kernel for better cache utilization
+    kernel.attention_int8_flash(
         q_int8, k_int8, v_int8,
         q_scales, k_scales, v_scales,
         out_int8, out_scales,

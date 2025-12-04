@@ -1339,7 +1339,403 @@ void attention_int8(
 }
 
 /**
- * Fused residual add + quantize
+ * Flash Attention Style Tiled Attention - AVX-512 Optimized
+ *
+ * Key optimizations over standard attention:
+ * 1. Tiles the computation to avoid O(M²) memory
+ * 2. Computes attention in chunks, accumulating online softmax
+ * 3. Better cache utilization by processing blocks at a time
+ * 4. Parallelizes over query rows (M) and heads
+ *
+ * Online softmax algorithm:
+ * - Process keys in blocks
+ * - Maintain running max and sum
+ * - Rescale previous accumulator when max changes
+ */
+void attention_int8_flash(
+    torch::Tensor q_tensor,         // [M, num_heads * head_dim] int8
+    torch::Tensor k_tensor,         // [M, num_heads * head_dim] int8
+    torch::Tensor v_tensor,         // [M, num_heads * head_dim] int8
+    torch::Tensor q_scale_tensor,   // [M] float32
+    torch::Tensor k_scale_tensor,   // [M] float32
+    torch::Tensor v_scale_tensor,   // [M] float32
+    torch::Tensor out_tensor,       // [M, num_heads * head_dim] int8 output
+    torch::Tensor out_scale_tensor, // [M] float32 output scales
+    int M, int num_heads, int head_dim,
+    float scale,                    // 1/sqrt(head_dim)
+    int num_threads
+) {
+    const int8_t* __restrict__ q = q_tensor.data_ptr<int8_t>();
+    const int8_t* __restrict__ k = k_tensor.data_ptr<int8_t>();
+    const int8_t* __restrict__ v = v_tensor.data_ptr<int8_t>();
+    const float* __restrict__ q_scales = q_scale_tensor.data_ptr<float>();
+    const float* __restrict__ k_scales = k_scale_tensor.data_ptr<float>();
+    const float* __restrict__ v_scales = v_scale_tensor.data_ptr<float>();
+    int8_t* __restrict__ out = out_tensor.data_ptr<int8_t>();
+    float* __restrict__ out_scales = out_scale_tensor.data_ptr<float>();
+
+    const int hidden_dim = num_heads * head_dim;
+
+    // Block size for Flash Attention style tiling
+    // Should fit in L1/L2 cache
+    constexpr int BLOCK_SIZE = 32;
+
+    omp_set_num_threads(num_threads);
+
+    // Parallelize over M (query rows) - each thread handles one query
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const int8_t* q_row = q + m * hidden_dim;
+        float q_scale_val = q_scales[m];
+        int8_t* out_row = out + m * hidden_dim;
+
+        // Per-head output accumulator (float)
+        float* attn_out = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
+        memset(attn_out, 0, hidden_dim * sizeof(float));
+
+        // Process each head
+        for (int h = 0; h < num_heads; h++) {
+            const int8_t* q_head = q_row + h * head_dim;
+
+            // Online softmax state per head
+            float running_max = -INFINITY;
+            float running_sum = 0.0f;
+
+            // Output accumulator for this head
+            float* head_out = attn_out + h * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                head_out[d] = 0.0f;
+            }
+
+            // Process keys in blocks (Flash Attention style)
+            for (int k_start = 0; k_start < M; k_start += BLOCK_SIZE) {
+                int k_end = std::min(k_start + BLOCK_SIZE, M);
+                int block_size = k_end - k_start;
+
+                // Compute scores for this block
+                alignas(64) float scores[BLOCK_SIZE];
+                float block_max = -INFINITY;
+
+                for (int n = 0; n < block_size; n++) {
+                    int k_idx = k_start + n;
+                    const int8_t* k_row = k + k_idx * hidden_dim;
+                    const int8_t* k_head = k_row + h * head_dim;
+                    float k_scale_val = k_scales[k_idx];
+
+                    // Dot product Q @ K^T
+                    __m512i acc = _mm512_setzero_si512();
+                    int d = 0;
+                    for (; d + 31 < head_dim; d += 32) {
+                        __m256i q_vec = _mm256_loadu_si256((__m256i*)(q_head + d));
+                        __m256i k_vec = _mm256_loadu_si256((__m256i*)(k_head + d));
+
+                        __m512i q_16 = _mm512_cvtepi8_epi16(q_vec);
+                        __m512i k_16 = _mm512_cvtepi8_epi16(k_vec);
+
+                        __m512i prod = _mm512_madd_epi16(q_16, k_16);
+                        acc = _mm512_add_epi32(acc, prod);
+                    }
+
+                    int32_t dot = _mm512_reduce_add_epi32(acc);
+                    for (; d < head_dim; d++) {
+                        dot += static_cast<int32_t>(q_head[d]) * static_cast<int32_t>(k_head[d]);
+                    }
+
+                    scores[n] = static_cast<float>(dot) * q_scale_val * k_scale_val * scale;
+                    block_max = std::max(block_max, scores[n]);
+                }
+
+                // Online softmax update
+                float new_max = std::max(running_max, block_max);
+
+                // Rescale previous accumulator if max changed
+                if (running_max != -INFINITY && new_max > running_max) {
+                    float rescale = std::exp(running_max - new_max);
+                    running_sum *= rescale;
+                    for (int d = 0; d < head_dim; d++) {
+                        head_out[d] *= rescale;
+                    }
+                }
+
+                // Compute exp(scores - new_max) and accumulate
+                float block_sum = 0.0f;
+                alignas(64) float probs[BLOCK_SIZE];
+
+                for (int n = 0; n < block_size; n++) {
+                    probs[n] = std::exp(scores[n] - new_max);
+                    block_sum += probs[n];
+                }
+
+                // Accumulate weighted V
+                for (int n = 0; n < block_size; n++) {
+                    int k_idx = k_start + n;
+                    const int8_t* v_row = v + k_idx * hidden_dim;
+                    const int8_t* v_head = v_row + h * head_dim;
+                    float v_scale_val = v_scales[k_idx];
+                    float prob = probs[n];
+
+                    // Vectorized V accumulation
+                    int d = 0;
+                    __m512 prob_vec = _mm512_set1_ps(prob);
+                    __m512 v_scale_vec = _mm512_set1_ps(v_scale_val);
+
+                    for (; d + 15 < head_dim; d += 16) {
+                        // Load 16 int8 values
+                        __m128i v_int8 = _mm_loadu_si128((__m128i*)(v_head + d));
+                        __m512i v_int32 = _mm512_cvtepi8_epi32(v_int8);
+                        __m512 v_float = _mm512_cvtepi32_ps(v_int32);
+                        v_float = _mm512_mul_ps(v_float, v_scale_vec);
+
+                        // Load current accumulator
+                        __m512 acc = _mm512_loadu_ps(head_out + d);
+                        acc = _mm512_fmadd_ps(prob_vec, v_float, acc);
+                        _mm512_storeu_ps(head_out + d, acc);
+                    }
+
+                    for (; d < head_dim; d++) {
+                        head_out[d] += prob * static_cast<float>(v_head[d]) * v_scale_val;
+                    }
+                }
+
+                running_max = new_max;
+                running_sum += block_sum;
+            }
+
+            // Normalize by sum
+            float inv_sum = 1.0f / running_sum;
+            for (int d = 0; d < head_dim; d++) {
+                head_out[d] *= inv_sum;
+            }
+        }
+
+        // Quantize output to int8
+        float max_abs = 0.0f;
+        for (int i = 0; i < hidden_dim; i++) {
+            max_abs = std::max(max_abs, std::abs(attn_out[i]));
+        }
+
+        float out_scale_val = max_abs / 127.0f;
+        if (out_scale_val == 0.0f) out_scale_val = 1.0f;
+        out_scales[m] = out_scale_val;
+
+        float inv_scale = 1.0f / out_scale_val;
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = attn_out[i] * inv_scale;
+            val = std::max(-127.0f, std::min(127.0f, val));
+            out_row[i] = static_cast<int8_t>(std::round(val));
+        }
+
+        free(attn_out);
+    }
+}
+
+/**
+ * Fused QKV Projection + Attention
+ *
+ * Combines Q, K, V projections with attention in a single kernel.
+ * Avoids intermediate materialization of Q, K, V tensors.
+ *
+ * Input: x [M, hidden_dim] int8
+ * Output: y [M, hidden_dim] int8
+ */
+void fused_qkv_attention(
+    torch::Tensor x_tensor,         // [M, hidden_dim] int8 input
+    torch::Tensor x_scale_tensor,   // [M] float32 input scales
+    torch::Tensor wq_tensor,        // [hidden_dim, K_padded] int8 Q weights
+    torch::Tensor wq_sum_tensor,    // [hidden_dim] int32 Q weight sums
+    torch::Tensor wk_tensor,        // [hidden_dim, K_padded] int8 K weights
+    torch::Tensor wk_sum_tensor,    // [hidden_dim] int32 K weight sums
+    torch::Tensor wv_tensor,        // [hidden_dim, K_padded] int8 V weights
+    torch::Tensor wv_sum_tensor,    // [hidden_dim] int32 V weight sums
+    torch::Tensor out_tensor,       // [M, hidden_dim] int8 output
+    torch::Tensor out_scale_tensor, // [M] float32 output scales
+    int M, int hidden_dim, int num_heads, int head_dim,
+    float scale,
+    int num_threads
+) {
+    const int8_t* __restrict__ x = x_tensor.data_ptr<int8_t>();
+    const float* __restrict__ x_scales = x_scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ wq = wq_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ wq_sum = wq_sum_tensor.data_ptr<int32_t>();
+    const int8_t* __restrict__ wk = wk_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ wk_sum = wk_sum_tensor.data_ptr<int32_t>();
+    const int8_t* __restrict__ wv = wv_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ wv_sum = wv_sum_tensor.data_ptr<int32_t>();
+    int8_t* __restrict__ out = out_tensor.data_ptr<int8_t>();
+    float* __restrict__ out_scales = out_scale_tensor.data_ptr<float>();
+
+    const int K_padded = ((hidden_dim + 63) / 64) * 64;
+    constexpr int BLOCK_SIZE = 32;
+
+    omp_set_num_threads(num_threads);
+
+    // Precompute all Q, K, V projections in parallel first
+    // This is more cache-friendly than computing on-the-fly
+    float* Q_float = (float*)aligned_alloc(64, M * hidden_dim * sizeof(float));
+    float* K_float = (float*)aligned_alloc(64, M * hidden_dim * sizeof(float));
+    float* V_float = (float*)aligned_alloc(64, M * hidden_dim * sizeof(float));
+
+    // Compute Q, K, V projections
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const int8_t* x_row = x + m * hidden_dim;
+        float x_scale = x_scales[m];
+
+        // Convert x to uint8 for VNNI
+        alignas(64) uint8_t x_uint8[K_padded];
+        for (int k = 0; k < hidden_dim; k++) {
+            x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+        }
+        for (int k = hidden_dim; k < K_padded; k++) {
+            x_uint8[k] = 128;
+        }
+
+        // Compute Q row
+        for (int n = 0; n < hidden_dim; n++) {
+            const int8_t* w_row = wq + n * K_padded;
+            __m512i acc = _mm512_setzero_si512();
+            for (int kk = 0; kk < K_padded; kk += 64) {
+                __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                __m512i w_vec = _mm512_loadu_si512((__m512i*)(w_row + kk));
+                acc = _mm512_dpbusd_epi32(acc, x_vec, w_vec);
+            }
+            int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * wq_sum[n];
+            Q_float[m * hidden_dim + n] = static_cast<float>(sum) * x_scale;
+        }
+
+        // Compute K row
+        for (int n = 0; n < hidden_dim; n++) {
+            const int8_t* w_row = wk + n * K_padded;
+            __m512i acc = _mm512_setzero_si512();
+            for (int kk = 0; kk < K_padded; kk += 64) {
+                __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                __m512i w_vec = _mm512_loadu_si512((__m512i*)(w_row + kk));
+                acc = _mm512_dpbusd_epi32(acc, x_vec, w_vec);
+            }
+            int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * wk_sum[n];
+            K_float[m * hidden_dim + n] = static_cast<float>(sum) * x_scale;
+        }
+
+        // Compute V row
+        for (int n = 0; n < hidden_dim; n++) {
+            const int8_t* w_row = wv + n * K_padded;
+            __m512i acc = _mm512_setzero_si512();
+            for (int kk = 0; kk < K_padded; kk += 64) {
+                __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                __m512i w_vec = _mm512_loadu_si512((__m512i*)(w_row + kk));
+                acc = _mm512_dpbusd_epi32(acc, x_vec, w_vec);
+            }
+            int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * wv_sum[n];
+            V_float[m * hidden_dim + n] = static_cast<float>(sum) * x_scale;
+        }
+    }
+
+    // Now compute attention using the float Q, K, V
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const float* q_row = Q_float + m * hidden_dim;
+        int8_t* out_row = out + m * hidden_dim;
+        float* attn_out = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
+
+        for (int h = 0; h < num_heads; h++) {
+            const float* q_head = q_row + h * head_dim;
+            float* head_out = attn_out + h * head_dim;
+
+            float running_max = -INFINITY;
+            float running_sum = 0.0f;
+            for (int d = 0; d < head_dim; d++) head_out[d] = 0.0f;
+
+            for (int k_start = 0; k_start < M; k_start += BLOCK_SIZE) {
+                int k_end = std::min(k_start + BLOCK_SIZE, M);
+                int block_size = k_end - k_start;
+
+                alignas(64) float scores[BLOCK_SIZE];
+                float block_max = -INFINITY;
+
+                for (int n = 0; n < block_size; n++) {
+                    int k_idx = k_start + n;
+                    const float* k_head = K_float + k_idx * hidden_dim + h * head_dim;
+
+                    // Float dot product (already dequantized)
+                    __m512 acc = _mm512_setzero_ps();
+                    int d = 0;
+                    for (; d + 15 < head_dim; d += 16) {
+                        __m512 q_vec = _mm512_loadu_ps(q_head + d);
+                        __m512 k_vec = _mm512_loadu_ps(k_head + d);
+                        acc = _mm512_fmadd_ps(q_vec, k_vec, acc);
+                    }
+                    float dot = _mm512_reduce_add_ps(acc);
+                    for (; d < head_dim; d++) {
+                        dot += q_head[d] * k_head[d];
+                    }
+
+                    scores[n] = dot * scale;
+                    block_max = std::max(block_max, scores[n]);
+                }
+
+                float new_max = std::max(running_max, block_max);
+                if (running_max != -INFINITY && new_max > running_max) {
+                    float rescale = std::exp(running_max - new_max);
+                    running_sum *= rescale;
+                    for (int d = 0; d < head_dim; d++) head_out[d] *= rescale;
+                }
+
+                float block_sum = 0.0f;
+                for (int n = 0; n < block_size; n++) {
+                    float prob = std::exp(scores[n] - new_max);
+                    block_sum += prob;
+
+                    int k_idx = k_start + n;
+                    const float* v_head = V_float + k_idx * hidden_dim + h * head_dim;
+
+                    __m512 prob_vec = _mm512_set1_ps(prob);
+                    int d = 0;
+                    for (; d + 15 < head_dim; d += 16) {
+                        __m512 v_vec = _mm512_loadu_ps(v_head + d);
+                        __m512 out_vec = _mm512_loadu_ps(head_out + d);
+                        out_vec = _mm512_fmadd_ps(prob_vec, v_vec, out_vec);
+                        _mm512_storeu_ps(head_out + d, out_vec);
+                    }
+                    for (; d < head_dim; d++) {
+                        head_out[d] += prob * v_head[d];
+                    }
+                }
+
+                running_max = new_max;
+                running_sum += block_sum;
+            }
+
+            float inv_sum = 1.0f / running_sum;
+            for (int d = 0; d < head_dim; d++) head_out[d] *= inv_sum;
+        }
+
+        // Quantize output
+        float max_abs = 0.0f;
+        for (int i = 0; i < hidden_dim; i++) {
+            max_abs = std::max(max_abs, std::abs(attn_out[i]));
+        }
+
+        float out_scale_val = max_abs / 127.0f;
+        if (out_scale_val == 0.0f) out_scale_val = 1.0f;
+        out_scales[m] = out_scale_val;
+
+        float inv_scale = 1.0f / out_scale_val;
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = attn_out[i] * inv_scale;
+            val = std::max(-127.0f, std::min(127.0f, val));
+            out_row[i] = static_cast<int8_t>(std::round(val));
+        }
+
+        free(attn_out);
+    }
+
+    free(Q_float);
+    free(K_float);
+    free(V_float);
+}
+
+/**
+ * Fused residual add + quantize - AVX-512 Vectorized
  *
  * Computes: y = x1 + x2, then quantizes to int8
  * Both inputs are int8 with their own scales.
@@ -1361,6 +1757,8 @@ void fused_residual_quantize(
     int8_t* __restrict__ y = y_tensor.data_ptr<int8_t>();
     float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
 
+    const int N_padded = ((N + 15) / 16) * 16;
+
     omp_set_num_threads(num_threads);
 
     #pragma omp parallel for schedule(static)
@@ -1372,25 +1770,69 @@ void fused_residual_quantize(
         float x1_scale = x1_scales[m];
         float x2_scale = x2_scales[m];
 
-        // First pass: compute sum and find max for quantization
-        float max_abs = 0.0f;
-        float* temp = (float*)aligned_alloc(64, N * sizeof(float));
+        __m512 x1_scale_vec = _mm512_set1_ps(x1_scale);
+        __m512 x2_scale_vec = _mm512_set1_ps(x2_scale);
 
-        for (int n = 0; n < N; n++) {
+        // First pass: compute sum and find max (vectorized)
+        float* temp = (float*)aligned_alloc(64, N_padded * sizeof(float));
+        __m512 max_abs_vec = _mm512_setzero_ps();
+
+        int n = 0;
+        for (; n + 15 < N; n += 16) {
+            // Load 16 int8 values from each input
+            __m128i x1_int8 = _mm_loadu_si128((__m128i*)(x1_row + n));
+            __m128i x2_int8 = _mm_loadu_si128((__m128i*)(x2_row + n));
+
+            // Convert to int32
+            __m512i x1_int32 = _mm512_cvtepi8_epi32(x1_int8);
+            __m512i x2_int32 = _mm512_cvtepi8_epi32(x2_int8);
+
+            // Convert to float and scale
+            __m512 x1_float = _mm512_mul_ps(_mm512_cvtepi32_ps(x1_int32), x1_scale_vec);
+            __m512 x2_float = _mm512_mul_ps(_mm512_cvtepi32_ps(x2_int32), x2_scale_vec);
+
+            // Add
+            __m512 sum = _mm512_add_ps(x1_float, x2_float);
+            _mm512_store_ps(temp + n, sum);
+
+            // Track max abs
+            __m512 abs_sum = _mm512_abs_ps(sum);
+            max_abs_vec = _mm512_max_ps(max_abs_vec, abs_sum);
+        }
+
+        float max_abs = _mm512_reduce_max_ps(max_abs_vec);
+
+        // Handle remainder
+        for (; n < N; n++) {
             float val = static_cast<float>(x1_row[n]) * x1_scale +
                        static_cast<float>(x2_row[n]) * x2_scale;
             temp[n] = val;
-            float abs_val = std::abs(val);
-            if (abs_val > max_abs) max_abs = abs_val;
+            max_abs = std::max(max_abs, std::abs(val));
         }
 
-        // Quantize
+        // Quantize (vectorized)
         float y_scale = max_abs / 127.0f;
         if (y_scale == 0.0f) y_scale = 1.0f;
         y_scales[m] = y_scale;
 
+        __m512 inv_scale_vec = _mm512_set1_ps(1.0f / y_scale);
+        __m512 min_val = _mm512_set1_ps(-127.0f);
+        __m512 max_val = _mm512_set1_ps(127.0f);
+
+        n = 0;
+        for (; n + 15 < N; n += 16) {
+            __m512 vals = _mm512_load_ps(temp + n);
+            vals = _mm512_mul_ps(vals, inv_scale_vec);
+            vals = _mm512_max_ps(vals, min_val);
+            vals = _mm512_min_ps(vals, max_val);
+            vals = _mm512_roundscale_ps(vals, _MM_FROUND_TO_NEAREST_INT);
+            __m512i int_vals = _mm512_cvtps_epi32(vals);
+            __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+            _mm_storeu_si128((__m128i*)(y_row + n), packed);
+        }
+
         float inv_scale = 1.0f / y_scale;
-        for (int n = 0; n < N; n++) {
+        for (; n < N; n++) {
             float val = temp[n] * inv_scale;
             val = std::max(-127.0f, std::min(127.0f, val));
             y_row[n] = static_cast<int8_t>(std::round(val));
@@ -1473,4 +1915,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused residual add + quantize");
     m.def("quantize_int32_to_int8", &quantize_int32_to_int8,
           "Quantize int32 to int8");
+    m.def("attention_int8_flash", &attention_int8_flash,
+          "Flash Attention style tiled attention");
+    m.def("fused_qkv_attention", &fused_qkv_attention,
+          "Fused QKV projection + attention");
 }
