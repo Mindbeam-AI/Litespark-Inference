@@ -801,7 +801,44 @@ void matmul_free_vnni_v3_int32_out(
 }
 
 /**
- * Softmax with int8 output
+ * Fast AVX-512 exponential approximation
+ * Uses polynomial approximation for exp(x)
+ * Accurate for x in [-88, 88], good enough for softmax
+ */
+inline __m512 avx512_exp_fast(__m512 x) {
+    // Clamp to prevent overflow
+    x = _mm512_max_ps(x, _mm512_set1_ps(-88.0f));
+    x = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
+
+    // exp(x) = 2^(x * log2(e))
+    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
+
+    __m512 z = _mm512_mul_ps(x, log2e);
+
+    // Split into integer and fractional parts
+    __m512i zi = _mm512_cvtps_epi32(z);
+    __m512 zf = _mm512_sub_ps(z, _mm512_cvtepi32_ps(zi));
+
+    // 2^frac using polynomial: 1 + f*ln2 + f^2*ln2^2/2 + ...
+    const __m512 c0 = _mm512_set1_ps(1.0f);
+    const __m512 c1 = _mm512_set1_ps(0.693147180559945309f);
+    const __m512 c2 = _mm512_set1_ps(0.240226506959100712f);
+    const __m512 c3 = _mm512_set1_ps(0.0555041086648215799f);
+
+    __m512 poly = _mm512_fmadd_ps(c3, zf, c2);
+    poly = _mm512_fmadd_ps(poly, zf, c1);
+    poly = _mm512_fmadd_ps(poly, zf, c0);
+
+    // 2^int part via bit manipulation
+    __m512i exp_int = _mm512_add_epi32(zi, _mm512_set1_epi32(127));
+    exp_int = _mm512_slli_epi32(exp_int, 23);
+    __m512 pow2_int = _mm512_castsi512_ps(exp_int);
+
+    return _mm512_mul_ps(pow2_int, poly);
+}
+
+/**
+ * Softmax with int8 output - AVX-512 Vectorized
  *
  * Takes int32 input (from matmul accumulator) and produces int8 output for next layer.
  * Uses per-row scaling for quantization.
@@ -810,6 +847,13 @@ void matmul_free_vnni_v3_int32_out(
  * 1. Convert int32 to float using input scale
  * 2. Compute softmax: exp(x - max) / sum(exp(x - max))
  * 3. Quantize to int8 (softmax output is [0,1], so we scale by 127)
+ *
+ * AVX-512 optimizations:
+ * - Vectorized int32->float conversion
+ * - Vectorized max reduction
+ * - Vectorized exp using fast approximation
+ * - Vectorized sum reduction
+ * - Vectorized quantization to int8
  */
 void softmax_int8(
     torch::Tensor x_tensor,         // [M, N] int32 input
@@ -826,50 +870,118 @@ void softmax_int8(
 
     omp_set_num_threads(num_threads);
 
+    // Pad N to 16 for aligned AVX-512 operations
+    const int N_padded = ((N + 15) / 16) * 16;
+
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
         const int32_t* x_row = x + m * N;
         int8_t* y_row = y + m * N;
         float x_scale = x_scales[m];
+        __m512 scale_vec = _mm512_set1_ps(x_scale);
 
-        // Step 1: Convert to float and find max (for numerical stability)
-        float max_val = -INFINITY;
-        for (int n = 0; n < N; n++) {
+        // Allocate aligned buffer for float values
+        float* float_vals = (float*)aligned_alloc(64, N_padded * sizeof(float));
+
+        // Step 1: Convert int32 to float and find max (vectorized)
+        __m512 max_vec = _mm512_set1_ps(-INFINITY);
+
+        int n = 0;
+        for (; n + 15 < N; n += 16) {
+            __m512i int_vals = _mm512_loadu_si512((__m512i*)(x_row + n));
+            __m512 float_v = _mm512_cvtepi32_ps(int_vals);
+            float_v = _mm512_mul_ps(float_v, scale_vec);
+            _mm512_store_ps(float_vals + n, float_v);
+            max_vec = _mm512_max_ps(max_vec, float_v);
+        }
+        // Handle remainder
+        float max_val = _mm512_reduce_max_ps(max_vec);
+        for (; n < N; n++) {
             float val = static_cast<float>(x_row[n]) * x_scale;
-            if (val > max_val) max_val = val;
+            float_vals[n] = val;
+            max_val = std::max(max_val, val);
+        }
+        // Pad with -inf so exp gives 0
+        for (; n < N_padded; n++) {
+            float_vals[n] = -INFINITY;
         }
 
-        // Step 2: Compute exp(x - max) and sum
-        float sum = 0.0f;
-        alignas(64) float exp_vals[N];
-        for (int n = 0; n < N; n++) {
-            float val = static_cast<float>(x_row[n]) * x_scale;
-            exp_vals[n] = std::exp(val - max_val);
-            sum += exp_vals[n];
-        }
+        // Step 2: Compute exp(x - max) and sum (vectorized)
+        __m512 max_broadcast = _mm512_set1_ps(max_val);
+        __m512 sum_vec = _mm512_setzero_ps();
 
-        // Step 3: Normalize and quantize to int8
-        // Softmax output is in [0, 1], we quantize to [0, 127]
+        n = 0;
+        for (; n + 15 < N_padded; n += 16) {
+            __m512 vals = _mm512_load_ps(float_vals + n);
+            __m512 shifted = _mm512_sub_ps(vals, max_broadcast);
+            __m512 exp_v = avx512_exp_fast(shifted);
+            _mm512_store_ps(float_vals + n, exp_v);
+            sum_vec = _mm512_add_ps(sum_vec, exp_v);
+        }
+        float sum = _mm512_reduce_add_ps(sum_vec);
+
+        // Step 3: Normalize and quantize to int8 (vectorized)
         float inv_sum = 1.0f / sum;
         y_scales[m] = 1.0f / 127.0f;  // Output scale: int8 * scale = probability
 
-        for (int n = 0; n < N; n++) {
-            float prob = exp_vals[n] * inv_sum;
-            // Quantize: prob in [0,1] -> int8 in [0, 127]
+        __m512 inv_sum_vec = _mm512_set1_ps(inv_sum);
+        __m512 scale_127 = _mm512_set1_ps(127.0f);
+        __m512 zero_vec = _mm512_setzero_ps();
+
+        n = 0;
+        for (; n + 15 < N; n += 16) {
+            __m512 exp_v = _mm512_load_ps(float_vals + n);
+            __m512 prob = _mm512_mul_ps(exp_v, inv_sum_vec);
+            __m512 scaled = _mm512_mul_ps(prob, scale_127);
+            // Clamp to [0, 127]
+            scaled = _mm512_max_ps(scaled, zero_vec);
+            scaled = _mm512_min_ps(scaled, scale_127);
+            // Round and convert to int32
+            scaled = _mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT);
+            __m512i int_vals = _mm512_cvtps_epi32(scaled);
+            // Pack to int8 (saturating)
+            __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+            _mm_storeu_si128((__m128i*)(y_row + n), packed);
+        }
+        // Handle remainder
+        for (; n < N; n++) {
+            float prob = float_vals[n] * inv_sum;
             int8_t q_val = static_cast<int8_t>(std::min(127.0f, std::round(prob * 127.0f)));
             y_row[n] = q_val;
         }
+
+        free(float_vals);
     }
 }
 
 /**
- * SwiGLU activation with int8 output
+ * Fast AVX-512 sigmoid approximation
+ * sigmoid(x) = 1 / (1 + exp(-x))
+ */
+inline __m512 avx512_sigmoid_fast(__m512 x) {
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    __m512 neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x);
+    __m512 exp_neg_x = avx512_exp_fast(neg_x);
+    __m512 one = _mm512_set1_ps(1.0f);
+    __m512 denom = _mm512_add_ps(one, exp_neg_x);
+    return _mm512_div_ps(one, denom);
+}
+
+/**
+ * SwiGLU activation with int8 output - AVX-512 Vectorized
  *
  * SwiGLU(x) = SiLU(x1) * x2 where x is split in half
  * SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
  *
  * Takes int32 input [M, N] where N is the full width (e.g., 16384)
  * Outputs int8 [M, N/2] after SwiGLU (e.g., 8192)
+ *
+ * AVX-512 optimizations:
+ * - Vectorized int32->float conversion
+ * - Vectorized sigmoid using fast exp approximation
+ * - Vectorized SiLU and multiply
+ * - Vectorized max abs reduction
+ * - Vectorized quantization to int8
  */
 void swiglu_int8(
     torch::Tensor x_tensor,         // [M, N] int32 input (N = 2 * hidden)
@@ -885,6 +997,7 @@ void swiglu_int8(
     float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
 
     const int half_N = N / 2;
+    const int half_N_padded = ((half_N + 15) / 16) * 16;
 
     omp_set_num_threads(num_threads);
 
@@ -893,54 +1006,95 @@ void swiglu_int8(
         const int32_t* x_row = x + m * N;
         int8_t* y_row = y + m * half_N;
         float x_scale = x_scales[m];
+        __m512 scale_vec = _mm512_set1_ps(x_scale);
 
-        // First pass: compute SwiGLU and find max for quantization
-        float max_abs = 0.0f;
-        alignas(64) float result[half_N];
+        // Allocate aligned buffer for results
+        float* result = (float*)aligned_alloc(64, half_N_padded * sizeof(float));
 
-        for (int n = 0; n < half_N; n++) {
-            // x1 = first half, x2 = second half
+        // First pass: compute SwiGLU and find max for quantization (vectorized)
+        __m512 max_abs_vec = _mm512_setzero_ps();
+
+        int n = 0;
+        for (; n + 15 < half_N; n += 16) {
+            // Load x1 (first half) and x2 (second half)
+            __m512i x1_int = _mm512_loadu_si512((__m512i*)(x_row + n));
+            __m512i x2_int = _mm512_loadu_si512((__m512i*)(x_row + n + half_N));
+
+            // Convert to float
+            __m512 x1 = _mm512_mul_ps(_mm512_cvtepi32_ps(x1_int), scale_vec);
+            __m512 x2 = _mm512_mul_ps(_mm512_cvtepi32_ps(x2_int), scale_vec);
+
+            // SiLU(x1) = x1 * sigmoid(x1)
+            __m512 sigmoid_x1 = avx512_sigmoid_fast(x1);
+            __m512 silu_x1 = _mm512_mul_ps(x1, sigmoid_x1);
+
+            // SwiGLU = SiLU(x1) * x2
+            __m512 swiglu_result = _mm512_mul_ps(silu_x1, x2);
+            _mm512_store_ps(result + n, swiglu_result);
+
+            // Track max abs
+            __m512 abs_result = _mm512_abs_ps(swiglu_result);
+            max_abs_vec = _mm512_max_ps(max_abs_vec, abs_result);
+        }
+
+        // Handle remainder (scalar)
+        float max_abs = _mm512_reduce_max_ps(max_abs_vec);
+        for (; n < half_N; n++) {
             float x1 = static_cast<float>(x_row[n]) * x_scale;
             float x2 = static_cast<float>(x_row[n + half_N]) * x_scale;
 
-            // SiLU(x1) = x1 * sigmoid(x1) = x1 / (1 + exp(-x1))
             float sigmoid_x1 = 1.0f / (1.0f + std::exp(-x1));
             float silu_x1 = x1 * sigmoid_x1;
-
-            // SwiGLU = SiLU(x1) * x2
             result[n] = silu_x1 * x2;
 
-            float abs_val = std::abs(result[n]);
-            if (abs_val > max_abs) max_abs = abs_val;
+            max_abs = std::max(max_abs, std::abs(result[n]));
         }
 
-        // Quantize to int8
+        // Quantize to int8 (vectorized)
         float y_scale = max_abs / 127.0f;
         if (y_scale == 0.0f) y_scale = 1.0f;
         y_scales[m] = y_scale;
 
+        __m512 inv_scale_vec = _mm512_set1_ps(1.0f / y_scale);
+        __m512 min_val = _mm512_set1_ps(-127.0f);
+        __m512 max_val = _mm512_set1_ps(127.0f);
+
+        n = 0;
+        for (; n + 15 < half_N; n += 16) {
+            __m512 vals = _mm512_load_ps(result + n);
+            vals = _mm512_mul_ps(vals, inv_scale_vec);
+            // Clamp to [-127, 127]
+            vals = _mm512_max_ps(vals, min_val);
+            vals = _mm512_min_ps(vals, max_val);
+            // Round and convert to int32
+            vals = _mm512_roundscale_ps(vals, _MM_FROUND_TO_NEAREST_INT);
+            __m512i int_vals = _mm512_cvtps_epi32(vals);
+            // Pack to int8 (saturating)
+            __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+            _mm_storeu_si128((__m128i*)(y_row + n), packed);
+        }
+
+        // Handle remainder (scalar)
         float inv_scale = 1.0f / y_scale;
-        for (int n = 0; n < half_N; n++) {
+        for (; n < half_N; n++) {
             float val = result[n] * inv_scale;
             val = std::max(-127.0f, std::min(127.0f, val));
             y_row[n] = static_cast<int8_t>(std::round(val));
         }
+
+        free(result);
     }
 }
 
 /**
- * Native Multi-Head Attention in int8/int32
+ * AVX-512 Vectorized Multi-Head Attention
  *
  * Computes: Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
  *
- * All operations stay in int8/int32:
- * - Q, K, V inputs are int8 [M, num_heads, head_dim]
- * - Q @ K^T computed in int32
- * - Softmax outputs int8 attention weights
- * - attn_weights @ V computed in int32
- * - Final output quantized to int8
- *
- * This avoids float32 conversions in the attention computation.
+ * Fully vectorized with AVX-512:
+ * - Q @ K^T uses vectorized dot products
+ * - Softmax uses fast exp approximation
+ * - @V uses FMA operations
  */
 void attention_int8(
     torch::Tensor q_tensor,         // [M, num_heads * head_dim] int8
@@ -965,6 +1119,7 @@ void attention_int8(
     float* __restrict__ out_scales = out_scale_tensor.data_ptr<float>();
 
     const int hidden_dim = num_heads * head_dim;
+    const int head_dim_padded = ((head_dim + 63) / 64) * 64;
 
     omp_set_num_threads(num_threads);
 
@@ -974,24 +1129,59 @@ void attention_int8(
         float q_scale = q_scales[m];
         int8_t* out_row = out + m * hidden_dim;
 
-        // Allocate per-row buffers
-        float* attn_scores = (float*)aligned_alloc(64, M * num_heads * sizeof(float));
-        float* attn_probs = (float*)aligned_alloc(64, M * num_heads * sizeof(float));
-        float* attn_out = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
+        // Allocate per-thread buffers (aligned for AVX-512)
+        float* attn_scores = (float*)aligned_alloc(64, ((M * num_heads + 15) / 16) * 16 * sizeof(float));
+        float* attn_probs = (float*)aligned_alloc(64, ((M * num_heads + 15) / 16) * 16 * sizeof(float));
+        float* attn_out = (float*)aligned_alloc(64, ((hidden_dim + 15) / 16) * 16 * sizeof(float));
 
         // For each head
         for (int h = 0; h < num_heads; h++) {
             const int8_t* q_head = q_row + h * head_dim;
 
-            // Step 1: Compute Q @ K^T for this head
-            // attn_scores[h, n] = sum_d(Q[m, h, d] * K[n, h, d]) * scale
+            // ============================================================
+            // Step 1: Q @ K^T with AVX-512 vectorized dot product
+            // ============================================================
             for (int n = 0; n < M; n++) {
                 const int8_t* k_row = k + n * hidden_dim;
                 const int8_t* k_head = k_row + h * head_dim;
                 float k_scale = k_scales[n];
 
-                int32_t dot = 0;
-                for (int d = 0; d < head_dim; d++) {
+                // Vectorized dot product using AVX-512
+                __m512i acc = _mm512_setzero_si512();
+
+                int d = 0;
+                // Process 64 elements at a time using VNNI-style computation
+                for (; d + 63 < head_dim; d += 64) {
+                    // Load Q and K as int8
+                    __m512i q_vec = _mm512_loadu_si512((__m512i*)(q_head + d));
+                    __m512i k_vec = _mm512_loadu_si512((__m512i*)(k_head + d));
+
+                    // Convert to int16 and multiply (avoiding overflow)
+                    // Split into low and high 256-bit parts
+                    __m256i q_lo = _mm512_extracti32x8_epi32(q_vec, 0);
+                    __m256i q_hi = _mm512_extracti32x8_epi32(q_vec, 1);
+                    __m256i k_lo = _mm512_extracti32x8_epi32(k_vec, 0);
+                    __m256i k_hi = _mm512_extracti32x8_epi32(k_vec, 1);
+
+                    // Extend to int16
+                    __m512i q_lo_16 = _mm512_cvtepi8_epi16(q_lo);
+                    __m512i q_hi_16 = _mm512_cvtepi8_epi16(q_hi);
+                    __m512i k_lo_16 = _mm512_cvtepi8_epi16(k_lo);
+                    __m512i k_hi_16 = _mm512_cvtepi8_epi16(k_hi);
+
+                    // Multiply and accumulate
+                    __m512i prod_lo = _mm512_madd_epi16(q_lo_16, k_lo_16);
+                    __m512i prod_hi = _mm512_madd_epi16(q_hi_16, k_hi_16);
+
+                    acc = _mm512_add_epi32(acc, prod_lo);
+                    acc = _mm512_add_epi32(acc, prod_hi);
+                }
+
+                // Horizontal sum
+                int32_t dot = _mm512_reduce_add_epi32(acc);
+
+                // Handle remainder
+                for (; d < head_dim; d++) {
                     dot += static_cast<int32_t>(q_head[d]) * static_cast<int32_t>(k_head[d]);
                 }
 
@@ -1000,53 +1190,144 @@ void attention_int8(
                 attn_scores[n * num_heads + h] = score;
             }
 
-            // Step 2: Softmax over keys (dimension n) for this head
-            float max_score = -INFINITY;
-            for (int n = 0; n < M; n++) {
-                if (attn_scores[n * num_heads + h] > max_score) {
-                    max_score = attn_scores[n * num_heads + h];
+            // ============================================================
+            // Step 2: Softmax with AVX-512 vectorized exp
+            // ============================================================
+
+            // Find max (vectorized)
+            __m512 max_vec = _mm512_set1_ps(-INFINITY);
+            int n = 0;
+            for (; n + 15 < M; n += 16) {
+                // Gather scores for this head across 16 positions
+                // Note: scores are interleaved by num_heads
+                __m512 scores;
+                alignas(64) float temp[16];
+                for (int i = 0; i < 16; i++) {
+                    temp[i] = attn_scores[(n + i) * num_heads + h];
+                }
+                scores = _mm512_load_ps(temp);
+                max_vec = _mm512_max_ps(max_vec, scores);
+            }
+            float max_score = _mm512_reduce_max_ps(max_vec);
+            for (; n < M; n++) {
+                max_score = std::max(max_score, attn_scores[n * num_heads + h]);
+            }
+
+            // Compute exp and sum (vectorized)
+            __m512 sum_vec = _mm512_setzero_ps();
+            __m512 max_broadcast = _mm512_set1_ps(max_score);
+
+            n = 0;
+            for (; n + 15 < M; n += 16) {
+                alignas(64) float temp[16];
+                for (int i = 0; i < 16; i++) {
+                    temp[i] = attn_scores[(n + i) * num_heads + h];
+                }
+                __m512 scores = _mm512_load_ps(temp);
+                __m512 shifted = _mm512_sub_ps(scores, max_broadcast);
+                __m512 exp_val = avx512_exp_fast(shifted);
+                _mm512_store_ps(temp, exp_val);
+                for (int i = 0; i < 16; i++) {
+                    attn_probs[(n + i) * num_heads + h] = temp[i];
+                }
+                sum_vec = _mm512_add_ps(sum_vec, exp_val);
+            }
+            float sum_exp = _mm512_reduce_add_ps(sum_vec);
+            for (; n < M; n++) {
+                float exp_val = std::exp(attn_scores[n * num_heads + h] - max_score);
+                attn_probs[n * num_heads + h] = exp_val;
+                sum_exp += exp_val;
+            }
+
+            // Normalize
+            float inv_sum = 1.0f / sum_exp;
+            __m512 inv_sum_vec = _mm512_set1_ps(inv_sum);
+            n = 0;
+            for (; n + 15 < M; n += 16) {
+                alignas(64) float temp[16];
+                for (int i = 0; i < 16; i++) {
+                    temp[i] = attn_probs[(n + i) * num_heads + h];
+                }
+                __m512 probs = _mm512_load_ps(temp);
+                probs = _mm512_mul_ps(probs, inv_sum_vec);
+                _mm512_store_ps(temp, probs);
+                for (int i = 0; i < 16; i++) {
+                    attn_probs[(n + i) * num_heads + h] = temp[i];
                 }
             }
-
-            float sum_exp = 0.0f;
-            for (int n = 0; n < M; n++) {
-                attn_probs[n * num_heads + h] = std::exp(attn_scores[n * num_heads + h] - max_score);
-                sum_exp += attn_probs[n * num_heads + h];
-            }
-
-            float inv_sum = 1.0f / sum_exp;
-            for (int n = 0; n < M; n++) {
+            for (; n < M; n++) {
                 attn_probs[n * num_heads + h] *= inv_sum;
             }
 
-            // Step 3: Compute attn_probs @ V for this head
-            // out[m, h, d] = sum_n(attn_probs[m, h, n] * V[n, h, d])
+            // ============================================================
+            // Step 3: attn_probs @ V with vectorized FMA
+            // ============================================================
             for (int d = 0; d < head_dim; d++) {
-                float sum = 0.0f;
-                for (int n = 0; n < M; n++) {
+                __m512 acc_vec = _mm512_setzero_ps();
+
+                n = 0;
+                for (; n + 15 < M; n += 16) {
+                    // Gather attention probs
+                    alignas(64) float prob_temp[16];
+                    alignas(64) float v_temp[16];
+                    for (int i = 0; i < 16; i++) {
+                        prob_temp[i] = attn_probs[(n + i) * num_heads + h];
+                        const int8_t* v_row = v + (n + i) * hidden_dim;
+                        v_temp[i] = static_cast<float>(v_row[h * head_dim + d]) * v_scales[n + i];
+                    }
+                    __m512 prob_vec = _mm512_load_ps(prob_temp);
+                    __m512 v_vec = _mm512_load_ps(v_temp);
+                    acc_vec = _mm512_fmadd_ps(prob_vec, v_vec, acc_vec);
+                }
+
+                float sum = _mm512_reduce_add_ps(acc_vec);
+                for (; n < M; n++) {
                     const int8_t* v_row = v + n * hidden_dim;
-                    float v_scale = v_scales[n];
-                    float v_val = static_cast<float>(v_row[h * head_dim + d]) * v_scale;
+                    float v_val = static_cast<float>(v_row[h * head_dim + d]) * v_scales[n];
                     sum += attn_probs[n * num_heads + h] * v_val;
                 }
                 attn_out[h * head_dim + d] = sum;
             }
         }
 
-        // Step 4: Quantize output to int8
-        float max_abs = 0.0f;
-        for (int i = 0; i < hidden_dim; i++) {
-            float abs_val = std::abs(attn_out[i]);
-            if (abs_val > max_abs) max_abs = abs_val;
+        // ============================================================
+        // Step 4: Quantize output to int8 (vectorized)
+        // ============================================================
+        __m512 max_abs_vec = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 15 < hidden_dim; i += 16) {
+            __m512 vals = _mm512_loadu_ps(attn_out + i);
+            __m512 abs_vals = _mm512_abs_ps(vals);
+            max_abs_vec = _mm512_max_ps(max_abs_vec, abs_vals);
+        }
+        float max_abs = _mm512_reduce_max_ps(max_abs_vec);
+        for (; i < hidden_dim; i++) {
+            max_abs = std::max(max_abs, std::abs(attn_out[i]));
         }
 
-        float out_scale = max_abs / 127.0f;
-        if (out_scale == 0.0f) out_scale = 1.0f;
-        out_scales[m] = out_scale;
+        float out_scale_val = max_abs / 127.0f;
+        if (out_scale_val == 0.0f) out_scale_val = 1.0f;
+        out_scales[m] = out_scale_val;
 
-        float inv_scale = 1.0f / out_scale;
-        for (int i = 0; i < hidden_dim; i++) {
-            float val = attn_out[i] * inv_scale;
+        __m512 inv_scale_vec = _mm512_set1_ps(1.0f / out_scale_val);
+        __m512 min_val = _mm512_set1_ps(-127.0f);
+        __m512 max_val = _mm512_set1_ps(127.0f);
+
+        i = 0;
+        for (; i + 15 < hidden_dim; i += 16) {
+            __m512 vals = _mm512_loadu_ps(attn_out + i);
+            vals = _mm512_mul_ps(vals, inv_scale_vec);
+            vals = _mm512_max_ps(vals, min_val);
+            vals = _mm512_min_ps(vals, max_val);
+            vals = _mm512_roundscale_ps(vals, _MM_FROUND_TO_NEAREST_INT);
+            __m512i int_vals = _mm512_cvtps_epi32(vals);
+
+            // Pack to int8
+            __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+            _mm_storeu_si128((__m128i*)(out_row + i), packed);
+        }
+        for (; i < hidden_dim; i++) {
+            float val = attn_out[i] / out_scale_val;
             val = std::max(-127.0f, std::min(127.0f, val));
             out_row[i] = static_cast<int8_t>(std::round(val));
         }
