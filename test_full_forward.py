@@ -156,8 +156,8 @@ def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     """
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
 
-    # Use v4 kernel for large N (better parallelization)
-    if N >= 4096:
+    # Use v4 kernel for large N or large K with small M
+    if N >= 4096 or (K >= 4096 and M <= 32):
         kernel.matmul_free_vnni_v4_large_n(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
         )
