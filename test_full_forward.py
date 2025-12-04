@@ -152,13 +152,20 @@ def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     """
     Run ternary matmul with int32 output (no float conversion).
     Output stays in int32 for chaining with softmax/swiglu.
+    Uses v4 kernel for large N (MLP), v3 for smaller N.
     """
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
-    bias = torch.empty(0)  # No bias for int32 output
 
-    kernel.matmul_free_vnni_v3_int32_out(
-        x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, num_threads
-    )
+    # Use v4 kernel for large N (better parallelization)
+    if N >= 4096:
+        kernel.matmul_free_vnni_v4_large_n(
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
+        )
+    else:
+        bias = torch.empty(0)
+        kernel.matmul_free_vnni_v3_int32_out(
+            x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, num_threads
+        )
 
     return y_int32
 
