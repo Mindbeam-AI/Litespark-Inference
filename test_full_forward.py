@@ -21,7 +21,6 @@ import json
 import platform
 import os
 import gc
-import resource
 from pathlib import Path
 from datetime import datetime
 from torch.utils.cpp_extension import load
@@ -363,12 +362,9 @@ USE_FUSED_MLP = False  # DISABLED - fused kernel is slower than separate kernels
 FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
 
 # Flag to enable new fusion strategies
-# Set via command line: python test_full_forward.py --no-fusion
-import sys
-_use_fusion = '--no-fusion' not in sys.argv
-USE_FUSED_MATMUL_SOFTMAX = _use_fusion  # Fuse matmul + softmax (eliminates int32 writes)
-USE_FUSED_QKV = _use_fusion  # Fuse Q,K,V projections (reads input once)
-USE_FUSED_MATMUL_QUANTIZE = _use_fusion  # Fuse down matmul + quantize
+USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
+USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
+USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
 
 
 # ============================================================================
@@ -634,36 +630,25 @@ class FullTransformerPyTorch:
 # ============================================================================
 
 def benchmark_forward(model, x, warmup=WARMUP_ITERS, iters=BENCH_ITERS):
-    """Benchmark forward pass with memory tracking"""
+    """Benchmark forward pass"""
     # Warmup
     for _ in range(warmup):
         _ = model.forward(x.clone())
 
     gc.collect()
 
-    # Get baseline memory before benchmark
-    baseline_mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-
     # Benchmark
     times = []
-    for i in range(iters):
+    for _ in range(iters):
         x_input = x.clone()
         start = time.perf_counter()
         _ = model.forward(x_input)
         end = time.perf_counter()
         times.append((end - start) * 1000)  # ms
 
-    # Get peak memory after benchmark (on macOS ru_maxrss is in bytes, on Linux it's in KB)
-    peak_mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if platform.system() == 'Darwin':
-        peak_memory_mb = peak_mem / (1024 * 1024)  # bytes to MB
-    else:
-        peak_memory_mb = peak_mem / 1024  # KB to MB
-
     return {
         'mean_ms': np.mean(times),
         'std_ms': np.std(times),
-        'peak_memory_mb': peak_memory_mb,
         'min_ms': np.min(times),
         'max_ms': np.max(times),
     }
@@ -739,7 +724,6 @@ def run_benchmarks():
         pytorch_gflops = (total_flops / 1e9) / (pytorch_results['mean_ms'] / 1000)
         print(f"  Time: {pytorch_results['mean_ms']:.2f} ± {pytorch_results['std_ms']:.2f} ms")
         print(f"  Throughput: {pytorch_gflops:.1f} GFLOPS")
-        print(f"  Peak Memory: {pytorch_results['peak_memory_mb']:.1f} MB")
 
         # Benchmark Native
         print(f"\nBenchmarking Native ({KERNEL_NAME})...")
@@ -747,7 +731,6 @@ def run_benchmarks():
         native_gflops = (total_flops / 1e9) / (native_results['mean_ms'] / 1000)
         print(f"  Time: {native_results['mean_ms']:.2f} ± {native_results['std_ms']:.2f} ms")
         print(f"  Throughput: {native_gflops:.1f} GFLOPS")
-        print(f"  Peak Memory: {native_results['peak_memory_mb']:.1f} MB")
 
         # Speedup
         speedup = pytorch_results['mean_ms'] / native_results['mean_ms']
@@ -760,13 +743,11 @@ def run_benchmarks():
                 'time_ms': pytorch_results['mean_ms'],
                 'std_ms': pytorch_results['std_ms'],
                 'gflops': pytorch_gflops,
-                'peak_memory_mb': pytorch_results['peak_memory_mb'],
             },
             'native': {
                 'time_ms': native_results['mean_ms'],
                 'std_ms': native_results['std_ms'],
                 'gflops': native_gflops,
-                'peak_memory_mb': native_results['peak_memory_mb'],
             },
             'speedup': speedup,
         }
@@ -777,12 +758,12 @@ def run_benchmarks():
 def print_summary(results):
     """Print summary table"""
     print("\n")
-    print("=" * 95)
+    print("=" * 70)
     print("SUMMARY: 24-Layer Transformer Forward Pass (Native Kernels)")
-    print("=" * 95)
+    print("=" * 70)
     print()
-    print(f"{'Batch Size':<12} {'PyTorch (ms)':<14} {'Native (ms)':<14} {'Speedup':<10} {'GFLOPS':<10} {'PT Mem (MB)':<12} {'Native Mem':<12}")
-    print("-" * 95)
+    print(f"{'Batch Size':<12} {'PyTorch (ms)':<15} {'Native (ms)':<15} {'Speedup':<10} {'GFLOPS':<10}")
+    print("-" * 70)
 
     for key, data in results.items():
         M = data['batch_size']
@@ -790,9 +771,7 @@ def print_summary(results):
         native_time = data['native']['time_ms']
         speedup = data['speedup']
         gflops = data['native']['gflops']
-        pt_mem = data['pytorch']['peak_memory_mb']
-        native_mem = data['native']['peak_memory_mb']
-        print(f"M={M:<10} {pt_time:<14.2f} {native_time:<14.2f} {speedup:<10.2f}x {gflops:<10.1f} {pt_mem:<12.1f} {native_mem:<12.1f}")
+        print(f"M={M:<10} {pt_time:<15.2f} {native_time:<15.2f} {speedup:<10.2f}x {gflops:<10.1f}")
 
 
 def save_results(results):
