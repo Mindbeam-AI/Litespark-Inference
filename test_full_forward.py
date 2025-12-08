@@ -177,6 +177,10 @@ else:
     KERNEL_NAME = "VNNI v3 Native"
     num_threads = torch.get_num_threads()
 
+    # Limit threads for better small batch performance
+    if num_threads > 8:
+        num_threads = 8  # Reduce thread overhead
+
 print(f"Loaded kernel: {KERNEL_NAME}")
 print(f"Using {num_threads} threads")
 print()
@@ -467,7 +471,7 @@ FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
 USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
 USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
 USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
-USE_FUSED_MATMUL_SWIGLU = True  # ENABLED - fuse matmul + SwiGLU to reduce memory traffic
+USE_FUSED_MATMUL_SWIGLU = False  # DISABLED - two-pass still slower than separate kernels
 
 
 # ============================================================================
