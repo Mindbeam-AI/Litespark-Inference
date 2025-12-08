@@ -1133,11 +1133,13 @@ void matmul_free_vnni_v3_fused_quantize(
 
     omp_set_num_threads(num_threads);
 
+    // Pre-allocate buffers for max M_TILE size to avoid malloc/free in loop
+    uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, M_TILE * K_padded);
+    float* row_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
+
     for (int m_tile = 0; m_tile < M; m_tile += M_TILE) {
         const int m_end = std::min(m_tile + M_TILE, M);
         const int m_tile_size = m_end - m_tile;
-
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
 
         #pragma omp parallel for schedule(static)
         for (int m = m_tile; m < m_end; m++) {
@@ -1159,9 +1161,6 @@ void matmul_free_vnni_v3_fused_quantize(
                 x_uint8[k] = 128;
             }
         }
-
-        // Allocate row buffers for all rows in this M tile
-        float* row_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
 
         // Compute matmul with N_TILE loop OUTSIDE parallel region
         // This keeps weight tiles in L2 cache across all M rows
@@ -1336,10 +1335,10 @@ void matmul_free_vnni_v3_fused_quantize(
                 y_row[n] = static_cast<int8_t>(std::round(val));
             }
         }
-
-        free(row_buffers);
-        free(x_uint8_tile);
     }
+
+    free(row_buffers);
+    free(x_uint8_tile);
 }
 
 /**
@@ -1392,6 +1391,12 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
     const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
 
     omp_set_num_threads(num_threads);
+
+    // Pre-allocate buffers for max M_TILE size to avoid malloc/free in loop
+    uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, M_TILE * K_padded);
+    float* q_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
+    float* k_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
+    float* v_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
 
     // Lambda to apply softmax and quantize a row buffer
     auto apply_softmax_quantize = [&](float* row_buffer, int8_t* y_row, float* y_scale, int row_idx) {
@@ -1451,14 +1456,6 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
     for (int m_tile = 0; m_tile < M; m_tile += M_TILE) {
         const int m_end = std::min(m_tile + M_TILE, M);
         const int m_tile_size = m_end - m_tile;
-
-        // Allocate activation buffer for this M tile (shared across Q, K, V)
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
-
-        // Allocate shared row buffers for all rows in this M tile
-        float* q_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
-        float* k_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
-        float* v_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
 
         // Convert activations once
         #pragma omp parallel for schedule(static)
@@ -1646,12 +1643,12 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
             apply_softmax_quantize(k_buffer, k_out + m * N, k_scales, m);
             apply_softmax_quantize(v_buffer, v_out + m * N, v_scales, m);
         }
-
-        free(q_buffers);
-        free(k_buffers);
-        free(v_buffers);
-        free(x_uint8_tile);
     }
+
+    free(q_buffers);
+    free(k_buffers);
+    free(v_buffers);
+    free(x_uint8_tile);
 }
 
 /**
@@ -1894,6 +1891,172 @@ void matmul_free_vnni_v5_large_m(
         } else {
             // Handle remainder (< 16 outputs)
             for (int n = n_start; n < n_end; n++) {
+                const int8_t* w_row = w_int8 + n * K_padded;
+                __m512i acc = _mm512_setzero_si512();
+
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                }
+
+                y_row[n] = _mm512_reduce_add_epi32(acc) - 128 * w_sum[n];
+            }
+        }
+    }
+
+    free(x_uint8_all);
+}
+
+/**
+ * v6 kernel: Cache-optimized for large N with v3-style tiling
+ *
+ * Uses the same pattern as v3 (N_TILE loop OUTSIDE parallel region)
+ * but optimized for very large N (e.g., N=16384 for MLP up projection).
+ *
+ * Key insight: v4 parallelizes over N blocks, but each thread processes all M rows
+ * for its block - this means weights for that block aren't shared across threads.
+ *
+ * v6 instead tiles over N in the outer loop, then parallelizes over M.
+ * This keeps the current N_TILE weights hot in L2 cache across all threads.
+ *
+ * For up_matmul [M=128, K=2048, N=16384]:
+ * - N_TILE=128: 128 × 2048 = 256KB per tile (fits L2)
+ * - 128 N_TILE iterations, each parallelizing 128 M rows
+ * - Much better cache behavior than v4
+ */
+void matmul_free_vnni_v6_large_n_tiled(
+    torch::Tensor x_int8_tensor,    // [M, K] int8
+    torch::Tensor scale_tensor,     // [M] float32
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8
+    torch::Tensor w_sum_tensor,     // [N] int32
+    torch::Tensor y_tensor,         // [M, N] int32 output
+    int M, int N, int K,
+    int num_threads
+) {
+    const int8_t* __restrict__ x_int8 = x_int8_tensor.data_ptr<int8_t>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ w_sum = w_sum_tensor.data_ptr<int32_t>();
+    int32_t* __restrict__ y = y_tensor.data_ptr<int32_t>();
+
+    const int K_padded = ((K + 63) / 64) * 64;
+
+    // Larger N_TILE for better cache utilization
+    // 128 × 2048 = 256KB per N_TILE, fits in L2
+    constexpr int N_TILE = 128;
+
+    omp_set_num_threads(num_threads);
+
+    // Pre-convert all activations to uint8
+    uint8_t* x_uint8_all = (uint8_t*)aligned_alloc(64, M * K_padded);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        uint8_t* x_uint8 = x_uint8_all + m * K_padded;
+        const int8_t* x_row = x_int8 + m * K;
+
+        const __m512i offset_vec = _mm512_set1_epi8((char)128);
+        int k = 0;
+        for (; k + 63 < K; k += 64) {
+            __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+            __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+            _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+        }
+        for (; k < K; k++) {
+            x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+        }
+        for (; k < K_padded; k++) {
+            x_uint8[k] = 128;
+        }
+    }
+
+    // N_TILE loop OUTSIDE parallel region - keeps weights hot in L2
+    for (int n_tile = 0; n_tile < N; n_tile += N_TILE) {
+        const int n_end_tile = std::min(n_tile + N_TILE, N);
+
+        // Parallelize over M rows - all threads share same weight tile
+        #pragma omp parallel for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const uint8_t* x_uint8 = x_uint8_all + m * K_padded;
+            int32_t* y_row = y + m * N;
+
+            // Process this N tile with 16-way register blocking
+            int n = n_tile;
+            for (; n + 15 < n_end_tile; n += 16) {
+                __m512i acc0 = _mm512_setzero_si512();
+                __m512i acc1 = _mm512_setzero_si512();
+                __m512i acc2 = _mm512_setzero_si512();
+                __m512i acc3 = _mm512_setzero_si512();
+                __m512i acc4 = _mm512_setzero_si512();
+                __m512i acc5 = _mm512_setzero_si512();
+                __m512i acc6 = _mm512_setzero_si512();
+                __m512i acc7 = _mm512_setzero_si512();
+                __m512i acc8 = _mm512_setzero_si512();
+                __m512i acc9 = _mm512_setzero_si512();
+                __m512i acc10 = _mm512_setzero_si512();
+                __m512i acc11 = _mm512_setzero_si512();
+                __m512i acc12 = _mm512_setzero_si512();
+                __m512i acc13 = _mm512_setzero_si512();
+                __m512i acc14 = _mm512_setzero_si512();
+                __m512i acc15 = _mm512_setzero_si512();
+
+                const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+                const int8_t* w4 = w_int8 + (n + 4) * K_padded;
+                const int8_t* w5 = w_int8 + (n + 5) * K_padded;
+                const int8_t* w6 = w_int8 + (n + 6) * K_padded;
+                const int8_t* w7 = w_int8 + (n + 7) * K_padded;
+                const int8_t* w8 = w_int8 + (n + 8) * K_padded;
+                const int8_t* w9 = w_int8 + (n + 9) * K_padded;
+                const int8_t* w10 = w_int8 + (n + 10) * K_padded;
+                const int8_t* w11 = w_int8 + (n + 11) * K_padded;
+                const int8_t* w12 = w_int8 + (n + 12) * K_padded;
+                const int8_t* w13 = w_int8 + (n + 13) * K_padded;
+                const int8_t* w14 = w_int8 + (n + 14) * K_padded;
+                const int8_t* w15 = w_int8 + (n + 15) * K_padded;
+
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                    acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                    acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                    acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+                    acc4 = _mm512_dpbusd_epi32(acc4, x_vec, _mm512_loadu_si512((__m512i*)(w4 + kk)));
+                    acc5 = _mm512_dpbusd_epi32(acc5, x_vec, _mm512_loadu_si512((__m512i*)(w5 + kk)));
+                    acc6 = _mm512_dpbusd_epi32(acc6, x_vec, _mm512_loadu_si512((__m512i*)(w6 + kk)));
+                    acc7 = _mm512_dpbusd_epi32(acc7, x_vec, _mm512_loadu_si512((__m512i*)(w7 + kk)));
+                    acc8 = _mm512_dpbusd_epi32(acc8, x_vec, _mm512_loadu_si512((__m512i*)(w8 + kk)));
+                    acc9 = _mm512_dpbusd_epi32(acc9, x_vec, _mm512_loadu_si512((__m512i*)(w9 + kk)));
+                    acc10 = _mm512_dpbusd_epi32(acc10, x_vec, _mm512_loadu_si512((__m512i*)(w10 + kk)));
+                    acc11 = _mm512_dpbusd_epi32(acc11, x_vec, _mm512_loadu_si512((__m512i*)(w11 + kk)));
+                    acc12 = _mm512_dpbusd_epi32(acc12, x_vec, _mm512_loadu_si512((__m512i*)(w12 + kk)));
+                    acc13 = _mm512_dpbusd_epi32(acc13, x_vec, _mm512_loadu_si512((__m512i*)(w13 + kk)));
+                    acc14 = _mm512_dpbusd_epi32(acc14, x_vec, _mm512_loadu_si512((__m512i*)(w14 + kk)));
+                    acc15 = _mm512_dpbusd_epi32(acc15, x_vec, _mm512_loadu_si512((__m512i*)(w15 + kk)));
+                }
+
+                // Reduce and store
+                y_row[n + 0] = _mm512_reduce_add_epi32(acc0) - 128 * w_sum[n + 0];
+                y_row[n + 1] = _mm512_reduce_add_epi32(acc1) - 128 * w_sum[n + 1];
+                y_row[n + 2] = _mm512_reduce_add_epi32(acc2) - 128 * w_sum[n + 2];
+                y_row[n + 3] = _mm512_reduce_add_epi32(acc3) - 128 * w_sum[n + 3];
+                y_row[n + 4] = _mm512_reduce_add_epi32(acc4) - 128 * w_sum[n + 4];
+                y_row[n + 5] = _mm512_reduce_add_epi32(acc5) - 128 * w_sum[n + 5];
+                y_row[n + 6] = _mm512_reduce_add_epi32(acc6) - 128 * w_sum[n + 6];
+                y_row[n + 7] = _mm512_reduce_add_epi32(acc7) - 128 * w_sum[n + 7];
+                y_row[n + 8] = _mm512_reduce_add_epi32(acc8) - 128 * w_sum[n + 8];
+                y_row[n + 9] = _mm512_reduce_add_epi32(acc9) - 128 * w_sum[n + 9];
+                y_row[n + 10] = _mm512_reduce_add_epi32(acc10) - 128 * w_sum[n + 10];
+                y_row[n + 11] = _mm512_reduce_add_epi32(acc11) - 128 * w_sum[n + 11];
+                y_row[n + 12] = _mm512_reduce_add_epi32(acc12) - 128 * w_sum[n + 12];
+                y_row[n + 13] = _mm512_reduce_add_epi32(acc13) - 128 * w_sum[n + 13];
+                y_row[n + 14] = _mm512_reduce_add_epi32(acc14) - 128 * w_sum[n + 14];
+                y_row[n + 15] = _mm512_reduce_add_epi32(acc15) - 128 * w_sum[n + 15];
+            }
+
+            // Handle remainder
+            for (; n < n_end_tile; n++) {
                 const int8_t* w_row = w_int8 + n * K_padded;
                 __m512i acc = _mm512_setzero_si512();
 
@@ -4300,4 +4463,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "VNNI v3 fused Q,K,V projection + softmax (reads input once)");
     m.def("matmul_free_vnni_v3_fused_swiglu", &matmul_free_vnni_v3_fused_swiglu,
           "VNNI v3 fused matmul + SwiGLU (eliminates 16384 int32 intermediate)");
+    m.def("matmul_free_vnni_v6_large_n_tiled", &matmul_free_vnni_v6_large_n_tiled,
+          "VNNI v6 cache-optimized for large N (N_TILE outside parallel)");
 }

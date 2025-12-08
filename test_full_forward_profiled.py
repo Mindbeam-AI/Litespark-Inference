@@ -182,10 +182,16 @@ def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K, op_name):
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
 
     # Kernel selection:
-    # - v4: Large N (parallelizes over N blocks) - good for up_matmul
+    # - v6: Large N with M>=64 (N_TILE outside parallel, better cache)
+    # - v4: Large N with small M (parallelizes over N blocks)
     # - v5: Large M (parallelizes over M×N tiles) - good for down_matmul
     # - v3: Default for small M and small N
-    if N >= 4096:
+    if N >= 4096 and M >= 64:
+        # Large N with moderate M: use v6 (N_TILE outside parallel for cache reuse)
+        kernel.matmul_free_vnni_v6_large_n_tiled(
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
+        )
+    elif N >= 4096:
         kernel.matmul_free_vnni_v4_large_n(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
         )

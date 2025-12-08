@@ -154,14 +154,20 @@ def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     Output stays in int32 for chaining with softmax/swiglu.
 
     Kernel selection:
-    - v4: Large N (parallelizes over N blocks) - good for up_matmul
+    - v6: Large N with M>=64 (N_TILE outside parallel, better cache)
+    - v4: Large N with small M (parallelizes over N blocks)
     - v5: Large M (parallelizes over M×N tiles) - good for down_matmul
     - v3: Default for small M and small N
     """
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
 
-    if N >= 4096:
-        # Large N: use v4 (parallelizes over N blocks)
+    if N >= 4096 and M >= 64:
+        # Large N with moderate M: use v6 (N_TILE outside parallel for cache reuse)
+        kernel.matmul_free_vnni_v6_large_n_tiled(
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
+        )
+    elif N >= 4096:
+        # Large N with small M: use v4 (parallelizes over N blocks)
         kernel.matmul_free_vnni_v4_large_n(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
         )
