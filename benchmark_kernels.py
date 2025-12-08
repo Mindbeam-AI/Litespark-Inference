@@ -150,18 +150,18 @@ def test_matmul_kernels(M, K, N, label):
         kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_out, bias, M, N, K, num_threads)
     results['v3'] = benchmark_kernel(run_v3)
 
-    # v4 (large N)
+    # v4 (large N) - outputs int32
     if N >= 1024:
-        y_out = torch.zeros(M, N, dtype=torch.float32)
+        y_out_i32 = torch.zeros(M, N, dtype=torch.int32)
         def run_v4():
-            kernel.matmul_free_vnni_v4_large_n(x_int8, x_scale, w_int8, w_sum, y_out, M, N, K, num_threads)
+            kernel.matmul_free_vnni_v4_large_n(x_int8, x_scale, w_int8, w_sum, y_out_i32, M, N, K, num_threads)
         results['v4_large_n'] = benchmark_kernel(run_v4)
 
-    # v5 (large M)
+    # v5 (large M) - outputs int32
     if M >= 32:
-        y_out = torch.zeros(M, N, dtype=torch.float32)
+        y_out_i32 = torch.zeros(M, N, dtype=torch.int32)
         def run_v5():
-            kernel.matmul_free_vnni_v5_large_m(x_int8, x_scale, w_int8, w_sum, y_out, M, N, K, num_threads)
+            kernel.matmul_free_vnni_v5_large_m(x_int8, x_scale, w_int8, w_sum, y_out_i32, M, N, K, num_threads)
         results['v5_large_m'] = benchmark_kernel(run_v5)
 
     # Print results
@@ -329,17 +329,17 @@ def test_mlp_up_kernels(M, K, N, label):
         kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_out, bias, M, N, K, num_threads)
     results['v3'] = benchmark_kernel(run_v3)
 
-    # v4 (designed for large N)
-    y_out = torch.zeros(M, N, dtype=torch.float32)
+    # v4 (designed for large N) - outputs int32
+    y_out_i32 = torch.zeros(M, N, dtype=torch.int32)
     def run_v4():
-        kernel.matmul_free_vnni_v4_large_n(x_int8, x_scale, w_int8, w_sum, y_out, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v4_large_n(x_int8, x_scale, w_int8, w_sum, y_out_i32, M, N, K, num_threads)
     results['v4_large_n'] = benchmark_kernel(run_v4)
 
-    # v5 (if M is large enough)
+    # v5 (if M is large enough) - outputs int32
     if M >= 32:
-        y_out = torch.zeros(M, N, dtype=torch.float32)
+        y_out_i32 = torch.zeros(M, N, dtype=torch.int32)
         def run_v5():
-            kernel.matmul_free_vnni_v5_large_m(x_int8, x_scale, w_int8, w_sum, y_out, M, N, K, num_threads)
+            kernel.matmul_free_vnni_v5_large_m(x_int8, x_scale, w_int8, w_sum, y_out_i32, M, N, K, num_threads)
         results['v5_large_m'] = benchmark_kernel(run_v5)
 
     # Print results
