@@ -21,9 +21,92 @@ import json
 import platform
 import os
 import gc
+import tracemalloc
 from pathlib import Path
 from datetime import datetime
 from torch.utils.cpp_extension import load
+
+
+# ============================================================================
+# Memory Tracking Utilities
+# ============================================================================
+
+def get_process_memory_mb():
+    """Get current process memory usage in MB (RSS - Resident Set Size)"""
+    try:
+        # Linux: read from /proc/self/status
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    # Value is in kB
+                    return int(line.split()[1]) / 1024.0
+    except (FileNotFoundError, IOError):
+        pass
+
+    # Fallback: use resource module (works on Linux/macOS)
+    try:
+        import resource
+        # ru_maxrss is in KB on Linux, bytes on macOS
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if platform.system() == 'Darwin':
+            return usage / (1024 * 1024)  # bytes to MB
+        else:
+            return usage / 1024  # KB to MB
+    except ImportError:
+        return 0.0
+
+
+def get_memory_stats():
+    """Get comprehensive memory statistics"""
+    stats = {
+        'process_rss_mb': get_process_memory_mb(),
+        'python_allocated_mb': 0.0,
+        'python_peak_mb': 0.0,
+    }
+
+    # Get Python/tracemalloc stats if tracking is active
+    if tracemalloc.is_tracing():
+        current, peak = tracemalloc.get_traced_memory()
+        stats['python_allocated_mb'] = current / (1024 * 1024)
+        stats['python_peak_mb'] = peak / (1024 * 1024)
+
+    return stats
+
+
+class MemoryTracker:
+    """Context manager for tracking memory during a code block"""
+
+    def __init__(self, name=""):
+        self.name = name
+        self.start_rss = 0.0
+        self.end_rss = 0.0
+        self.peak_rss = 0.0
+        self.start_python = 0.0
+        self.peak_python = 0.0
+
+    def __enter__(self):
+        gc.collect()
+        tracemalloc.start()
+        self.start_rss = get_process_memory_mb()
+        current, _ = tracemalloc.get_traced_memory()
+        self.start_python = current / (1024 * 1024)
+        return self
+
+    def __exit__(self, *args):
+        gc.collect()
+        self.end_rss = get_process_memory_mb()
+        current, peak = tracemalloc.get_traced_memory()
+        self.peak_python = peak / (1024 * 1024)
+        tracemalloc.stop()
+        self.peak_rss = max(self.end_rss, self.start_rss)
+
+    def get_results(self):
+        return {
+            'rss_start_mb': self.start_rss,
+            'rss_end_mb': self.end_rss,
+            'rss_delta_mb': self.end_rss - self.start_rss,
+            'python_peak_mb': self.peak_python,
+        }
 
 # ============================================================================
 # Configuration
@@ -656,16 +739,24 @@ class FullTransformerPyTorch:
 # Benchmarking
 # ============================================================================
 
-def benchmark_forward(model, x, warmup=WARMUP_ITERS, iters=BENCH_ITERS):
-    """Benchmark forward pass"""
+def benchmark_forward(model, x, warmup=WARMUP_ITERS, iters=BENCH_ITERS, track_memory=True):
+    """Benchmark forward pass with optional memory tracking"""
     # Warmup
     for _ in range(warmup):
         _ = model.forward(x.clone())
 
     gc.collect()
 
+    # Get baseline memory before benchmark
+    mem_before = get_process_memory_mb()
+
+    # Start memory tracking if requested
+    if track_memory:
+        tracemalloc.start()
+
     # Benchmark
     times = []
+    peak_mem = mem_before
     for _ in range(iters):
         x_input = x.clone()
         start = time.perf_counter()
@@ -673,11 +764,30 @@ def benchmark_forward(model, x, warmup=WARMUP_ITERS, iters=BENCH_ITERS):
         end = time.perf_counter()
         times.append((end - start) * 1000)  # ms
 
+        # Track peak memory during iterations
+        if track_memory:
+            current_mem = get_process_memory_mb()
+            peak_mem = max(peak_mem, current_mem)
+
+    # Get memory stats
+    mem_after = get_process_memory_mb()
+    python_current, python_peak = (0, 0)
+    if track_memory:
+        python_current, python_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
     return {
         'mean_ms': np.mean(times),
         'std_ms': np.std(times),
         'min_ms': np.min(times),
         'max_ms': np.max(times),
+        'memory': {
+            'rss_before_mb': mem_before,
+            'rss_after_mb': mem_after,
+            'rss_peak_mb': peak_mem,
+            'rss_delta_mb': mem_after - mem_before,
+            'python_peak_mb': python_peak / (1024 * 1024) if track_memory else 0,
+        }
     }
 
 
@@ -752,6 +862,7 @@ def run_benchmarks():
         pytorch_gflops = (total_flops / 1e9) / (pytorch_results['mean_ms'] / 1000)
         print(f"  Time: {pytorch_results['mean_ms']:.2f} ± {pytorch_results['std_ms']:.2f} ms")
         print(f"  Throughput: {pytorch_gflops:.1f} GFLOPS")
+        print(f"  Memory (RSS peak): {pytorch_results['memory']['rss_peak_mb']:.1f} MB")
 
         # Benchmark Native
         print(f"\nBenchmarking Native ({KERNEL_NAME})...")
@@ -759,6 +870,7 @@ def run_benchmarks():
         native_gflops = (total_flops / 1e9) / (native_results['mean_ms'] / 1000)
         print(f"  Time: {native_results['mean_ms']:.2f} ± {native_results['std_ms']:.2f} ms")
         print(f"  Throughput: {native_gflops:.1f} GFLOPS")
+        print(f"  Memory (RSS peak): {native_results['memory']['rss_peak_mb']:.1f} MB")
 
         # Speedup
         speedup = pytorch_results['mean_ms'] / native_results['mean_ms']
@@ -771,11 +883,13 @@ def run_benchmarks():
                 'time_ms': pytorch_results['mean_ms'],
                 'std_ms': pytorch_results['std_ms'],
                 'gflops': pytorch_gflops,
+                'memory_mb': pytorch_results['memory']['rss_peak_mb'],
             },
             'native': {
                 'time_ms': native_results['mean_ms'],
                 'std_ms': native_results['std_ms'],
                 'gflops': native_gflops,
+                'memory_mb': native_results['memory']['rss_peak_mb'],
             },
             'speedup': speedup,
         }
@@ -786,12 +900,12 @@ def run_benchmarks():
 def print_summary(results):
     """Print summary table"""
     print("\n")
-    print("=" * 70)
+    print("=" * 90)
     print("SUMMARY: 24-Layer Transformer Forward Pass (Native Kernels)")
-    print("=" * 70)
+    print("=" * 90)
     print()
-    print(f"{'Batch Size':<12} {'PyTorch (ms)':<15} {'Native (ms)':<15} {'Speedup':<10} {'GFLOPS':<10}")
-    print("-" * 70)
+    print(f"{'Batch':<8} {'PyTorch (ms)':<14} {'Native (ms)':<14} {'Speedup':<10} {'GFLOPS':<10} {'PT Mem':<10} {'Native Mem':<10}")
+    print("-" * 90)
 
     for key, data in results.items():
         M = data['batch_size']
@@ -799,7 +913,9 @@ def print_summary(results):
         native_time = data['native']['time_ms']
         speedup = data['speedup']
         gflops = data['native']['gflops']
-        print(f"M={M:<10} {pt_time:<15.2f} {native_time:<15.2f} {speedup:<10.2f}x {gflops:<10.1f}")
+        pt_mem = data['pytorch'].get('memory_mb', 0)
+        native_mem = data['native'].get('memory_mb', 0)
+        print(f"M={M:<6} {pt_time:<14.2f} {native_time:<14.2f} {speedup:<10.2f}x {gflops:<10.1f} {pt_mem:<10.1f} {native_mem:<10.1f}")
 
 
 def save_results(results):
