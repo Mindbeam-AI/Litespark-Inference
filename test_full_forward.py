@@ -21,6 +21,7 @@ import json
 import platform
 import os
 import gc
+import tracemalloc
 from pathlib import Path
 from datetime import datetime
 from torch.utils.cpp_extension import load
@@ -633,25 +634,38 @@ class FullTransformerPyTorch:
 # ============================================================================
 
 def benchmark_forward(model, x, warmup=WARMUP_ITERS, iters=BENCH_ITERS):
-    """Benchmark forward pass"""
+    """Benchmark forward pass with memory tracking"""
     # Warmup
     for _ in range(warmup):
         _ = model.forward(x.clone())
 
     gc.collect()
 
-    # Benchmark
+    # Benchmark with memory tracking
     times = []
-    for _ in range(iters):
+    peak_memory_mb = 0
+
+    for i in range(iters):
         x_input = x.clone()
+
+        # Track memory on first iteration
+        if i == 0:
+            tracemalloc.start()
+
         start = time.perf_counter()
         _ = model.forward(x_input)
         end = time.perf_counter()
         times.append((end - start) * 1000)  # ms
 
+        if i == 0:
+            current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            peak_memory_mb = peak / (1024 * 1024)  # Convert to MB
+
     return {
         'mean_ms': np.mean(times),
         'std_ms': np.std(times),
+        'peak_memory_mb': peak_memory_mb,
         'min_ms': np.min(times),
         'max_ms': np.max(times),
     }
@@ -727,6 +741,7 @@ def run_benchmarks():
         pytorch_gflops = (total_flops / 1e9) / (pytorch_results['mean_ms'] / 1000)
         print(f"  Time: {pytorch_results['mean_ms']:.2f} ± {pytorch_results['std_ms']:.2f} ms")
         print(f"  Throughput: {pytorch_gflops:.1f} GFLOPS")
+        print(f"  Peak Memory: {pytorch_results['peak_memory_mb']:.1f} MB")
 
         # Benchmark Native
         print(f"\nBenchmarking Native ({KERNEL_NAME})...")
@@ -734,6 +749,7 @@ def run_benchmarks():
         native_gflops = (total_flops / 1e9) / (native_results['mean_ms'] / 1000)
         print(f"  Time: {native_results['mean_ms']:.2f} ± {native_results['std_ms']:.2f} ms")
         print(f"  Throughput: {native_gflops:.1f} GFLOPS")
+        print(f"  Peak Memory: {native_results['peak_memory_mb']:.1f} MB")
 
         # Speedup
         speedup = pytorch_results['mean_ms'] / native_results['mean_ms']
@@ -746,11 +762,13 @@ def run_benchmarks():
                 'time_ms': pytorch_results['mean_ms'],
                 'std_ms': pytorch_results['std_ms'],
                 'gflops': pytorch_gflops,
+                'peak_memory_mb': pytorch_results['peak_memory_mb'],
             },
             'native': {
                 'time_ms': native_results['mean_ms'],
                 'std_ms': native_results['std_ms'],
                 'gflops': native_gflops,
+                'peak_memory_mb': native_results['peak_memory_mb'],
             },
             'speedup': speedup,
         }
@@ -761,12 +779,12 @@ def run_benchmarks():
 def print_summary(results):
     """Print summary table"""
     print("\n")
-    print("=" * 70)
+    print("=" * 95)
     print("SUMMARY: 24-Layer Transformer Forward Pass (Native Kernels)")
-    print("=" * 70)
+    print("=" * 95)
     print()
-    print(f"{'Batch Size':<12} {'PyTorch (ms)':<15} {'Native (ms)':<15} {'Speedup':<10} {'GFLOPS':<10}")
-    print("-" * 70)
+    print(f"{'Batch Size':<12} {'PyTorch (ms)':<14} {'Native (ms)':<14} {'Speedup':<10} {'GFLOPS':<10} {'PT Mem (MB)':<12} {'Native Mem':<12}")
+    print("-" * 95)
 
     for key, data in results.items():
         M = data['batch_size']
@@ -774,7 +792,9 @@ def print_summary(results):
         native_time = data['native']['time_ms']
         speedup = data['speedup']
         gflops = data['native']['gflops']
-        print(f"M={M:<10} {pt_time:<15.2f} {native_time:<15.2f} {speedup:<10.2f}x {gflops:<10.1f}")
+        pt_mem = data['pytorch']['peak_memory_mb']
+        native_mem = data['native']['peak_memory_mb']
+        print(f"M={M:<10} {pt_time:<14.2f} {native_time:<14.2f} {speedup:<10.2f}x {gflops:<10.1f} {pt_mem:<12.1f} {native_mem:<12.1f}")
 
 
 def save_results(results):
