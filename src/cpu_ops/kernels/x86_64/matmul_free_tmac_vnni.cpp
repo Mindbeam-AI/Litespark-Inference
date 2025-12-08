@@ -868,7 +868,8 @@ void matmul_free_vnni_v3_fused_softmax(
     const int N_padded = ((N + 15) / 16) * 16;
 
     constexpr int N_TILE = 64;
-    constexpr int M_TILE = 32;
+    // Use larger M_TILE for better thread utilization when M is large
+    const int M_TILE = (M >= 64) ? 64 : 32;
 
     omp_set_num_threads(num_threads);
 
@@ -909,13 +910,6 @@ void matmul_free_vnni_v3_fused_softmax(
         // This keeps weight tiles in L2 cache across all M rows
         for (int n_tile = 0; n_tile < N; n_tile += N_TILE) {
             const int n_end_tile = std::min(n_tile + N_TILE, N);
-
-            // Prefetch weight tile into L2
-            for (int n = n_tile; n < n_end_tile; n++) {
-                for (int k = 0; k < K_padded; k += 64) {
-                    _mm_prefetch((const char*)(w_int8 + n * K_padded + k), _MM_HINT_T1);
-                }
-            }
 
             // Process all M rows against this N tile (parallelized)
             #pragma omp parallel for schedule(static)
@@ -1132,7 +1126,8 @@ void matmul_free_vnni_v3_fused_quantize(
     const int N_padded = ((N + 15) / 16) * 16;
 
     constexpr int N_TILE = 64;
-    constexpr int M_TILE = 32;
+    // Use larger M_TILE for better thread utilization when M is large
+    const int M_TILE = (M >= 64) ? 64 : 32;
 
     omp_set_num_threads(num_threads);
 
@@ -1170,13 +1165,6 @@ void matmul_free_vnni_v3_fused_quantize(
         // This keeps weight tiles in L2 cache across all M rows
         for (int n_tile = 0; n_tile < N; n_tile += N_TILE) {
             const int n_end_tile = std::min(n_tile + N_TILE, N);
-
-            // Prefetch weight tile into L2
-            for (int n = n_tile; n < n_end_tile; n++) {
-                for (int k = 0; k < K_padded; k += 64) {
-                    _mm_prefetch((const char*)(w_int8 + n * K_padded + k), _MM_HINT_T1);
-                }
-            }
 
             // Process all M rows against this N tile (parallelized)
             #pragma omp parallel for schedule(static)
@@ -1395,7 +1383,8 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
     const int N_padded = ((N + 15) / 16) * 16;
 
     constexpr int N_TILE = 64;
-    constexpr int M_TILE = 32;
+    // Use larger M_TILE for better thread utilization when M is large
+    const int M_TILE = (M >= 64) ? 64 : 32;
 
     omp_set_num_threads(num_threads);
 
@@ -1492,15 +1481,6 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
         // This keeps weight tiles in L2 cache across all M rows
         for (int n_tile = 0; n_tile < N; n_tile += N_TILE) {
             const int n_end_tile = std::min(n_tile + N_TILE, N);
-
-            // Prefetch Q, K, V weight tiles into L2 (3 weight matrices)
-            for (int n = n_tile; n < n_end_tile; n++) {
-                for (int k = 0; k < K_padded; k += 64) {
-                    _mm_prefetch((const char*)(wq + n * K_padded + k), _MM_HINT_T1);
-                    _mm_prefetch((const char*)(wk + n * K_padded + k), _MM_HINT_T1);
-                    _mm_prefetch((const char*)(wv + n * K_padded + k), _MM_HINT_T1);
-                }
-            }
 
             // Process all M rows against this N tile (parallelized)
             #pragma omp parallel for schedule(static)
