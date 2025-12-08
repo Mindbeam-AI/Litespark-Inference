@@ -140,13 +140,14 @@ def test_matmul_kernels(M, K, N, label):
     x = torch.randn(M, K, dtype=torch.float32)
     x_int8, x_scale = quantize_input(x)
     w_int8, w_sum = prepare_ternary_weights(N, K)
+    bias = torch.Tensor()  # empty tensor for no bias
 
     results = {}
 
     # v3 (baseline)
     y_out = torch.zeros(M, N, dtype=torch.float32)
     def run_v3():
-        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_out, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_out, bias, M, N, K, num_threads)
     results['v3'] = benchmark_kernel(run_v3)
 
     # v4 (large N)
@@ -178,6 +179,7 @@ def test_fused_softmax_kernels(M, K, N, label):
     x = torch.randn(M, K, dtype=torch.float32)
     x_int8, x_scale = quantize_input(x)
     w_int8, w_sum = prepare_ternary_weights(N, K)
+    bias = torch.Tensor()  # empty tensor for no bias
 
     results = {}
 
@@ -187,7 +189,7 @@ def test_fused_softmax_kernels(M, K, N, label):
     y_scale = torch.zeros(M, dtype=torch.float32)
 
     def run_separate():
-        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_float, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_float, bias, M, N, K, num_threads)
         # Softmax in PyTorch
         probs = torch.softmax(y_float, dim=-1)
         # Quantize
@@ -217,6 +219,7 @@ def test_fused_quantize_kernels(M, K, N, label):
     x = torch.randn(M, K, dtype=torch.float32)
     x_int8, x_scale = quantize_input(x)
     w_int8, w_sum = prepare_ternary_weights(N, K)
+    bias = torch.Tensor()  # empty tensor for no bias
 
     results = {}
 
@@ -226,7 +229,7 @@ def test_fused_quantize_kernels(M, K, N, label):
     y_scale = torch.zeros(M, dtype=torch.float32)
 
     def run_separate():
-        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_float, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_float, bias, M, N, K, num_threads)
         probs = torch.softmax(y_float, dim=-1)
         max_abs = probs.abs().max(dim=1, keepdim=True).values
         scale = max_abs / 127.0
@@ -258,6 +261,7 @@ def test_fused_qkv_kernels(M, K, N, label):
     wq_int8, wq_sum = prepare_ternary_weights(N, K)
     wk_int8, wk_sum = prepare_ternary_weights(N, K)
     wv_int8, wv_sum = prepare_ternary_weights(N, K)
+    bias = torch.Tensor()  # empty tensor for no bias
 
     results = {}
 
@@ -273,9 +277,9 @@ def test_fused_qkv_kernels(M, K, N, label):
     v_scale = torch.zeros(M, dtype=torch.float32)
 
     def run_separate():
-        kernel.matmul_free_vnni_v3(x_int8, x_scale, wq_int8, wq_sum, q_float, M, N, K, num_threads)
-        kernel.matmul_free_vnni_v3(x_int8, x_scale, wk_int8, wk_sum, k_float, M, N, K, num_threads)
-        kernel.matmul_free_vnni_v3(x_int8, x_scale, wv_int8, wv_sum, v_float, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v3(x_int8, x_scale, wq_int8, wq_sum, q_float, bias, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v3(x_int8, x_scale, wk_int8, wk_sum, k_float, bias, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v3(x_int8, x_scale, wv_int8, wv_sum, v_float, bias, M, N, K, num_threads)
         # Softmax + quantize
         for (f, i8, sc) in [(q_float, q_int8, q_scale), (k_float, k_int8, k_scale), (v_float, v_int8, v_scale)]:
             probs = torch.softmax(f, dim=-1)
@@ -315,13 +319,14 @@ def test_mlp_up_kernels(M, K, N, label):
     x = torch.randn(M, K, dtype=torch.float32)
     x_int8, x_scale = quantize_input(x)
     w_int8, w_sum = prepare_ternary_weights(N, K)
+    bias = torch.Tensor()  # empty tensor for no bias
 
     results = {}
 
     # v3
     y_out = torch.zeros(M, N, dtype=torch.float32)
     def run_v3():
-        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_out, M, N, K, num_threads)
+        kernel.matmul_free_vnni_v3(x_int8, x_scale, w_int8, w_sum, y_out, bias, M, N, K, num_threads)
     results['v3'] = benchmark_kernel(run_v3)
 
     # v4 (designed for large N)
