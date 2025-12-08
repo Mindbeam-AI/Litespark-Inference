@@ -75,6 +75,43 @@ def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 # ============================================================================
+# Ternary Linear Helper
+# ============================================================================
+
+def ternary_linear(x: torch.Tensor, layer: TernaryLinear, kernel, num_threads: int) -> torch.Tensor:
+    """Apply ternary linear with our kernel. Uses v2 for small dims, v3 for large."""
+    M = x.shape[0]
+    N = layer.out_features
+    K = layer.in_features
+
+    # Quantize input
+    x_int8, x_scale = quantize_activation(x)
+
+    # Allocate output
+    y = torch.zeros(M, N, dtype=torch.float32)
+    bias = layer.bias if layer.bias is not None else torch.Tensor()
+
+    # Use v2 for small dimensions (less overhead), v3 for large
+    if K <= 1024 and N <= 4096:
+        kernel.matmul_free_vnni_v2(
+            x_int8, x_scale,
+            layer.w_int8, layer.w_sum,
+            y, bias,
+            M, N, K, num_threads
+        )
+    else:
+        kernel.matmul_free_vnni_v3(
+            x_int8, x_scale,
+            layer.w_int8, layer.w_sum,
+            y, bias,
+            M, N, K, num_threads
+        )
+
+    # Apply ternary scale
+    return y * layer.scale
+
+
+# ============================================================================
 # Ternary GPT-2 Model
 # ============================================================================
 
@@ -103,32 +140,6 @@ class TernaryGPT2Attention(nn.Module):
         # Scaling factor for attention
         self.scale = 1.0 / (self.head_dim ** 0.5)
 
-    def _ternary_linear(self, x: torch.Tensor, layer: TernaryLinear) -> torch.Tensor:
-        """Apply ternary linear with our kernel."""
-        M = x.shape[0]
-        N = layer.out_features
-        K = layer.in_features
-
-        # Quantize input
-        x_int8, x_scale = quantize_activation(x)
-
-        # Allocate output
-        y = torch.zeros(M, N, dtype=torch.float32)
-        bias = layer.bias if layer.bias is not None else torch.Tensor()
-
-        # Run kernel
-        self.kernel.matmul_free_vnni_v3(
-            x_int8, x_scale,
-            layer.w_int8, layer.w_sum,
-            y, bias,
-            M, N, K, self.num_threads
-        )
-
-        # Apply ternary scale
-        y = y * layer.scale
-
-        return y
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -146,7 +157,7 @@ class TernaryGPT2Attention(nn.Module):
         x = hidden_states.view(-1, hidden)
 
         # QKV projection: [M, 3*hidden]
-        qkv = self._ternary_linear(x, self.c_attn)
+        qkv = ternary_linear(x, self.c_attn, self.kernel, self.num_threads)
 
         # Split Q, K, V
         q, k, v = qkv.split(self.n_embd, dim=-1)
@@ -177,7 +188,7 @@ class TernaryGPT2Attention(nn.Module):
 
         # Output projection
         x = attn_output.view(-1, hidden)
-        output = self._ternary_linear(x, self.c_proj)
+        output = ternary_linear(x, self.c_proj, self.kernel, self.num_threads)
         output = output.view(batch, seq_len, hidden)
 
         return output
@@ -200,45 +211,19 @@ class TernaryGPT2MLP(nn.Module):
         self.kernel = kernel
         self.num_threads = num_threads
 
-    def _ternary_linear(self, x: torch.Tensor, layer: TernaryLinear) -> torch.Tensor:
-        """Apply ternary linear with our kernel."""
-        M = x.shape[0]
-        N = layer.out_features
-        K = layer.in_features
-
-        # Quantize input
-        x_int8, x_scale = quantize_activation(x)
-
-        # Allocate output
-        y = torch.zeros(M, N, dtype=torch.float32)
-        bias = layer.bias if layer.bias is not None else torch.Tensor()
-
-        # Run kernel
-        self.kernel.matmul_free_vnni_v3(
-            x_int8, x_scale,
-            layer.w_int8, layer.w_sum,
-            y, bias,
-            M, N, K, self.num_threads
-        )
-
-        # Apply ternary scale
-        y = y * layer.scale
-
-        return y
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden = hidden_states.shape
 
         x = hidden_states.view(-1, hidden)
 
         # Up projection
-        h = self._ternary_linear(x, self.c_fc)
+        h = ternary_linear(x, self.c_fc, self.kernel, self.num_threads)
 
         # GELU activation
         h = F.gelu(h)
 
         # Down projection
-        output = self._ternary_linear(h, self.c_proj)
+        output = ternary_linear(h, self.c_proj, self.kernel, self.num_threads)
 
         return output.view(batch, seq_len, hidden)
 
