@@ -236,25 +236,42 @@ def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     Run ternary matmul with int32 output (no float conversion).
     Output stays in int32 for chaining with softmax/swiglu.
 
-    Kernel selection:
-    - v4: Large N (parallelizes over N blocks) - good for up_matmul
-    - v5: Large M (parallelizes over M×N tiles) - good for down_matmul
-    - v3: Default for small M and small N
+    Optimized kernel selection for transformer dimensions:
+    - v6: Very large N (cache-optimized tiling) - best for MLP up projection (N=16384)
+    - v4: Large N (parallelizes over N blocks) - good for medium N (N=4096-8192)
+    - v5: Large M (parallelizes over M×N tiles) - good for MLP down projection
+    - v2: Small M (register blocking) - best for small matrices (M≤8, N≤4096)
+    - v3: Default fallback (cache-optimized)
     """
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
 
-    if N >= 4096:
+    if N >= 8192:
+        # Very large N (MLP up projection): use v6 (cache-optimized tiling, better than v4)
+        kernel.matmul_free_vnni_v6_large_n_tiled(
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
+        )
+    elif N >= 4096:
         # Large N: use v4 (parallelizes over N blocks)
         kernel.matmul_free_vnni_v4_large_n(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
         )
     elif M >= 64:
-        # Large M: use v5 (parallelizes over M×N tiles)
+        # Large M (MLP down projection): use v5 (parallelizes over M×N tiles)
         kernel.matmul_free_vnni_v5_large_m(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
         )
+    elif M <= 8 and N <= 4096:
+        # Small M, small/medium N: use v2 (register blocking, best for small matrices)
+        # v2 outputs float32, so we need conversion to int32
+        y_float = torch.zeros(M, N, dtype=torch.float32)
+        bias = torch.empty(0)
+        kernel.matmul_free_vnni_v2(
+            x_int8, scales, w_int8, w_sum, y_float, bias, M, N, K, num_threads
+        )
+        # Convert float32 to int32 (multiply by scale to get back to int32 range)
+        y_int32 = (y_float * scales.unsqueeze(1)).round().to(torch.int32)
     else:
-        # Small M and N: use v3
+        # Default: use v3 (cache-optimized)
         bias = torch.empty(0)
         kernel.matmul_free_vnni_v3_int32_out(
             x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, num_threads
