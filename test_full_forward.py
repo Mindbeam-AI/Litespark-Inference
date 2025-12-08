@@ -384,7 +384,7 @@ FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
 USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
 USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
 USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
-USE_FUSED_MATMUL_SWIGLU = True  # Fuse up matmul + SwiGLU (eliminates 16384 int32 intermediate)
+USE_FUSED_MATMUL_SWIGLU = False  # DISABLED - cache thrashing, needs N-tiled approach
 
 
 # ============================================================================
