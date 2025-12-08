@@ -78,11 +78,27 @@ def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 # Ternary Linear Helper
 # ============================================================================
 
+def get_inference_threads(M, N, base_threads):
+    """Get optimal thread count for inference workloads"""
+    if M <= 8:
+        return 1                    # Single token generation - avoid thread overhead
+    elif M <= 32:
+        return min(2, base_threads) # Small sequences - minimal threading
+    elif M <= 128:
+        return min(4, base_threads) # Medium sequences - moderate threading
+    elif N >= 10000:
+        return min(8, base_threads) # LM head needs more threads for large vocab
+    else:
+        return min(6, base_threads) # Conservative default
+
 def ternary_linear(x: torch.Tensor, layer: TernaryLinear, kernel, num_threads: int) -> torch.Tensor:
-    """Apply ternary linear with our kernel. Uses v2 for small dims, v3 for large."""
+    """Apply ternary linear with inference-optimized kernel selection."""
     M = x.shape[0]
     N = layer.out_features
     K = layer.in_features
+
+    # Inference-optimized thread selection
+    optimal_threads = get_inference_threads(M, N, num_threads)
 
     # Quantize input
     x_int8, x_scale = quantize_activation(x)
@@ -91,20 +107,38 @@ def ternary_linear(x: torch.Tensor, layer: TernaryLinear, kernel, num_threads: i
     y = torch.zeros(M, N, dtype=torch.float32)
     bias = layer.bias if layer.bias is not None else torch.Tensor()
 
-    # Use v2 for small dimensions (less overhead), v3 for large
-    if K <= 1024 and N <= 4096:
+    # Inference-optimized kernel selection
+    if N >= 10000:
+        # Large vocabulary (LM head): use v6 for better cache behavior
+        # Note: v6 outputs int32, so we need a different approach for LM head
+        # For now, use v4 which is still better than v3 for large N
+        kernel.matmul_free_vnni_v4_large_n(
+            x_int8, x_scale,
+            layer.w_int8, layer.w_sum,
+            y, M, N, K, optimal_threads
+        )
+    elif N >= 4096:
+        # Large MLP layers: use v4 for better parallelization over N
+        kernel.matmul_free_vnni_v4_large_n(
+            x_int8, x_scale,
+            layer.w_int8, layer.w_sum,
+            y, M, N, K, optimal_threads
+        )
+    elif K <= 1024 and N <= 4096:
+        # Most attention layers: use v2 for small dimensions (less overhead)
         kernel.matmul_free_vnni_v2(
             x_int8, x_scale,
             layer.w_int8, layer.w_sum,
             y, bias,
-            M, N, K, num_threads
+            M, N, K, optimal_threads
         )
     else:
+        # Medium dimensions: use v3 with adaptive tiling
         kernel.matmul_free_vnni_v3(
             x_int8, x_scale,
             layer.w_int8, layer.w_sum,
             y, bias,
-            M, N, K, num_threads
+            M, N, K, optimal_threads
         )
 
     # Apply ternary scale

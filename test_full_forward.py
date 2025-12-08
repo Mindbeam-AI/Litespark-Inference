@@ -175,11 +175,14 @@ else:
     )
 
     KERNEL_NAME = "VNNI v3 Native"
-    num_threads = torch.get_num_threads()
-
-    # Limit threads for better small batch performance
-    if num_threads > 8:
-        num_threads = 8  # Reduce thread overhead
+    # Adaptive thread limiting for better performance
+    base_threads = torch.get_num_threads()
+    if base_threads <= 4:
+        num_threads = base_threads
+    elif base_threads <= 8:
+        num_threads = 6  # Slightly reduce from 8 for better cache behavior
+    else:
+        num_threads = 8  # Cap at 8 for large thread counts
 
 print(f"Loaded kernel: {KERNEL_NAME}")
 print(f"Using {num_threads} threads")
@@ -235,33 +238,57 @@ def quantize_activations_initial(x):
 # Native Kernel Wrappers
 # ============================================================================
 
+def get_optimal_threads(base_threads, M, N):
+    """Get optimal thread count based on workload characteristics"""
+    if M <= 16 and N <= 4096:
+        return min(2, base_threads)  # Small workloads: minimize thread overhead
+    elif M <= 32:
+        return min(4, base_threads)  # Medium workloads: moderate threading
+    elif N >= 16384:
+        return min(8, base_threads)  # Large N: more threads for parallelization
+    else:
+        return min(6, base_threads)  # Conservative default
+
 def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     """
-    Run ternary matmul with int32 output (no float conversion).
+    Run ternary matmul with int32 output - optimized kernel selection.
     Output stays in int32 for chaining with softmax/swiglu.
 
-    Kernel selection:
-    - v4: Large N (parallelizes over N blocks) - good for up_matmul
+    Enhanced kernel selection:
+    - v6: Very large N (better cache behavior) - excellent for large MLP up_matmul
+    - v4: Large N (parallelizes over N blocks) - good for medium MLP up_matmul
     - v5: Large M (parallelizes over M×N tiles) - good for down_matmul
     - v3: Default for small M and small N
     """
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
 
-    if N >= 4096:
+    # Adaptive thread selection
+    optimal_threads = get_optimal_threads(num_threads, M, N)
+
+    if N >= 8192:
+        # Very large N: use v6 for better cache behavior than v4
+        # Excellent for large MLP up projection: M=128, N=16384, K=2048
+        kernel.matmul_free_vnni_v6_large_n_tiled(
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
+        )
+    elif N >= 4096:
         # Large N: use v4 (parallelizes over N blocks)
+        # Good for medium MLP layers: M=128, N=4096-8192, K=2048
         kernel.matmul_free_vnni_v4_large_n(
-            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
         )
     elif M >= 64:
         # Large M: use v5 (parallelizes over M×N tiles)
+        # Good for down projection: M=128, N=2048, K=8192
         kernel.matmul_free_vnni_v5_large_m(
-            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, num_threads
+            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
         )
     else:
-        # Small M and N: use v3
+        # Small M and N: use v3 (cache-optimized tiling)
+        # Good for attention: M=128, N=2048, K=2048
         bias = torch.empty(0)
         kernel.matmul_free_vnni_v3_int32_out(
-            x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, num_threads
+            x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, optimal_threads
         )
 
     return y_int32
@@ -445,7 +472,7 @@ def fused_matmul_quantize(x_int8, x_scales, w_int8, w_sum, M, N, K):
 
 def fused_matmul_swiglu(x_int8, x_scales, w_int8, w_sum, M, N, K):
     """
-    Fused matmul + SwiGLU: int8 input -> int8 output (never writes int32 to memory).
+    Optimized fused matmul + SwiGLU: int8 input -> int8 output (single-pass, better cache efficiency).
     Input: x[M, K], weights W_up[N, K] where N = mlp_hidden (16384)
     Output: y[M, N/2] int8 (8192 outputs after SwiGLU)
     """
@@ -453,7 +480,8 @@ def fused_matmul_swiglu(x_int8, x_scales, w_int8, w_sum, M, N, K):
     y_int8 = torch.zeros(M, half_N, dtype=torch.int8)
     y_scales = torch.zeros(M, dtype=torch.float32)
 
-    kernel.matmul_free_vnni_v3_fused_swiglu(
+    # Use optimized single-pass kernel for better performance
+    kernel.matmul_free_vnni_v3_fused_swiglu_optimized(
         x_int8, x_scales, w_int8, w_sum,
         y_int8, y_scales,
         M, N, K, num_threads
@@ -471,7 +499,7 @@ FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
 USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
 USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
 USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
-USE_FUSED_MATMUL_SWIGLU = False  # DISABLED - two-pass still slower than separate kernels
+USE_FUSED_MATMUL_SWIGLU = True   # ENABLED - using optimized single-pass kernel
 
 
 # ============================================================================

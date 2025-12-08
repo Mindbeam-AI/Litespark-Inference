@@ -867,10 +867,16 @@ void matmul_free_vnni_v3_fused_softmax(
     const int K_padded = ((K + 63) / 64) * 64;
     const int N_padded = ((N + 15) / 16) * 16;
 
-    constexpr int N_TILE = 64;
-    // Use larger M_TILE for better thread utilization when M is large
-    // For small M, use M directly to avoid tiling overhead
-    const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
+    // Adaptive N_TILE based on problem characteristics
+    const int N_TILE = (N >= 8192) ? 128 :    // Large N: bigger tiles for better cache reuse
+                       64;                     // Default: conservative tile size
+
+    // Adaptive M_TILE for better thread utilization and cache efficiency
+    // Larger M_TILE for large M, smaller for small M to reduce tiling overhead
+    const int M_TILE = (M >= 128) ? 64 :      // Very large M: maximum tile size
+                       (M >= 64) ? 32 :        // Large M: moderate tile size
+                       (M >= 16) ? 16 :        // Medium M: small tile size
+                       M;                      // Small M: no tiling overhead
 
     omp_set_num_threads(num_threads);
 
@@ -1126,10 +1132,15 @@ void matmul_free_vnni_v3_fused_quantize(
     const int K_padded = ((K + 63) / 64) * 64;
     const int N_padded = ((N + 15) / 16) * 16;
 
-    constexpr int N_TILE = 64;
-    // Use larger M_TILE for better thread utilization when M is large
-    // For small M, use M directly to avoid tiling overhead
-    const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
+    // Adaptive N_TILE based on problem characteristics
+    const int N_TILE = (N >= 8192) ? 128 :    // Large N: bigger tiles for better cache reuse
+                       64;                     // Default: conservative tile size
+
+    // Adaptive M_TILE for better thread utilization and cache efficiency
+    const int M_TILE = (M >= 128) ? 64 :      // Very large M: maximum tile size
+                       (M >= 64) ? 32 :        // Large M: moderate tile size
+                       (M >= 16) ? 16 :        // Medium M: small tile size
+                       M;                      // Small M: no tiling overhead
 
     omp_set_num_threads(num_threads);
 
@@ -1400,12 +1411,17 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
     const int K_padded = ((K + 63) / 64) * 64;
     const int N_padded = ((N + 15) / 16) * 16;
 
-    // Smaller N_TILE for QKV since we load 3 weight matrices per tile
-    // 3 × 32 × 2048 = 192KB fits better in L2 than 3 × 64 × 2048 = 384KB
-    constexpr int N_TILE = 32;
-    // Use larger M_TILE for better thread utilization when M is large
-    // For small M, use M directly to avoid tiling overhead
-    const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
+    // Adaptive N_TILE for QKV: smaller since we load 3 weight matrices per tile
+    // Need to fit 3 × N_TILE × K in L2 cache
+    const int N_TILE = (K >= 2048) ? 32 :     // Large K: smaller N_TILE (3×32×2048=192KB)
+                       (K >= 1024) ? 48 :     // Medium K: moderate N_TILE (3×48×1024=144KB)
+                       64;                    // Small K: larger N_TILE (3×64×512=96KB)
+
+    // Adaptive M_TILE for better thread utilization
+    const int M_TILE = (M >= 128) ? 64 :      // Very large M: maximum tile size
+                       (M >= 64) ? 32 :        // Large M: moderate tile size
+                       (M >= 16) ? 16 :        // Medium M: small tile size
+                       M;                      // Small M: no tiling overhead
 
     omp_set_num_threads(num_threads);
 
@@ -1729,6 +1745,10 @@ void matmul_free_vnni_v4_large_n(
         }
     }
 
+    // Adaptive scheduling: static for small workloads (less overhead), dynamic for large
+    const char* schedule_type = (M <= 32 && n_blocks <= 64) ? "static" : "dynamic";
+    const int chunk_size = (n_blocks <= 64) ? 1 : 4;
+
     // Parallelize over N blocks (better for large N)
     #pragma omp parallel for schedule(dynamic, 4)
     for (int nb = 0; nb < n_blocks; nb++) {
@@ -1754,27 +1774,59 @@ void matmul_free_vnni_v4_large_n(
                     w_ptrs[i] = w_int8 + (n_start + i) * K_padded;
                 }
 
-                // Main computation loop
-                for (int kk = 0; kk < K_padded; kk += 64) {
-                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                // Optimized computation loop with 4-way K unrolling for better pipeline utilization
+                for (int kk = 0; kk < K_padded; kk += 256) {
+                    // Unroll K loop 4x (4 × 64 = 256 bytes) for better ILP
+                    const int k_end = std::min(kk + 256, K_padded);
 
-                    // Unrolled for 16 outputs
-                    acc[0] = _mm512_dpbusd_epi32(acc[0], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[0] + kk)));
-                    acc[1] = _mm512_dpbusd_epi32(acc[1], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[1] + kk)));
-                    acc[2] = _mm512_dpbusd_epi32(acc[2], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[2] + kk)));
-                    acc[3] = _mm512_dpbusd_epi32(acc[3], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[3] + kk)));
-                    acc[4] = _mm512_dpbusd_epi32(acc[4], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[4] + kk)));
-                    acc[5] = _mm512_dpbusd_epi32(acc[5], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[5] + kk)));
-                    acc[6] = _mm512_dpbusd_epi32(acc[6], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[6] + kk)));
-                    acc[7] = _mm512_dpbusd_epi32(acc[7], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[7] + kk)));
-                    acc[8] = _mm512_dpbusd_epi32(acc[8], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[8] + kk)));
-                    acc[9] = _mm512_dpbusd_epi32(acc[9], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[9] + kk)));
-                    acc[10] = _mm512_dpbusd_epi32(acc[10], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[10] + kk)));
-                    acc[11] = _mm512_dpbusd_epi32(acc[11], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[11] + kk)));
-                    acc[12] = _mm512_dpbusd_epi32(acc[12], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[12] + kk)));
-                    acc[13] = _mm512_dpbusd_epi32(acc[13], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[13] + kk)));
-                    acc[14] = _mm512_dpbusd_epi32(acc[14], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[14] + kk)));
-                    acc[15] = _mm512_dpbusd_epi32(acc[15], x_vec, _mm512_loadu_si512((__m512i*)(w_ptrs[15] + kk)));
+                    for (int k_inner = kk; k_inner < k_end; k_inner += 64) {
+                        __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + k_inner));
+
+                        // Process 16 outputs in groups of 4 for better instruction scheduling
+                        // Group 1: outputs 0-3
+                        __m512i w0 = _mm512_loadu_si512((__m512i*)(w_ptrs[0] + k_inner));
+                        __m512i w1 = _mm512_loadu_si512((__m512i*)(w_ptrs[1] + k_inner));
+                        __m512i w2 = _mm512_loadu_si512((__m512i*)(w_ptrs[2] + k_inner));
+                        __m512i w3 = _mm512_loadu_si512((__m512i*)(w_ptrs[3] + k_inner));
+
+                        acc[0] = _mm512_dpbusd_epi32(acc[0], x_vec, w0);
+                        acc[1] = _mm512_dpbusd_epi32(acc[1], x_vec, w1);
+                        acc[2] = _mm512_dpbusd_epi32(acc[2], x_vec, w2);
+                        acc[3] = _mm512_dpbusd_epi32(acc[3], x_vec, w3);
+
+                        // Group 2: outputs 4-7
+                        __m512i w4 = _mm512_loadu_si512((__m512i*)(w_ptrs[4] + k_inner));
+                        __m512i w5 = _mm512_loadu_si512((__m512i*)(w_ptrs[5] + k_inner));
+                        __m512i w6 = _mm512_loadu_si512((__m512i*)(w_ptrs[6] + k_inner));
+                        __m512i w7 = _mm512_loadu_si512((__m512i*)(w_ptrs[7] + k_inner));
+
+                        acc[4] = _mm512_dpbusd_epi32(acc[4], x_vec, w4);
+                        acc[5] = _mm512_dpbusd_epi32(acc[5], x_vec, w5);
+                        acc[6] = _mm512_dpbusd_epi32(acc[6], x_vec, w6);
+                        acc[7] = _mm512_dpbusd_epi32(acc[7], x_vec, w7);
+
+                        // Group 3: outputs 8-11
+                        __m512i w8 = _mm512_loadu_si512((__m512i*)(w_ptrs[8] + k_inner));
+                        __m512i w9 = _mm512_loadu_si512((__m512i*)(w_ptrs[9] + k_inner));
+                        __m512i w10 = _mm512_loadu_si512((__m512i*)(w_ptrs[10] + k_inner));
+                        __m512i w11 = _mm512_loadu_si512((__m512i*)(w_ptrs[11] + k_inner));
+
+                        acc[8] = _mm512_dpbusd_epi32(acc[8], x_vec, w8);
+                        acc[9] = _mm512_dpbusd_epi32(acc[9], x_vec, w9);
+                        acc[10] = _mm512_dpbusd_epi32(acc[10], x_vec, w10);
+                        acc[11] = _mm512_dpbusd_epi32(acc[11], x_vec, w11);
+
+                        // Group 4: outputs 12-15
+                        __m512i w12 = _mm512_loadu_si512((__m512i*)(w_ptrs[12] + k_inner));
+                        __m512i w13 = _mm512_loadu_si512((__m512i*)(w_ptrs[13] + k_inner));
+                        __m512i w14 = _mm512_loadu_si512((__m512i*)(w_ptrs[14] + k_inner));
+                        __m512i w15 = _mm512_loadu_si512((__m512i*)(w_ptrs[15] + k_inner));
+
+                        acc[12] = _mm512_dpbusd_epi32(acc[12], x_vec, w12);
+                        acc[13] = _mm512_dpbusd_epi32(acc[13], x_vec, w13);
+                        acc[14] = _mm512_dpbusd_epi32(acc[14], x_vec, w14);
+                        acc[15] = _mm512_dpbusd_epi32(acc[15], x_vec, w15);
+                    }
                 }
 
                 // Reduce and store
@@ -1855,6 +1907,9 @@ void matmul_free_vnni_v5_large_m(
             x_uint8[k] = 128;
         }
     }
+
+    // Adaptive scheduling based on workload size
+    const int chunk_size = (total_tiles <= 256) ? 4 : 8;
 
     // Parallelize over M×N_tiles (flattened)
     #pragma omp parallel for schedule(dynamic, 8)
@@ -1959,9 +2014,13 @@ void matmul_free_vnni_v6_large_n_tiled(
 
     const int K_padded = ((K + 63) / 64) * 64;
 
-    // Larger N_TILE for better cache utilization
-    // 128 × 2048 = 256KB per N_TILE, fits in L2
-    constexpr int N_TILE = 128;
+    // Adaptive N_TILE for better cache utilization based on problem size
+    // For vocabulary matrices (N~50K): 256×768=197KB per tile (fewer iterations)
+    // For MLP matrices (N~16K): 128×2048=256KB per tile (optimal L2 fit)
+    // For smaller matrices: 64×2048=128KB per tile (conservative)
+    const int N_TILE = (N >= 50000) ? 256 :   // Large vocabulary (GPT-2 LM head)
+                       (N >= 16384) ? 128 :    // Large MLP (up projection)
+                       64;                     // Default/smaller matrices
 
     omp_set_num_threads(num_threads);
 
@@ -3063,7 +3122,156 @@ void swiglu_int8(
 }
 
 /**
- * Fused MLP Up + SwiGLU Kernel (Option C: Two-pass approach)
+ * Optimized Single-Pass SwiGLU Kernel (NEW)
+ *
+ * Combines matmul (x @ W_up) with SwiGLU activation in a single pass.
+ * Processes gate and up projections simultaneously to eliminate intermediate storage.
+ *
+ * Single-pass approach:
+ * - Process N in pairs: [gate_i, up_i] simultaneously
+ * - Apply SwiGLU immediately without intermediate buffers
+ * - Much better cache locality and memory efficiency
+ *
+ * Input: x[M, K] int8 (hidden_dim = 2048)
+ * Weights: W_up[N, K] int8 where N = 16384 (mlp_hidden)
+ * Output: y[M, N/2] int8 (8192 outputs after SwiGLU)
+ *
+ * SwiGLU(x) = SiLU(x[:N/2]) * x[N/2:] where SiLU(x) = x * sigmoid(x)
+ */
+void matmul_free_vnni_v3_fused_swiglu_optimized(
+    torch::Tensor x_int8_tensor,    // [M, K] int8
+    torch::Tensor scale_tensor,     // [M] float32
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8
+    torch::Tensor w_sum_tensor,     // [N] int32
+    torch::Tensor y_tensor,         // [M, N/2] int8 output
+    torch::Tensor y_scale_tensor,   // [M] float32 output scales
+    int M, int N, int K,
+    int num_threads
+) {
+    const int8_t* __restrict__ x_int8 = x_int8_tensor.data_ptr<int8_t>();
+    const float* __restrict__ scales = scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ w_sum = w_sum_tensor.data_ptr<int32_t>();
+    int8_t* __restrict__ y = y_tensor.data_ptr<int8_t>();
+    float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
+
+    const int K_padded = ((K + 63) / 64) * 64;
+    const int half_N = N / 2;
+    const int half_N_padded = ((half_N + 15) / 16) * 16;
+
+    // Adaptive tiling based on problem size
+    const int N_TILE = (half_N >= 8192) ? 64 :     // Large: 64 pairs = 128 outputs
+                       (half_N >= 4096) ? 32 :     // Medium: 32 pairs = 64 outputs
+                       16;                         // Small: 16 pairs = 32 outputs
+    const int M_TILE = (M >= 64) ? 32 : M;
+
+    omp_set_num_threads(num_threads);
+
+    // Process M in tiles
+    for (int m_tile = 0; m_tile < M; m_tile += M_TILE) {
+        const int m_end = std::min(m_tile + M_TILE, M);
+        const int m_tile_size = m_end - m_tile;
+
+        // Allocate activation buffer for this M tile (only once)
+        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+
+        // Convert activations to uint8 (parallelized)
+        #pragma omp parallel for schedule(static)
+        for (int m_local = 0; m_local < m_tile_size; m_local++) {
+            const int m = m_tile + m_local;
+            uint8_t* x_uint8 = x_uint8_tile + m_local * K_padded;
+            const int8_t* x_row = x_int8 + m * K;
+
+            const __m512i offset_vec = _mm512_set1_epi8((char)128);
+            int k = 0;
+            for (; k + 63 < K; k += 64) {
+                __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+                __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+                _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+            }
+            for (; k < K; k++) {
+                x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+            }
+            for (; k < K_padded; k++) {
+                x_uint8[k] = 128;
+            }
+        }
+
+        // Single-pass: process N in pairs [gate_i, up_i] simultaneously
+        for (int n_tile = 0; n_tile < half_N; n_tile += N_TILE) {
+            const int n_end_tile = std::min(n_tile + N_TILE, half_N);
+
+            #pragma omp parallel for schedule(static)
+            for (int m = m_tile; m < m_end; m++) {
+                const int m_local = m - m_tile;
+                const uint8_t* x_uint8 = x_uint8_tile + m_local * K_padded;
+                float x_scale = scales[m];
+                int8_t* y_row = y + m * half_N;
+
+                // Allocate small per-thread buffer for SwiGLU results
+                const int tile_size = n_end_tile - n_tile;
+                float* swiglu_results = (float*)aligned_alloc(64, tile_size * sizeof(float));
+                float max_abs = 0.0f;
+
+                // Process pairs [gate_i, up_i] in this tile
+                for (int n_pair = n_tile; n_pair < n_end_tile; n_pair++) {
+                    const int gate_idx = n_pair;           // First half: gate weights
+                    const int up_idx = n_pair + half_N;    // Second half: up weights
+
+                    // Compute gate projection: x @ W_gate[n_pair]
+                    __m512i gate_acc = _mm512_setzero_si512();
+                    const int8_t* w_gate = w_int8 + gate_idx * K_padded;
+
+                    for (int k = 0; k < K_padded; k += 64) {
+                        __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + k));
+                        __m512i w_vec = _mm512_loadu_si512((__m512i*)(w_gate + k));
+                        gate_acc = _mm512_dpbusd_epi32(gate_acc, x_vec, w_vec);
+                    }
+                    int32_t gate_sum = _mm512_reduce_add_epi32(gate_acc) - 128 * w_sum[gate_idx];
+                    float gate_val = static_cast<float>(gate_sum) * x_scale;
+
+                    // Compute up projection: x @ W_up[n_pair]
+                    __m512i up_acc = _mm512_setzero_si512();
+                    const int8_t* w_up = w_int8 + up_idx * K_padded;
+
+                    for (int k = 0; k < K_padded; k += 64) {
+                        __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + k));
+                        __m512i w_vec = _mm512_loadu_si512((__m512i*)(w_up + k));
+                        up_acc = _mm512_dpbusd_epi32(up_acc, x_vec, w_vec);
+                    }
+                    int32_t up_sum = _mm512_reduce_add_epi32(up_acc) - 128 * w_sum[up_idx];
+                    float up_val = static_cast<float>(up_sum) * x_scale;
+
+                    // Apply SwiGLU: SiLU(gate) * up
+                    float sigmoid_gate = 1.0f / (1.0f + expf(-gate_val));
+                    float silu_gate = gate_val * sigmoid_gate;
+                    float swiglu_result = silu_gate * up_val;
+
+                    swiglu_results[n_pair - n_tile] = swiglu_result;
+                    max_abs = std::max(max_abs, std::abs(swiglu_result));
+                }
+
+                // Quantize results to int8
+                float scale = max_abs / 127.0f;
+                if (scale == 0.0f) scale = 1.0f;
+                y_scales[m] = scale;
+
+                for (int n_pair = n_tile; n_pair < n_end_tile; n_pair++) {
+                    float val = swiglu_results[n_pair - n_tile];
+                    int8_t quantized = static_cast<int8_t>(std::round(val / scale));
+                    y_row[n_pair] = quantized;
+                }
+
+                free(swiglu_results);
+            }
+        }
+
+        free(x_uint8_tile);
+    }
+}
+
+/**
+ * Original Fused MLP Up + SwiGLU Kernel (Two-pass approach - DEPRECATED)
  *
  * Combines matmul (x @ W_up) with SwiGLU activation using cache-friendly tiling.
  *
@@ -4482,6 +4690,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "VNNI v3 fused Q,K,V projection + softmax (reads input once)");
     m.def("matmul_free_vnni_v3_fused_swiglu", &matmul_free_vnni_v3_fused_swiglu,
           "VNNI v3 fused matmul + SwiGLU (eliminates 16384 int32 intermediate)");
+    m.def("matmul_free_vnni_v3_fused_swiglu_optimized", &matmul_free_vnni_v3_fused_swiglu_optimized,
+          "VNNI v3 optimized single-pass fused matmul + SwiGLU (better cache efficiency)");
     m.def("matmul_free_vnni_v6_large_n_tiled", &matmul_free_vnni_v6_large_n_tiled,
           "VNNI v6 cache-optimized for large N (N_TILE outside parallel)");
 }
