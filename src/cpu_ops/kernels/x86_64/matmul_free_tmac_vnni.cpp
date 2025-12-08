@@ -1214,7 +1214,18 @@ void matmul_free_vnni_v3_fused_quantize(
                     const int8_t* w14 = w_int8 + (n + 14) * K_padded;
                     const int8_t* w15 = w_int8 + (n + 15) * K_padded;
 
+                    // Prefetch first cache lines
+                    _mm_prefetch((const char*)(w0 + 64), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(w8 + 64), _MM_HINT_T0);
+
                     for (int kk = 0; kk < K_padded; kk += 64) {
+                        // Prefetch next cache lines (2 iterations ahead = 128 bytes)
+                        if (kk + 128 < K_padded) {
+                            _mm_prefetch((const char*)(w0 + kk + 128), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(w4 + kk + 128), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(w8 + kk + 128), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(w12 + kk + 128), _MM_HINT_T0);
+                        }
                         __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
                         acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
                         acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
