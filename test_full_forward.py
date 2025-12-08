@@ -362,9 +362,12 @@ USE_FUSED_MLP = False  # DISABLED - fused kernel is slower than separate kernels
 FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
 
 # Flag to enable new fusion strategies
-USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
-USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
-USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
+# Set via command line: python test_full_forward.py --no-fusion
+import sys
+_use_fusion = '--no-fusion' not in sys.argv
+USE_FUSED_MATMUL_SOFTMAX = _use_fusion  # Fuse matmul + softmax (eliminates int32 writes)
+USE_FUSED_QKV = _use_fusion  # Fuse Q,K,V projections (reads input once)
+USE_FUSED_MATMUL_QUANTIZE = _use_fusion  # Fuse down matmul + quantize
 
 
 # ============================================================================
