@@ -1133,13 +1133,11 @@ void matmul_free_vnni_v3_fused_quantize(
 
     omp_set_num_threads(num_threads);
 
-    // Pre-allocate buffers for max M_TILE size to avoid malloc/free in loop
-    uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, M_TILE * K_padded);
-    float* row_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
-
     for (int m_tile = 0; m_tile < M; m_tile += M_TILE) {
         const int m_end = std::min(m_tile + M_TILE, M);
         const int m_tile_size = m_end - m_tile;
+
+        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
 
         #pragma omp parallel for schedule(static)
         for (int m = m_tile; m < m_end; m++) {
@@ -1161,6 +1159,9 @@ void matmul_free_vnni_v3_fused_quantize(
                 x_uint8[k] = 128;
             }
         }
+
+        // Allocate row buffers for all rows in this M tile
+        float* row_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
 
         // Compute matmul with N_TILE loop OUTSIDE parallel region
         // This keeps weight tiles in L2 cache across all M rows
@@ -1335,10 +1336,10 @@ void matmul_free_vnni_v3_fused_quantize(
                 y_row[n] = static_cast<int8_t>(std::round(val));
             }
         }
-    }
 
-    free(row_buffers);
-    free(x_uint8_tile);
+        free(row_buffers);
+        free(x_uint8_tile);
+    }
 }
 
 /**
@@ -1391,12 +1392,6 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
     const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
 
     omp_set_num_threads(num_threads);
-
-    // Pre-allocate buffers for max M_TILE size to avoid malloc/free in loop
-    uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, M_TILE * K_padded);
-    float* q_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
-    float* k_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
-    float* v_buffers = (float*)aligned_alloc(64, M_TILE * N_padded * sizeof(float));
 
     // Lambda to apply softmax and quantize a row buffer
     auto apply_softmax_quantize = [&](float* row_buffer, int8_t* y_row, float* y_scale, int row_idx) {
@@ -1456,6 +1451,14 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
     for (int m_tile = 0; m_tile < M; m_tile += M_TILE) {
         const int m_end = std::min(m_tile + M_TILE, M);
         const int m_tile_size = m_end - m_tile;
+
+        // Allocate activation buffer for this M tile (shared across Q, K, V)
+        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+
+        // Allocate shared row buffers for all rows in this M tile
+        float* q_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
+        float* k_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
+        float* v_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
 
         // Convert activations once
         #pragma omp parallel for schedule(static)
@@ -1643,12 +1646,12 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
             apply_softmax_quantize(k_buffer, k_out + m * N, k_scales, m);
             apply_softmax_quantize(v_buffer, v_out + m * N, v_scales, m);
         }
-    }
 
-    free(q_buffers);
-    free(k_buffers);
-    free(v_buffers);
-    free(x_uint8_tile);
+        free(q_buffers);
+        free(k_buffers);
+        free(v_buffers);
+        free(x_uint8_tile);
+    }
 }
 
 /**
