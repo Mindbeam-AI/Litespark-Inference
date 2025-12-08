@@ -275,6 +275,32 @@ def native_quantize_int32(x_int32, x_scales, M, N):
     return y_int8, y_scales
 
 
+def native_fused_mlp(x_int8, x_scales, w_up, w_up_sum, w_down, w_down_sum, M, hidden_dim, mlp_hidden):
+    """
+    Fused MLP: up projection + SwiGLU + down projection in one kernel.
+    Eliminates intermediate memory writes for better performance on large M.
+    """
+    y_int8 = torch.zeros(M, hidden_dim, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.fused_mlp_int8(
+        x_int8, x_scales,
+        w_up, w_up_sum,
+        w_down, w_down_sum,
+        y_int8, y_scales,
+        M, hidden_dim, mlp_hidden,
+        num_threads
+    )
+
+    return y_int8, y_scales
+
+
+# Flag to enable/disable fused MLP (for A/B testing)
+# Fused MLP is better for large M (memory bound), separate kernels better for small M
+USE_FUSED_MLP = True
+FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
+
+
 # ============================================================================
 # Native Transformer Layer
 # ============================================================================
@@ -361,22 +387,32 @@ class TransformerLayerNative:
 
         # === MLP BLOCK ===
 
-        # MLP Gate-Up: [M, hidden_dim] -> [M, mlp_hidden] int32
-        mlp_up_int32 = matmul_int32_out(x_res_int8, x_res_scales, self.w_up, self.w_up_sum,
-                                        M, self.mlp_hidden, self.hidden_dim)
+        if USE_FUSED_MLP and M >= FUSED_MLP_MIN_M:
+            # Fused MLP: up + swiglu + down in one kernel (better for large M)
+            mlp_down_int8, mlp_down_scales = native_fused_mlp(
+                x_res_int8, x_res_scales,
+                self.w_up, self.w_up_sum,
+                self.w_down, self.w_down_sum,
+                M, self.hidden_dim, self.mlp_hidden
+            )
+        else:
+            # Separate kernels (original path)
+            # MLP Gate-Up: [M, hidden_dim] -> [M, mlp_hidden] int32
+            mlp_up_int32 = matmul_int32_out(x_res_int8, x_res_scales, self.w_up, self.w_up_sum,
+                                            M, self.mlp_hidden, self.hidden_dim)
 
-        # SwiGLU: [M, mlp_hidden] int32 -> [M, mlp_intermediate] int8
-        mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_res_scales,
-                                                     M, self.mlp_hidden)
+            # SwiGLU: [M, mlp_hidden] int32 -> [M, mlp_intermediate] int8
+            mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_res_scales,
+                                                         M, self.mlp_hidden)
 
-        # MLP Down: [M, mlp_intermediate] -> [M, hidden_dim] int32
-        mlp_down_int32 = matmul_int32_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
-                                          M, self.hidden_dim, self.mlp_intermediate)
+            # MLP Down: [M, mlp_intermediate] -> [M, hidden_dim] int32
+            mlp_down_int32 = matmul_int32_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
+                                              M, self.hidden_dim, self.mlp_intermediate)
 
-        # Quantize int32 output to int8 (native kernel)
-        mlp_down_int8, mlp_down_scales = native_quantize_int32(
-            mlp_down_int32, mlp_act_scales, M, self.hidden_dim
-        )
+            # Quantize int32 output to int8 (native kernel)
+            mlp_down_int8, mlp_down_scales = native_quantize_int32(
+                mlp_down_int32, mlp_act_scales, M, self.hidden_dim
+            )
 
         # Fused residual: x_res + mlp_down -> int8
         y_int8, y_scales = native_fused_residual(

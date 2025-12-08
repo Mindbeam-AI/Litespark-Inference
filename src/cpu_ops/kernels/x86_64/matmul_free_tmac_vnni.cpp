@@ -28,6 +28,43 @@ constexpr int TILE_N = 64;   // Process 64 columns at a time
 constexpr int TILE_K = 256;  // Process 256 K elements at a time
 
 /**
+ * Fast AVX-512 exponential approximation
+ * Uses polynomial approximation for exp(x)
+ * Accurate for x in [-88, 88], good enough for softmax
+ */
+inline __m512 avx512_exp_fast(__m512 x) {
+    // Clamp to prevent overflow
+    x = _mm512_max_ps(x, _mm512_set1_ps(-88.0f));
+    x = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
+
+    // exp(x) = 2^(x * log2(e))
+    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
+
+    __m512 z = _mm512_mul_ps(x, log2e);
+
+    // Split into integer and fractional parts
+    __m512i zi = _mm512_cvtps_epi32(z);
+    __m512 zf = _mm512_sub_ps(z, _mm512_cvtepi32_ps(zi));
+
+    // 2^frac using polynomial: 1 + f*ln2 + f^2*ln2^2/2 + ...
+    const __m512 c0 = _mm512_set1_ps(1.0f);
+    const __m512 c1 = _mm512_set1_ps(0.693147180559945309f);
+    const __m512 c2 = _mm512_set1_ps(0.240226506959100712f);
+    const __m512 c3 = _mm512_set1_ps(0.0555041086648215799f);
+
+    __m512 poly = _mm512_fmadd_ps(c3, zf, c2);
+    poly = _mm512_fmadd_ps(poly, zf, c1);
+    poly = _mm512_fmadd_ps(poly, zf, c0);
+
+    // 2^int part via bit manipulation
+    __m512i exp_int = _mm512_add_epi32(zi, _mm512_set1_epi32(127));
+    exp_int = _mm512_slli_epi32(exp_int, 23);
+    __m512 pow2_int = _mm512_castsi512_ps(exp_int);
+
+    return _mm512_mul_ps(pow2_int, poly);
+}
+
+/**
  * Quantize activations to int8 with per-row scaling
  */
 void quantize_activations_int8_vnni(
@@ -1064,7 +1101,10 @@ void matmul_free_vnni_v5_large_m(
  * 2. SwiGLU -> [M, mlp_hidden/2]
  * 3. result @ W_down -> [M, hidden_dim]
  *
- * This avoids writing intermediate tensors to memory.
+ * Optimized version with:
+ * - Heap allocation instead of stack (large arrays)
+ * - Proper parallelization over M
+ * - Vectorized inner loops with 4-way unrolling
  */
 void fused_mlp_int8(
     torch::Tensor x_tensor,         // [M, hidden_dim] int8 input
@@ -1093,134 +1133,220 @@ void fused_mlp_int8(
 
     omp_set_num_threads(num_threads);
 
-    #pragma omp parallel for schedule(static)
-    for (int m = 0; m < M; m++) {
-        const int8_t* x_row = x + m * hidden_dim;
-        float x_scale = x_scales[m];
-        int8_t* y_row = y + m * hidden_dim;
+    // Pre-allocate per-thread buffers to avoid repeated allocation
+    #pragma omp parallel
+    {
+        // Thread-local buffers (heap allocated)
+        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_up_padded);
+        float* up_float = (float*)aligned_alloc(64, mlp_hidden * sizeof(float));
+        float* swiglu_float = (float*)aligned_alloc(64, mlp_intermediate * sizeof(float));
+        uint8_t* swiglu_uint8 = (uint8_t*)aligned_alloc(64, K_down_padded);
+        float* down_float = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
 
-        // Step 1: Convert input to uint8
-        alignas(64) uint8_t x_uint8[K_up_padded];
-        for (int k = 0; k < hidden_dim; k++) {
-            x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
-        }
-        for (int k = hidden_dim; k < K_up_padded; k++) {
-            x_uint8[k] = 128;
-        }
+        #pragma omp for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const int8_t* x_row = x + m * hidden_dim;
+            float x_scale = x_scales[m];
+            int8_t* y_row = y + m * hidden_dim;
 
-        // Step 2: Up projection to float (need float for SwiGLU)
-        alignas(64) float up_float[mlp_hidden];
-        for (int n = 0; n < mlp_hidden; n++) {
-            const int8_t* w_row = w_up + n * K_up_padded;
-            __m512i acc = _mm512_setzero_si512();
-
-            for (int kk = 0; kk < K_up_padded; kk += 64) {
-                __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
-                acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+            // Step 1: Convert input to uint8 (vectorized)
+            const __m512i offset_vec = _mm512_set1_epi8((char)128);
+            int k = 0;
+            for (; k + 63 < hidden_dim; k += 64) {
+                __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+                __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+                _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+            }
+            for (; k < hidden_dim; k++) {
+                x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+            }
+            for (; k < K_up_padded; k++) {
+                x_uint8[k] = 128;
             }
 
-            int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * w_up_sum[n];
-            up_float[n] = static_cast<float>(sum) * x_scale;
-        }
+            // Step 2: Up projection with 4-way unrolling
+            int n = 0;
+            for (; n + 3 < mlp_hidden; n += 4) {
+                const int8_t* w0 = w_up + (n + 0) * K_up_padded;
+                const int8_t* w1 = w_up + (n + 1) * K_up_padded;
+                const int8_t* w2 = w_up + (n + 2) * K_up_padded;
+                const int8_t* w3 = w_up + (n + 3) * K_up_padded;
 
-        // Step 3: SwiGLU activation (in float)
-        alignas(64) float swiglu_result[mlp_intermediate];
-        float max_abs_swiglu = 0.0f;
+                __m512i acc0 = _mm512_setzero_si512();
+                __m512i acc1 = _mm512_setzero_si512();
+                __m512i acc2 = _mm512_setzero_si512();
+                __m512i acc3 = _mm512_setzero_si512();
 
-        for (int n = 0; n < mlp_intermediate; n++) {
-            float x1 = up_float[n];
-            float x2 = up_float[n + mlp_intermediate];
+                for (int kk = 0; kk < K_up_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                    acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                    acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                    acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+                }
 
-            // SiLU(x1) = x1 * sigmoid(x1)
-            float sigmoid_x1 = 1.0f / (1.0f + std::exp(-x1));
-            float silu_x1 = x1 * sigmoid_x1;
-
-            swiglu_result[n] = silu_x1 * x2;
-            max_abs_swiglu = std::max(max_abs_swiglu, std::abs(swiglu_result[n]));
-        }
-
-        // Quantize SwiGLU output for down projection
-        float swiglu_scale = max_abs_swiglu / 127.0f;
-        if (swiglu_scale == 0.0f) swiglu_scale = 1.0f;
-
-        alignas(64) uint8_t swiglu_uint8[K_down_padded];
-        for (int n = 0; n < mlp_intermediate; n++) {
-            float val = swiglu_result[n] / swiglu_scale;
-            val = std::max(-127.0f, std::min(127.0f, val));
-            int8_t q = static_cast<int8_t>(std::round(val));
-            swiglu_uint8[n] = static_cast<uint8_t>(static_cast<int16_t>(q) + 128);
-        }
-        for (int n = mlp_intermediate; n < K_down_padded; n++) {
-            swiglu_uint8[n] = 128;
-        }
-
-        // Step 4: Down projection
-        alignas(64) float down_float[hidden_dim];
-        float max_abs_down = 0.0f;
-
-        for (int n = 0; n < hidden_dim; n++) {
-            const int8_t* w_row = w_down + n * K_down_padded;
-            __m512i acc = _mm512_setzero_si512();
-
-            for (int kk = 0; kk < K_down_padded; kk += 64) {
-                __m512i x_vec = _mm512_load_si512((__m512i*)(swiglu_uint8 + kk));
-                acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                up_float[n + 0] = static_cast<float>(_mm512_reduce_add_epi32(acc0) - 128 * w_up_sum[n + 0]) * x_scale;
+                up_float[n + 1] = static_cast<float>(_mm512_reduce_add_epi32(acc1) - 128 * w_up_sum[n + 1]) * x_scale;
+                up_float[n + 2] = static_cast<float>(_mm512_reduce_add_epi32(acc2) - 128 * w_up_sum[n + 2]) * x_scale;
+                up_float[n + 3] = static_cast<float>(_mm512_reduce_add_epi32(acc3) - 128 * w_up_sum[n + 3]) * x_scale;
+            }
+            for (; n < mlp_hidden; n++) {
+                const int8_t* w_row = w_up + n * K_up_padded;
+                __m512i acc = _mm512_setzero_si512();
+                for (int kk = 0; kk < K_up_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                }
+                up_float[n] = static_cast<float>(_mm512_reduce_add_epi32(acc) - 128 * w_up_sum[n]) * x_scale;
             }
 
-            int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * w_down_sum[n];
-            down_float[n] = static_cast<float>(sum) * swiglu_scale;
-            max_abs_down = std::max(max_abs_down, std::abs(down_float[n]));
+            // Step 3: SwiGLU activation (vectorized)
+            __m512 max_abs_vec = _mm512_setzero_ps();
+            n = 0;
+            for (; n + 15 < mlp_intermediate; n += 16) {
+                __m512 x1 = _mm512_loadu_ps(up_float + n);
+                __m512 x2 = _mm512_loadu_ps(up_float + n + mlp_intermediate);
+
+                // sigmoid(x1) = 1 / (1 + exp(-x1))
+                __m512 neg_x1 = _mm512_sub_ps(_mm512_setzero_ps(), x1);
+                __m512 exp_neg = avx512_exp_fast(neg_x1);
+                __m512 sigmoid = _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f), exp_neg));
+
+                // SiLU(x1) = x1 * sigmoid(x1)
+                __m512 silu = _mm512_mul_ps(x1, sigmoid);
+
+                // result = SiLU(x1) * x2
+                __m512 result = _mm512_mul_ps(silu, x2);
+                _mm512_storeu_ps(swiglu_float + n, result);
+
+                max_abs_vec = _mm512_max_ps(max_abs_vec, _mm512_abs_ps(result));
+            }
+            float max_abs_swiglu = _mm512_reduce_max_ps(max_abs_vec);
+            for (; n < mlp_intermediate; n++) {
+                float x1 = up_float[n];
+                float x2 = up_float[n + mlp_intermediate];
+                float sigmoid_x1 = 1.0f / (1.0f + std::exp(-x1));
+                float silu_x1 = x1 * sigmoid_x1;
+                swiglu_float[n] = silu_x1 * x2;
+                max_abs_swiglu = std::max(max_abs_swiglu, std::abs(swiglu_float[n]));
+            }
+
+            // Quantize SwiGLU output
+            float swiglu_scale = max_abs_swiglu / 127.0f;
+            if (swiglu_scale == 0.0f) swiglu_scale = 1.0f;
+            float inv_swiglu_scale = 1.0f / swiglu_scale;
+
+            __m512 inv_scale_vec = _mm512_set1_ps(inv_swiglu_scale);
+            __m512 min_val = _mm512_set1_ps(-127.0f);
+            __m512 max_val = _mm512_set1_ps(127.0f);
+            __m512i offset_128 = _mm512_set1_epi32(128);
+
+            n = 0;
+            for (; n + 15 < mlp_intermediate; n += 16) {
+                __m512 vals = _mm512_loadu_ps(swiglu_float + n);
+                vals = _mm512_mul_ps(vals, inv_scale_vec);
+                vals = _mm512_max_ps(vals, min_val);
+                vals = _mm512_min_ps(vals, max_val);
+                vals = _mm512_roundscale_ps(vals, _MM_FROUND_TO_NEAREST_INT);
+                __m512i int_vals = _mm512_cvtps_epi32(vals);
+                int_vals = _mm512_add_epi32(int_vals, offset_128);
+                // Pack to uint8
+                __m128i packed = _mm512_cvtepi32_epi8(int_vals);
+                _mm_storeu_si128((__m128i*)(swiglu_uint8 + n), packed);
+            }
+            for (; n < mlp_intermediate; n++) {
+                float val = swiglu_float[n] * inv_swiglu_scale;
+                val = std::max(-127.0f, std::min(127.0f, val));
+                int8_t q = static_cast<int8_t>(std::round(val));
+                swiglu_uint8[n] = static_cast<uint8_t>(static_cast<int16_t>(q) + 128);
+            }
+            for (n = mlp_intermediate; n < K_down_padded; n++) {
+                swiglu_uint8[n] = 128;
+            }
+
+            // Step 4: Down projection with 4-way unrolling
+            __m512 max_abs_down_vec = _mm512_setzero_ps();
+            n = 0;
+            for (; n + 3 < hidden_dim; n += 4) {
+                const int8_t* w0 = w_down + (n + 0) * K_down_padded;
+                const int8_t* w1 = w_down + (n + 1) * K_down_padded;
+                const int8_t* w2 = w_down + (n + 2) * K_down_padded;
+                const int8_t* w3 = w_down + (n + 3) * K_down_padded;
+
+                __m512i acc0 = _mm512_setzero_si512();
+                __m512i acc1 = _mm512_setzero_si512();
+                __m512i acc2 = _mm512_setzero_si512();
+                __m512i acc3 = _mm512_setzero_si512();
+
+                for (int kk = 0; kk < K_down_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(swiglu_uint8 + kk));
+                    acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                    acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                    acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                    acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+                }
+
+                down_float[n + 0] = static_cast<float>(_mm512_reduce_add_epi32(acc0) - 128 * w_down_sum[n + 0]) * swiglu_scale;
+                down_float[n + 1] = static_cast<float>(_mm512_reduce_add_epi32(acc1) - 128 * w_down_sum[n + 1]) * swiglu_scale;
+                down_float[n + 2] = static_cast<float>(_mm512_reduce_add_epi32(acc2) - 128 * w_down_sum[n + 2]) * swiglu_scale;
+                down_float[n + 3] = static_cast<float>(_mm512_reduce_add_epi32(acc3) - 128 * w_down_sum[n + 3]) * swiglu_scale;
+
+                // Track max abs
+                __m128 vals = _mm_set_ps(down_float[n+3], down_float[n+2], down_float[n+1], down_float[n+0]);
+                __m128 abs_vals = _mm_andnot_ps(_mm_set1_ps(-0.0f), vals);
+                // Horizontal max
+                float max_of_4 = std::max(std::max(down_float[n+0], down_float[n+1]),
+                                          std::max(down_float[n+2], down_float[n+3]));
+                max_of_4 = std::abs(max_of_4);
+            }
+            float max_abs_down = 0.0f;
+            for (int i = 0; i < hidden_dim; i++) {
+                max_abs_down = std::max(max_abs_down, std::abs(down_float[i]));
+            }
+            for (; n < hidden_dim; n++) {
+                const int8_t* w_row = w_down + n * K_down_padded;
+                __m512i acc = _mm512_setzero_si512();
+                for (int kk = 0; kk < K_down_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(swiglu_uint8 + kk));
+                    acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                }
+                down_float[n] = static_cast<float>(_mm512_reduce_add_epi32(acc) - 128 * w_down_sum[n]) * swiglu_scale;
+                max_abs_down = std::max(max_abs_down, std::abs(down_float[n]));
+            }
+
+            // Step 5: Quantize output (vectorized)
+            float out_scale = max_abs_down / 127.0f;
+            if (out_scale == 0.0f) out_scale = 1.0f;
+            y_scales[m] = out_scale;
+
+            float inv_out_scale = 1.0f / out_scale;
+            inv_scale_vec = _mm512_set1_ps(inv_out_scale);
+
+            n = 0;
+            for (; n + 15 < hidden_dim; n += 16) {
+                __m512 vals = _mm512_loadu_ps(down_float + n);
+                vals = _mm512_mul_ps(vals, inv_scale_vec);
+                vals = _mm512_max_ps(vals, min_val);
+                vals = _mm512_min_ps(vals, max_val);
+                vals = _mm512_roundscale_ps(vals, _MM_FROUND_TO_NEAREST_INT);
+                __m512i int_vals = _mm512_cvtps_epi32(vals);
+                __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+                _mm_storeu_si128((__m128i*)(y_row + n), packed);
+            }
+            for (; n < hidden_dim; n++) {
+                float val = down_float[n] * inv_out_scale;
+                val = std::max(-127.0f, std::min(127.0f, val));
+                y_row[n] = static_cast<int8_t>(std::round(val));
+            }
         }
 
-        // Step 5: Quantize output
-        float out_scale = max_abs_down / 127.0f;
-        if (out_scale == 0.0f) out_scale = 1.0f;
-        y_scales[m] = out_scale;
-
-        float inv_scale = 1.0f / out_scale;
-        for (int n = 0; n < hidden_dim; n++) {
-            float val = down_float[n] * inv_scale;
-            val = std::max(-127.0f, std::min(127.0f, val));
-            y_row[n] = static_cast<int8_t>(std::round(val));
-        }
+        // Free thread-local buffers
+        free(x_uint8);
+        free(up_float);
+        free(swiglu_float);
+        free(swiglu_uint8);
+        free(down_float);
     }
-}
-
-/**
- * Fast AVX-512 exponential approximation
- * Uses polynomial approximation for exp(x)
- * Accurate for x in [-88, 88], good enough for softmax
- */
-inline __m512 avx512_exp_fast(__m512 x) {
-    // Clamp to prevent overflow
-    x = _mm512_max_ps(x, _mm512_set1_ps(-88.0f));
-    x = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
-
-    // exp(x) = 2^(x * log2(e))
-    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
-
-    __m512 z = _mm512_mul_ps(x, log2e);
-
-    // Split into integer and fractional parts
-    __m512i zi = _mm512_cvtps_epi32(z);
-    __m512 zf = _mm512_sub_ps(z, _mm512_cvtepi32_ps(zi));
-
-    // 2^frac using polynomial: 1 + f*ln2 + f^2*ln2^2/2 + ...
-    const __m512 c0 = _mm512_set1_ps(1.0f);
-    const __m512 c1 = _mm512_set1_ps(0.693147180559945309f);
-    const __m512 c2 = _mm512_set1_ps(0.240226506959100712f);
-    const __m512 c3 = _mm512_set1_ps(0.0555041086648215799f);
-
-    __m512 poly = _mm512_fmadd_ps(c3, zf, c2);
-    poly = _mm512_fmadd_ps(poly, zf, c1);
-    poly = _mm512_fmadd_ps(poly, zf, c0);
-
-    // 2^int part via bit manipulation
-    __m512i exp_int = _mm512_add_epi32(zi, _mm512_set1_epi32(127));
-    exp_int = _mm512_slli_epi32(exp_int, 23);
-    __m512 pow2_int = _mm512_castsi512_ps(exp_int);
-
-    return _mm512_mul_ps(pow2_int, poly);
 }
 
 /**
