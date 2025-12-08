@@ -6,12 +6,17 @@ Supports loading pre-trained ternary models:
 1. MatMul-free LM (ridger/MMfreeLM-370M, 1.3B, 2.7B)
 2. BitNet b1.58 (1bitLLM/bitnet_b1_58-3B, microsoft/bitnet-b1.58-2B-4T)
 3. HGRN-Bit (same as MatMul-free LM architecture)
+
+Supported architectures:
+- x86_64 with AVX-512 VNNI (Intel Ice Lake+, AMD Zen4+)
+- aarch64/arm64 with NEON SDOT (AWS Graviton 2/3/4, Apple Silicon)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import platform
+import os
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 from torch.utils.cpp_extension import load
@@ -20,34 +25,137 @@ import json
 
 
 # ============================================================================
-# Load VNNI Kernel
+# Architecture Detection
+# ============================================================================
+
+def is_graviton() -> bool:
+    """Detect if running on AWS Graviton."""
+    try:
+        # Check MIDR register for ARM implementer
+        midr_path = '/sys/devices/system/cpu/cpu0/regs/identification/midr_el1'
+        if os.path.exists(midr_path):
+            with open(midr_path) as f:
+                midr = int(f.read().strip(), 16)
+                # Graviton uses ARM implementer (0x41)
+                return (midr >> 24) == 0x41
+    except:
+        pass
+
+    # Alternative: check /proc/cpuinfo
+    try:
+        with open('/proc/cpuinfo') as f:
+            cpuinfo = f.read().lower()
+            # Graviton 2 reports neoverse-n1, Graviton 3/4 reports neoverse-v1
+            if 'neoverse' in cpuinfo:
+                return True
+    except:
+        pass
+
+    return False
+
+
+def get_arch_info() -> Dict:
+    """Get architecture information."""
+    machine = platform.machine().lower()
+
+    info = {
+        'machine': machine,
+        'is_x86_64': machine in ['x86_64', 'amd64'],
+        'is_arm64': machine in ['aarch64', 'arm64'],
+        'is_graviton': False,
+        'is_apple_silicon': False,
+        'kernel_type': None,
+    }
+
+    if info['is_x86_64']:
+        info['kernel_type'] = 'vnni'
+    elif info['is_arm64']:
+        info['is_graviton'] = is_graviton()
+        info['is_apple_silicon'] = platform.system() == 'Darwin'
+        info['kernel_type'] = 'graviton' if info['is_graviton'] else 'neon'
+
+    return info
+
+
+# ============================================================================
+# Load Architecture-Specific Kernel
 # ============================================================================
 
 _kernel = None
+_kernel_type = None
 
 def get_kernel():
-    """Load the VNNI kernel (cached)."""
-    global _kernel
+    """Load the appropriate kernel for this architecture (cached)."""
+    global _kernel, _kernel_type
+
     if _kernel is None:
-        machine = platform.machine().lower()
-        if machine not in ['x86_64', 'amd64']:
-            raise RuntimeError(f"Ternary inference requires x86_64. Got: {machine}")
+        arch_info = get_arch_info()
+        machine = arch_info['machine']
 
-        kernel_path = Path(__file__).parent.parent / 'src/cpu_ops/kernels/x86_64/matmul_free_tmac_vnni.cpp'
+        if arch_info['is_x86_64']:
+            # x86_64 with AVX-512 VNNI
+            kernel_path = Path(__file__).parent.parent / 'src/cpu_ops/kernels/x86_64/matmul_free_tmac_vnni.cpp'
 
-        _kernel = load(
-            name='matmul_free_vnni',
-            sources=[str(kernel_path)],
-            extra_cflags=['-O3', '-march=native', '-fopenmp', '-mavx512f', '-mavx512bw', '-mavx512vnni'],
-            extra_ldflags=['-fopenmp'],
-            verbose=False
-        )
+            _kernel = load(
+                name='matmul_free_vnni',
+                sources=[str(kernel_path)],
+                extra_cflags=['-O3', '-march=native', '-fopenmp', '-mavx512f', '-mavx512bw', '-mavx512vnni'],
+                extra_ldflags=['-fopenmp'],
+                verbose=False
+            )
+            _kernel_type = 'vnni'
+
+        elif arch_info['is_arm64']:
+            if arch_info['is_graviton']:
+                # AWS Graviton with NEON SDOT
+                kernel_path = Path(__file__).parent.parent / 'src/cpu_ops/kernels/arm64/matmul_free_graviton.cpp'
+
+                _kernel = load(
+                    name='matmul_free_graviton',
+                    sources=[str(kernel_path)],
+                    extra_cflags=['-O3', '-march=armv8.2-a+dotprod', '-fopenmp'],
+                    extra_ldflags=['-fopenmp'],
+                    verbose=False
+                )
+                _kernel_type = 'graviton'
+            else:
+                # Apple Silicon or other ARM64 with NEON SDOT
+                kernel_path = Path(__file__).parent.parent / 'src/cpu_ops/kernels/arm64/matmul_free_neon_int8.cpp'
+
+                _kernel = load(
+                    name='matmul_free_neon',
+                    sources=[str(kernel_path)],
+                    extra_cflags=['-O3', '-march=native', '-fopenmp'],
+                    extra_ldflags=['-fopenmp'],
+                    verbose=False
+                )
+                _kernel_type = 'neon'
+        else:
+            raise RuntimeError(f"Unsupported architecture: {machine}")
+
     return _kernel
+
+
+def get_kernel_type() -> str:
+    """Get the kernel type being used."""
+    global _kernel_type
+    if _kernel_type is None:
+        get_kernel()  # This will set _kernel_type
+    return _kernel_type
 
 
 # ============================================================================
 # Weight Preparation
 # ============================================================================
+
+def get_k_padding() -> int:
+    """Get K padding alignment based on architecture."""
+    kernel_type = get_kernel_type()
+    if kernel_type == 'vnni':
+        return 64  # AVX-512 = 512 bits = 64 bytes
+    else:
+        return 16  # NEON = 128 bits = 16 bytes
+
 
 def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize float activation to int8 with per-row scaling."""
@@ -55,7 +163,8 @@ def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = x.unsqueeze(0)
 
     M, K = x.shape
-    K_padded = ((K + 63) // 64) * 64
+    k_pad = get_k_padding()
+    K_padded = ((K + k_pad - 1) // k_pad) * k_pad
 
     max_abs = x.abs().max(dim=1, keepdim=True).values
     scale = max_abs / 127.0
@@ -69,7 +178,7 @@ def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 def prepare_ternary_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
-    Prepare weight tensor for VNNI kernel.
+    Prepare weight tensor for kernel.
 
     Args:
         weight: Float tensor [out_features, in_features] with values ~{-1, 0, +1}
@@ -80,7 +189,8 @@ def prepare_ternary_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
         scale: Scale factor for the weights
     """
     N, K = weight.shape
-    K_padded = ((K + 63) // 64) * 64
+    k_pad = get_k_padding()
+    K_padded = ((K + k_pad - 1) // k_pad) * k_pad
 
     # Convert to ternary int8
     # For properly trained ternary models, weights should already be ~{-1, 0, +1}
@@ -107,7 +217,7 @@ def prepare_ternary_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
 # ============================================================================
 
 class TernaryLinear(nn.Module):
-    """Ternary linear layer using VNNI kernel."""
+    """Ternary linear layer with architecture-adaptive kernel selection."""
 
     def __init__(
         self,
@@ -119,7 +229,8 @@ class TernaryLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.K_padded = ((in_features + 63) // 64) * 64
+        k_pad = get_k_padding()
+        self.K_padded = ((in_features + k_pad - 1) // k_pad) * k_pad
         self.num_threads = num_threads or torch.get_num_threads()
 
         # Will be set by load_from_weight
@@ -135,7 +246,7 @@ class TernaryLinear(nn.Module):
             self.bias_tensor = bias.clone()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass using VNNI kernel."""
+        """Forward pass using architecture-appropriate kernel."""
         original_shape = x.shape
         x = x.view(-1, self.in_features)
         M = x.shape[0]
@@ -147,22 +258,60 @@ class TernaryLinear(nn.Module):
         y = torch.zeros(M, self.out_features, dtype=torch.float32)
         bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
 
-        # Select kernel based on dimensions
+        # Select kernel based on architecture and dimensions
         kernel = get_kernel()
-        if self.in_features <= 1024 and self.out_features <= 4096:
-            kernel.matmul_free_vnni_v2(
-                x_int8, x_scale,
-                self.w_int8, self.w_sum,
-                y, bias,
-                M, self.out_features, self.in_features, self.num_threads
-            )
+        kernel_type = get_kernel_type()
+
+        if kernel_type == 'vnni':
+            # x86_64 AVX-512 VNNI
+            if self.in_features <= 1024 and self.out_features <= 4096:
+                kernel.matmul_free_vnni_v2(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                kernel.matmul_free_vnni_v3(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+        elif kernel_type == 'graviton':
+            # AWS Graviton NEON SDOT
+            if self.in_features <= 1024 and self.out_features <= 4096:
+                kernel.matmul_free_graviton_v2(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                kernel.matmul_free_graviton_v3(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+        elif kernel_type == 'neon':
+            # Apple Silicon / Generic ARM NEON SDOT
+            if self.in_features <= 1024 and self.out_features <= 4096:
+                kernel.matmul_free_neon_sdot_v2(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                kernel.matmul_free_neon_sdot_v3(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
         else:
-            kernel.matmul_free_vnni_v3(
-                x_int8, x_scale,
-                self.w_int8, self.w_sum,
-                y, bias,
-                M, self.out_features, self.in_features, self.num_threads
-            )
+            raise RuntimeError(f"Unknown kernel type: {kernel_type}")
 
         # Apply scale
         y = y * self.scale
