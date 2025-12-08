@@ -2881,6 +2881,252 @@ void swiglu_int8(
 }
 
 /**
+ * Fused MLP Up + SwiGLU Kernel
+ *
+ * Combines matmul (x @ W_up) with SwiGLU activation in one kernel.
+ * Eliminates the 16384 int32 intermediate write/read per row.
+ *
+ * Input: x[M, K] int8 (hidden_dim = 2048)
+ * Weights: W_up[N, K] int8 where N = 16384 (mlp_hidden)
+ * Output: y[M, N/2] int8 (8192 outputs after SwiGLU)
+ *
+ * SwiGLU(x) = SiLU(x[:N/2]) * x[N/2:] where SiLU(x) = x * sigmoid(x)
+ */
+void matmul_free_vnni_v3_fused_swiglu(
+    torch::Tensor x_int8_tensor,    // [M, K] int8
+    torch::Tensor scale_tensor,     // [M] float32
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8 (N = mlp_hidden = 16384)
+    torch::Tensor w_sum_tensor,     // [N] int32
+    torch::Tensor y_tensor,         // [M, N/2] int8 output (after SwiGLU)
+    torch::Tensor y_scale_tensor,   // [M] float32 output scales
+    int M, int N, int K,            // N = 16384 (mlp_hidden), output is N/2 = 8192
+    int num_threads
+) {
+    const int8_t* __restrict__ x_int8 = x_int8_tensor.data_ptr<int8_t>();
+    const float* __restrict__ scales = scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ w_sum = w_sum_tensor.data_ptr<int32_t>();
+    int8_t* __restrict__ y = y_tensor.data_ptr<int8_t>();
+    float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
+
+    const int K_padded = ((K + 63) / 64) * 64;
+    const int half_N = N / 2;  // 8192
+    const int half_N_padded = ((half_N + 15) / 16) * 16;
+
+    omp_set_num_threads(num_threads);
+
+    // Parallelize over M rows - each thread processes one row completely
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        const int8_t* x_row = x_int8 + m * K;
+        float x_scale = scales[m];
+        int8_t* y_row = y + m * half_N;
+
+        // Step 1: Convert activation to uint8
+        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_padded);
+        const __m512i offset_vec = _mm512_set1_epi8((char)128);
+        int k = 0;
+        for (; k + 63 < K; k += 64) {
+            __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+            __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+            _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+        }
+        for (; k < K; k++) {
+            x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+        }
+        for (; k < K_padded; k++) {
+            x_uint8[k] = 128;
+        }
+
+        // Step 2: Compute all N matmul outputs to float buffer
+        // We need all N outputs before applying SwiGLU
+        float* matmul_buffer = (float*)aligned_alloc(64, N * sizeof(float));
+
+        // Process outputs with 16-way register blocking
+        int n = 0;
+        for (; n + 15 < N; n += 16) {
+            __m512i acc0 = _mm512_setzero_si512();
+            __m512i acc1 = _mm512_setzero_si512();
+            __m512i acc2 = _mm512_setzero_si512();
+            __m512i acc3 = _mm512_setzero_si512();
+            __m512i acc4 = _mm512_setzero_si512();
+            __m512i acc5 = _mm512_setzero_si512();
+            __m512i acc6 = _mm512_setzero_si512();
+            __m512i acc7 = _mm512_setzero_si512();
+            __m512i acc8 = _mm512_setzero_si512();
+            __m512i acc9 = _mm512_setzero_si512();
+            __m512i acc10 = _mm512_setzero_si512();
+            __m512i acc11 = _mm512_setzero_si512();
+            __m512i acc12 = _mm512_setzero_si512();
+            __m512i acc13 = _mm512_setzero_si512();
+            __m512i acc14 = _mm512_setzero_si512();
+            __m512i acc15 = _mm512_setzero_si512();
+
+            const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+            const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+            const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+            const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+            const int8_t* w4 = w_int8 + (n + 4) * K_padded;
+            const int8_t* w5 = w_int8 + (n + 5) * K_padded;
+            const int8_t* w6 = w_int8 + (n + 6) * K_padded;
+            const int8_t* w7 = w_int8 + (n + 7) * K_padded;
+            const int8_t* w8 = w_int8 + (n + 8) * K_padded;
+            const int8_t* w9 = w_int8 + (n + 9) * K_padded;
+            const int8_t* w10 = w_int8 + (n + 10) * K_padded;
+            const int8_t* w11 = w_int8 + (n + 11) * K_padded;
+            const int8_t* w12 = w_int8 + (n + 12) * K_padded;
+            const int8_t* w13 = w_int8 + (n + 13) * K_padded;
+            const int8_t* w14 = w_int8 + (n + 14) * K_padded;
+            const int8_t* w15 = w_int8 + (n + 15) * K_padded;
+
+            for (int kk = 0; kk < K_padded; kk += 64) {
+                __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+                acc4 = _mm512_dpbusd_epi32(acc4, x_vec, _mm512_loadu_si512((__m512i*)(w4 + kk)));
+                acc5 = _mm512_dpbusd_epi32(acc5, x_vec, _mm512_loadu_si512((__m512i*)(w5 + kk)));
+                acc6 = _mm512_dpbusd_epi32(acc6, x_vec, _mm512_loadu_si512((__m512i*)(w6 + kk)));
+                acc7 = _mm512_dpbusd_epi32(acc7, x_vec, _mm512_loadu_si512((__m512i*)(w7 + kk)));
+                acc8 = _mm512_dpbusd_epi32(acc8, x_vec, _mm512_loadu_si512((__m512i*)(w8 + kk)));
+                acc9 = _mm512_dpbusd_epi32(acc9, x_vec, _mm512_loadu_si512((__m512i*)(w9 + kk)));
+                acc10 = _mm512_dpbusd_epi32(acc10, x_vec, _mm512_loadu_si512((__m512i*)(w10 + kk)));
+                acc11 = _mm512_dpbusd_epi32(acc11, x_vec, _mm512_loadu_si512((__m512i*)(w11 + kk)));
+                acc12 = _mm512_dpbusd_epi32(acc12, x_vec, _mm512_loadu_si512((__m512i*)(w12 + kk)));
+                acc13 = _mm512_dpbusd_epi32(acc13, x_vec, _mm512_loadu_si512((__m512i*)(w13 + kk)));
+                acc14 = _mm512_dpbusd_epi32(acc14, x_vec, _mm512_loadu_si512((__m512i*)(w14 + kk)));
+                acc15 = _mm512_dpbusd_epi32(acc15, x_vec, _mm512_loadu_si512((__m512i*)(w15 + kk)));
+            }
+
+            // Convert to float with scale
+            matmul_buffer[n + 0] = static_cast<float>(_mm512_reduce_add_epi32(acc0) - 128 * w_sum[n + 0]) * x_scale;
+            matmul_buffer[n + 1] = static_cast<float>(_mm512_reduce_add_epi32(acc1) - 128 * w_sum[n + 1]) * x_scale;
+            matmul_buffer[n + 2] = static_cast<float>(_mm512_reduce_add_epi32(acc2) - 128 * w_sum[n + 2]) * x_scale;
+            matmul_buffer[n + 3] = static_cast<float>(_mm512_reduce_add_epi32(acc3) - 128 * w_sum[n + 3]) * x_scale;
+            matmul_buffer[n + 4] = static_cast<float>(_mm512_reduce_add_epi32(acc4) - 128 * w_sum[n + 4]) * x_scale;
+            matmul_buffer[n + 5] = static_cast<float>(_mm512_reduce_add_epi32(acc5) - 128 * w_sum[n + 5]) * x_scale;
+            matmul_buffer[n + 6] = static_cast<float>(_mm512_reduce_add_epi32(acc6) - 128 * w_sum[n + 6]) * x_scale;
+            matmul_buffer[n + 7] = static_cast<float>(_mm512_reduce_add_epi32(acc7) - 128 * w_sum[n + 7]) * x_scale;
+            matmul_buffer[n + 8] = static_cast<float>(_mm512_reduce_add_epi32(acc8) - 128 * w_sum[n + 8]) * x_scale;
+            matmul_buffer[n + 9] = static_cast<float>(_mm512_reduce_add_epi32(acc9) - 128 * w_sum[n + 9]) * x_scale;
+            matmul_buffer[n + 10] = static_cast<float>(_mm512_reduce_add_epi32(acc10) - 128 * w_sum[n + 10]) * x_scale;
+            matmul_buffer[n + 11] = static_cast<float>(_mm512_reduce_add_epi32(acc11) - 128 * w_sum[n + 11]) * x_scale;
+            matmul_buffer[n + 12] = static_cast<float>(_mm512_reduce_add_epi32(acc12) - 128 * w_sum[n + 12]) * x_scale;
+            matmul_buffer[n + 13] = static_cast<float>(_mm512_reduce_add_epi32(acc13) - 128 * w_sum[n + 13]) * x_scale;
+            matmul_buffer[n + 14] = static_cast<float>(_mm512_reduce_add_epi32(acc14) - 128 * w_sum[n + 14]) * x_scale;
+            matmul_buffer[n + 15] = static_cast<float>(_mm512_reduce_add_epi32(acc15) - 128 * w_sum[n + 15]) * x_scale;
+        }
+
+        // Remainder with 4-way blocking
+        for (; n + 3 < N; n += 4) {
+            __m512i acc0 = _mm512_setzero_si512();
+            __m512i acc1 = _mm512_setzero_si512();
+            __m512i acc2 = _mm512_setzero_si512();
+            __m512i acc3 = _mm512_setzero_si512();
+
+            const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+            const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+            const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+            const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+
+            for (int kk = 0; kk < K_padded; kk += 64) {
+                __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+            }
+
+            matmul_buffer[n + 0] = static_cast<float>(_mm512_reduce_add_epi32(acc0) - 128 * w_sum[n + 0]) * x_scale;
+            matmul_buffer[n + 1] = static_cast<float>(_mm512_reduce_add_epi32(acc1) - 128 * w_sum[n + 1]) * x_scale;
+            matmul_buffer[n + 2] = static_cast<float>(_mm512_reduce_add_epi32(acc2) - 128 * w_sum[n + 2]) * x_scale;
+            matmul_buffer[n + 3] = static_cast<float>(_mm512_reduce_add_epi32(acc3) - 128 * w_sum[n + 3]) * x_scale;
+        }
+
+        // Final remainder
+        for (; n < N; n++) {
+            const int8_t* w_row = w_int8 + n * K_padded;
+            __m512i acc = _mm512_setzero_si512();
+            for (int kk = 0; kk < K_padded; kk += 64) {
+                __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+            }
+            matmul_buffer[n] = static_cast<float>(_mm512_reduce_add_epi32(acc) - 128 * w_sum[n]) * x_scale;
+        }
+
+        // Step 3: Apply SwiGLU and find max for quantization
+        float* swiglu_buffer = (float*)aligned_alloc(64, half_N_padded * sizeof(float));
+        __m512 max_abs_vec = _mm512_setzero_ps();
+
+        n = 0;
+        for (; n + 15 < half_N; n += 16) {
+            // Load first half (gate) and second half (up)
+            __m512 x1 = _mm512_loadu_ps(matmul_buffer + n);
+            __m512 x2 = _mm512_loadu_ps(matmul_buffer + n + half_N);
+
+            // SiLU(x1) = x1 * sigmoid(x1)
+            __m512 sigmoid_x1 = avx512_sigmoid_fast(x1);
+            __m512 silu_x1 = _mm512_mul_ps(x1, sigmoid_x1);
+
+            // SwiGLU = SiLU(x1) * x2
+            __m512 swiglu_result = _mm512_mul_ps(silu_x1, x2);
+            _mm512_store_ps(swiglu_buffer + n, swiglu_result);
+
+            // Track max abs
+            __m512 abs_result = _mm512_abs_ps(swiglu_result);
+            max_abs_vec = _mm512_max_ps(max_abs_vec, abs_result);
+        }
+
+        // Handle remainder (scalar)
+        float max_abs = _mm512_reduce_max_ps(max_abs_vec);
+        for (; n < half_N; n++) {
+            float x1 = matmul_buffer[n];
+            float x2 = matmul_buffer[n + half_N];
+
+            float sigmoid_x1 = 1.0f / (1.0f + std::exp(-x1));
+            float silu_x1 = x1 * sigmoid_x1;
+            swiglu_buffer[n] = silu_x1 * x2;
+
+            max_abs = std::max(max_abs, std::abs(swiglu_buffer[n]));
+        }
+
+        // Step 4: Quantize to int8
+        float y_scale = max_abs / 127.0f;
+        if (y_scale == 0.0f) y_scale = 1.0f;
+        y_scales[m] = y_scale;
+
+        __m512 inv_scale_vec = _mm512_set1_ps(1.0f / y_scale);
+        __m512 min_val = _mm512_set1_ps(-127.0f);
+        __m512 max_val_clamp = _mm512_set1_ps(127.0f);
+
+        n = 0;
+        for (; n + 15 < half_N; n += 16) {
+            __m512 vals = _mm512_load_ps(swiglu_buffer + n);
+            vals = _mm512_mul_ps(vals, inv_scale_vec);
+            vals = _mm512_max_ps(vals, min_val);
+            vals = _mm512_min_ps(vals, max_val_clamp);
+            vals = _mm512_roundscale_ps(vals, _MM_FROUND_TO_NEAREST_INT);
+            __m512i int_vals = _mm512_cvtps_epi32(vals);
+            __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+            _mm_storeu_si128((__m128i*)(y_row + n), packed);
+        }
+
+        // Handle remainder (scalar)
+        float inv_scale = 1.0f / y_scale;
+        for (; n < half_N; n++) {
+            float val = swiglu_buffer[n] * inv_scale;
+            val = std::max(-127.0f, std::min(127.0f, val));
+            y_row[n] = static_cast<int8_t>(std::round(val));
+        }
+
+        free(x_uint8);
+        free(matmul_buffer);
+        free(swiglu_buffer);
+    }
+}
+
+/**
  * AVX-512 Vectorized Multi-Head Attention
  *
  * Computes: Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
@@ -3958,4 +4204,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "VNNI v3 with fused quantize (same tiling as v3)");
     m.def("matmul_free_vnni_v3_fused_qkv_softmax", &matmul_free_vnni_v3_fused_qkv_softmax,
           "VNNI v3 fused Q,K,V projection + softmax (reads input once)");
+    m.def("matmul_free_vnni_v3_fused_swiglu", &matmul_free_vnni_v3_fused_swiglu,
+          "VNNI v3 fused matmul + SwiGLU (eliminates 16384 int32 intermediate)");
 }

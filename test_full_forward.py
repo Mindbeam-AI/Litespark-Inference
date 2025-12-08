@@ -356,6 +356,25 @@ def fused_matmul_quantize(x_int8, x_scales, w_int8, w_sum, M, N, K):
     return y_int8, y_scales
 
 
+def fused_matmul_swiglu(x_int8, x_scales, w_int8, w_sum, M, N, K):
+    """
+    Fused matmul + SwiGLU: int8 input -> int8 output (never writes int32 to memory).
+    Input: x[M, K], weights W_up[N, K] where N = mlp_hidden (16384)
+    Output: y[M, N/2] int8 (8192 outputs after SwiGLU)
+    """
+    half_N = N // 2
+    y_int8 = torch.zeros(M, half_N, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.matmul_free_vnni_v3_fused_swiglu(
+        x_int8, x_scales, w_int8, w_sum,
+        y_int8, y_scales,
+        M, N, K, num_threads
+    )
+
+    return y_int8, y_scales
+
+
 # Flag to enable/disable fused MLP (for A/B testing)
 # Fused MLP is better for large M (memory bound), separate kernels better for small M
 USE_FUSED_MLP = False  # DISABLED - fused kernel is slower than separate kernels
@@ -365,6 +384,7 @@ FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
 USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
 USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
 USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
+USE_FUSED_MATMUL_SWIGLU = True  # Fuse up matmul + SwiGLU (eliminates 16384 int32 intermediate)
 
 
 # ============================================================================
@@ -493,13 +513,20 @@ class TransformerLayerNative:
             )
         else:
             # Separate kernels (original path)
-            # MLP Gate-Up: [M, hidden_dim] -> [M, mlp_hidden] int32
-            mlp_up_int32 = matmul_int32_out(x_res_int8, x_res_scales, self.w_up, self.w_up_sum,
-                                            M, self.mlp_hidden, self.hidden_dim)
+            if USE_FUSED_MATMUL_SWIGLU:
+                # Fused matmul + SwiGLU: eliminates 16384 int32 write/read
+                mlp_act_int8, mlp_act_scales = fused_matmul_swiglu(
+                    x_res_int8, x_res_scales, self.w_up, self.w_up_sum,
+                    M, self.mlp_hidden, self.hidden_dim
+                )
+            else:
+                # MLP Gate-Up: [M, hidden_dim] -> [M, mlp_hidden] int32
+                mlp_up_int32 = matmul_int32_out(x_res_int8, x_res_scales, self.w_up, self.w_up_sum,
+                                                M, self.mlp_hidden, self.hidden_dim)
 
-            # SwiGLU: [M, mlp_hidden] int32 -> [M, mlp_intermediate] int8
-            mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_res_scales,
-                                                         M, self.mlp_hidden)
+                # SwiGLU: [M, mlp_hidden] int32 -> [M, mlp_intermediate] int8
+                mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_res_scales,
+                                                             M, self.mlp_hidden)
 
             # MLP Down: [M, mlp_intermediate] -> [M, hidden_dim]
             if USE_FUSED_MATMUL_QUANTIZE:
@@ -693,6 +720,7 @@ def run_benchmarks():
     print(f"  USE_FUSED_QKV: {USE_FUSED_QKV}")
     print(f"  USE_FUSED_MATMUL_SOFTMAX: {USE_FUSED_MATMUL_SOFTMAX}")
     print(f"  USE_FUSED_MATMUL_QUANTIZE: {USE_FUSED_MATMUL_QUANTIZE}")
+    print(f"  USE_FUSED_MATMUL_SWIGLU: {USE_FUSED_MATMUL_SWIGLU}")
     print(f"  USE_FUSED_MLP: {USE_FUSED_MLP}")
     print()
 
