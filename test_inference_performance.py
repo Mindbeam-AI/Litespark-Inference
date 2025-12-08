@@ -11,10 +11,7 @@ import time
 import sys
 import platform
 from pathlib import Path
-
-# Add src to path
-sys.path.append('src')
-from cpu_ops import load_kernels
+from torch.utils.cpp_extension import load
 
 def test_inference_patterns():
     """Test performance on realistic inference patterns."""
@@ -23,16 +20,25 @@ def test_inference_patterns():
     print("GPT-2 Inference Performance Test")
     print("=" * 70)
     
-    # Load kernels
+    # Load kernels - EXACTLY the same as test_full_forward.py
     arch = platform.machine().lower()
-    if arch in ['x86_64', 'amd64']:
-        arch = 'x86_64'
-    else:
+    if arch not in ['x86_64', 'amd64']:
         print(f"Unsupported architecture: {arch}")
         return
-        
-    kernel = load_kernels(arch)
-    print(f"Loaded kernel for {arch}")
+
+    print("Loading VNNI kernels...")
+
+    # Use exact same loading as test_full_forward.py to ensure we get the optimized kernels
+    kernel = load(
+        name="vnni_kernel_inference_test",
+        sources=["src/cpu_ops/kernels/x86_64/matmul_free_tmac_vnni.cpp"],
+        extra_cflags=['-O3', '-march=native', '-ffast-math', '-fopenmp'],
+        extra_ldflags=['-lgomp'],
+        verbose=True  # Show compilation to verify correct kernel
+    )
+
+    print("✅ VNNI kernels loaded successfully")
+    print("✅ Using optimized VNNI v2/v3/v4/v5/v6 kernels (same as transformer benchmark)")
     
     # GPT-2 layer dimensions
     test_cases = [
@@ -59,8 +65,8 @@ def test_inference_patterns():
     ]
     
     print(f"\nTesting {len(test_cases)} inference patterns...")
-    print(f"{'Description':<35} {'M':<4} {'N':<6} {'K':<6} {'Time (ms)':<10} {'GFLOPS':<8}")
-    print("-" * 70)
+    print(f"{'Description':<35} {'M':<4} {'N':<6} {'K':<6} {'Time (ms)':<10} {'GFLOPS':<8} {'Kernel'}")
+    print("-" * 80)
     
     results = []
     
@@ -73,22 +79,52 @@ def test_inference_patterns():
         y = torch.zeros(M, N, dtype=torch.float32)
         bias = torch.zeros(N, dtype=torch.float32)
         
+        # Use same threading and kernel selection as test_full_forward.py
+        base_threads = 8  # Same as transformer benchmark
+        if M <= 8:
+            threads = min(4, base_threads)
+        elif M <= 32:
+            threads = min(6, base_threads)
+        else:
+            threads = base_threads
+
+        # Use same kernel selection logic as matmul_int32_out in test_full_forward.py
+        if N >= 8192:
+            kernel_func = kernel.matmul_free_vnni_v4_large_n
+            y_out = torch.zeros(M, N, dtype=torch.int32)
+            kernel_name = "v4"
+        elif N >= 4096 and M >= 16:
+            kernel_func = kernel.matmul_free_vnni_v4_large_n
+            y_out = torch.zeros(M, N, dtype=torch.int32)
+            kernel_name = "v4"
+        elif M >= 64:
+            kernel_func = kernel.matmul_free_vnni_v5_large_m
+            y_out = torch.zeros(M, N, dtype=torch.int32)
+            kernel_name = "v5"
+        elif M >= 32 and N >= 2048:
+            kernel_func = kernel.matmul_free_vnni_v5_large_m
+            y_out = torch.zeros(M, N, dtype=torch.int32)
+            kernel_name = "v5"
+        else:
+            kernel_func = kernel.matmul_free_vnni_v3
+            y_out = y  # v3 outputs float32
+            kernel_name = "v3"
+
         # Warmup
         for _ in range(3):
-            kernel.matmul_free_vnni_v3(
-                x_int8, scales, w_int8, w_sum, y, bias, M, N, K, 8
-            )
-        
+            if kernel_name == "v3":
+                kernel_func(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+            else:
+                kernel_func(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
+
         # Benchmark
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
         start_time = time.time()
-        
+
         for _ in range(10):
-            kernel.matmul_free_vnni_v3(
-                x_int8, scales, w_int8, w_sum, y, bias, M, N, K, 8
-            )
-        
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+            if kernel_name == "v3":
+                kernel_func(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+            else:
+                kernel_func(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
         end_time = time.time()
         
         # Calculate metrics
@@ -96,7 +132,7 @@ def test_inference_patterns():
         flops = 2 * M * N * K  # Approximate FLOPs for matmul
         gflops = flops / (avg_time_ms * 1e6)
         
-        print(f"{desc:<35} {M:<4} {N:<6} {K:<6} {avg_time_ms:<10.2f} {gflops:<8.1f}")
+        print(f"{desc:<35} {M:<4} {N:<6} {K:<6} {avg_time_ms:<10.2f} {gflops:<8.1f} ({kernel_name})")
         
         results.append({
             'description': desc,
