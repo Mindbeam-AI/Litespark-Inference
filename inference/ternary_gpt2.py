@@ -107,25 +107,11 @@ def ternary_linear(x: torch.Tensor, layer: TernaryLinear, kernel, num_threads: i
     y = torch.zeros(M, N, dtype=torch.float32)
     bias = layer.bias if layer.bias is not None else torch.Tensor()
 
-    # Inference-optimized kernel selection
-    if N >= 10000:
-        # Large vocabulary (LM head): use v6 for better cache behavior
-        # Note: v6 outputs int32, so we need a different approach for LM head
-        # For now, use v4 which is still better than v3 for large N
-        kernel.matmul_free_vnni_v4_large_n(
-            x_int8, x_scale,
-            layer.w_int8, layer.w_sum,
-            y, M, N, K, optimal_threads
-        )
-    elif N >= 4096:
-        # Large MLP layers: use v4 for better parallelization over N
-        kernel.matmul_free_vnni_v4_large_n(
-            x_int8, x_scale,
-            layer.w_int8, layer.w_sum,
-            y, M, N, K, optimal_threads
-        )
-    elif K <= 1024 and N <= 4096:
-        # Most attention layers: use v2 for small dimensions (less overhead)
+    # FIXED: Use original working kernel selection with adaptive threading
+    print(f"DEBUG: ternary_linear M={M}, N={N}, K={K}, threads={optimal_threads}")
+
+    if K <= 1024 and N <= 4096:
+        print(f"DEBUG: Using v2 kernel for small dims K={K}, N={N}")
         kernel.matmul_free_vnni_v2(
             x_int8, x_scale,
             layer.w_int8, layer.w_sum,
@@ -133,7 +119,7 @@ def ternary_linear(x: torch.Tensor, layer: TernaryLinear, kernel, num_threads: i
             M, N, K, optimal_threads
         )
     else:
-        # Medium dimensions: use v3 with adaptive tiling
+        print(f"DEBUG: Using v3 kernel for large dims K={K}, N={N}")
         kernel.matmul_free_vnni_v3(
             x_int8, x_scale,
             layer.w_int8, layer.w_sum,

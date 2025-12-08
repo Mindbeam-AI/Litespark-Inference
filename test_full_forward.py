@@ -240,52 +240,46 @@ def quantize_activations_initial(x):
 
 def get_optimal_threads(base_threads, M, N):
     """Get optimal thread count based on workload characteristics"""
-    if M <= 16 and N <= 4096:
-        return min(2, base_threads)  # Small workloads: minimize thread overhead
+    if M <= 8:
+        result = 1  # Single token generation - avoid thread overhead completely
+    elif M <= 16 and N <= 4096:
+        result = min(2, base_threads)  # Small workloads: minimize thread overhead
     elif M <= 32:
-        return min(4, base_threads)  # Medium workloads: moderate threading
+        result = min(4, base_threads)  # Medium workloads: moderate threading
     elif N >= 16384:
-        return min(8, base_threads)  # Large N: more threads for parallelization
+        result = min(8, base_threads)  # Large N: more threads for parallelization
     else:
-        return min(6, base_threads)  # Conservative default
+        result = min(6, base_threads)  # Conservative default
+
+    print(f"DEBUG: Thread selection - M={M}, N={N}, base={base_threads} -> optimal={result}")
+    return result
 
 def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     """
-    Run ternary matmul with int32 output - optimized kernel selection.
+    Run ternary matmul with int32 output - FIXED kernel selection.
     Output stays in int32 for chaining with softmax/swiglu.
-
-    Enhanced kernel selection:
-    - v6: Very large N (better cache behavior) - excellent for large MLP up_matmul
-    - v4: Large N (parallelizes over N blocks) - good for medium MLP up_matmul
-    - v5: Large M (parallelizes over M×N tiles) - good for down_matmul
-    - v3: Default for small M and small N
     """
     y_int32 = torch.zeros(M, N, dtype=torch.int32)
 
     # Adaptive thread selection
     optimal_threads = get_optimal_threads(num_threads, M, N)
 
-    if N >= 8192:
-        # Very large N: use v6 for better cache behavior than v4
-        # Excellent for large MLP up projection: M=128, N=16384, K=2048
-        kernel.matmul_free_vnni_v6_large_n_tiled(
-            x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
-        )
-    elif N >= 4096:
-        # Large N: use v4 (parallelizes over N blocks)
-        # Good for medium MLP layers: M=128, N=4096-8192, K=2048
+    # DEBUG: Print what we're doing
+    print(f"DEBUG: M={M}, N={N}, K={K}, threads={optimal_threads}")
+
+    # SIMPLIFIED kernel selection - use original logic that was working
+    if N >= 4096:
+        print(f"DEBUG: Using v4 kernel for large N={N}")
         kernel.matmul_free_vnni_v4_large_n(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
         )
     elif M >= 64:
-        # Large M: use v5 (parallelizes over M×N tiles)
-        # Good for down projection: M=128, N=2048, K=8192
+        print(f"DEBUG: Using v5 kernel for large M={M}")
         kernel.matmul_free_vnni_v5_large_m(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
         )
     else:
-        # Small M and N: use v3 (cache-optimized tiling)
-        # Good for attention: M=128, N=2048, K=2048
+        print(f"DEBUG: Using v3 kernel for small M={M}, N={N}")
         bias = torch.empty(0)
         kernel.matmul_free_vnni_v3_int32_out(
             x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, optimal_threads
@@ -499,7 +493,7 @@ FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
 USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
 USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
 USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
-USE_FUSED_MATMUL_SWIGLU = True   # ENABLED - using optimized single-pass kernel
+USE_FUSED_MATMUL_SWIGLU = False  # DISABLED - debug original performance first
 
 
 # ============================================================================
