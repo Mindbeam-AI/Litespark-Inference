@@ -21,7 +21,7 @@ import json
 import platform
 import os
 import gc
-import tracemalloc
+import resource
 from pathlib import Path
 from datetime import datetime
 from torch.utils.cpp_extension import load
@@ -641,26 +641,24 @@ def benchmark_forward(model, x, warmup=WARMUP_ITERS, iters=BENCH_ITERS):
 
     gc.collect()
 
-    # Benchmark with memory tracking
-    times = []
-    peak_memory_mb = 0
+    # Get baseline memory before benchmark
+    baseline_mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
+    # Benchmark
+    times = []
     for i in range(iters):
         x_input = x.clone()
-
-        # Track memory on first iteration
-        if i == 0:
-            tracemalloc.start()
-
         start = time.perf_counter()
         _ = model.forward(x_input)
         end = time.perf_counter()
         times.append((end - start) * 1000)  # ms
 
-        if i == 0:
-            current, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
-            peak_memory_mb = peak / (1024 * 1024)  # Convert to MB
+    # Get peak memory after benchmark (on macOS ru_maxrss is in bytes, on Linux it's in KB)
+    peak_mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if platform.system() == 'Darwin':
+        peak_memory_mb = peak_mem / (1024 * 1024)  # bytes to MB
+    else:
+        peak_memory_mb = peak_mem / 1024  # KB to MB
 
     return {
         'mean_ms': np.mean(times),
