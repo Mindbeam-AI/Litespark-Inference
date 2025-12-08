@@ -127,7 +127,7 @@ Q_DIM = HIDDEN_DIM
 K_DIM = HIDDEN_DIM
 V_DIM = HIDDEN_DIM
 
-# Test batch sizes - expanded to see larger batch performance
+# Test batch sizes
 BATCH_SIZES = [1, 16, 32, 64, 128, 256]
 
 # Number of warmup and benchmark iterations
