@@ -1,5 +1,7 @@
 # Documentation (keep local only)
 *.md
+*.docx
+*.pdf
 docs/
 
 # Jupyter Notebooks
