@@ -869,7 +869,8 @@ void matmul_free_vnni_v3_fused_softmax(
 
     constexpr int N_TILE = 64;
     // Use larger M_TILE for better thread utilization when M is large
-    const int M_TILE = (M >= 64) ? 64 : 32;
+    // For small M, use M directly to avoid tiling overhead
+    const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
 
     omp_set_num_threads(num_threads);
 
@@ -1127,7 +1128,8 @@ void matmul_free_vnni_v3_fused_quantize(
 
     constexpr int N_TILE = 64;
     // Use larger M_TILE for better thread utilization when M is large
-    const int M_TILE = (M >= 64) ? 64 : 32;
+    // For small M, use M directly to avoid tiling overhead
+    const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
 
     omp_set_num_threads(num_threads);
 
@@ -1384,7 +1386,8 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
 
     constexpr int N_TILE = 64;
     // Use larger M_TILE for better thread utilization when M is large
-    const int M_TILE = (M >= 64) ? 64 : 32;
+    // For small M, use M directly to avoid tiling overhead
+    const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
 
     omp_set_num_threads(num_threads);
 
