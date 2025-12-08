@@ -1384,7 +1384,9 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
     const int K_padded = ((K + 63) / 64) * 64;
     const int N_padded = ((N + 15) / 16) * 16;
 
-    constexpr int N_TILE = 64;
+    // Smaller N_TILE for QKV since we load 3 weight matrices per tile
+    // 3 × 32 × 2048 = 192KB fits better in L2 than 3 × 64 × 2048 = 384KB
+    constexpr int N_TILE = 32;
     // Use larger M_TILE for better thread utilization when M is large
     // For small M, use M directly to avoid tiling overhead
     const int M_TILE = (M >= 64) ? 64 : ((M >= 32) ? 32 : M);
