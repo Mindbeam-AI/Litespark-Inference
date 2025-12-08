@@ -240,19 +240,20 @@ def quantize_activations_initial(x):
 
 def get_optimal_threads(base_threads, M, N):
     """Get optimal thread count based on workload characteristics"""
-    if M <= 8:
-        result = 1  # Single token generation - avoid thread overhead completely
-    elif M <= 16 and N <= 4096:
-        result = min(2, base_threads)  # Small workloads: minimize thread overhead
+    if M == 1:
+        return 1  # Single token: always use 1 thread
+    elif M <= 4:
+        return 1  # Very small batches: single thread
+    elif M <= 8:
+        return 2  # Small batches: minimal threading
+    elif M <= 16:
+        return min(3, base_threads)  # Small-medium batches
     elif M <= 32:
-        result = min(4, base_threads)  # Medium workloads: moderate threading
+        return min(4, base_threads)  # Medium batches
     elif N >= 16384:
-        result = min(8, base_threads)  # Large N: more threads for parallelization
+        return min(8, base_threads)  # Large N: more threads
     else:
-        result = min(6, base_threads)  # Conservative default
-
-    print(f"DEBUG: Thread selection - M={M}, N={N}, base={base_threads} -> optimal={result}")
-    return result
+        return min(6, base_threads)  # Conservative default
 
 def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     """
@@ -264,22 +265,25 @@ def matmul_int32_out(x_int8, scales, w_int8, w_sum, M, N, K):
     # Adaptive thread selection
     optimal_threads = get_optimal_threads(num_threads, M, N)
 
-    # DEBUG: Print what we're doing
-    print(f"DEBUG: M={M}, N={N}, K={K}, threads={optimal_threads}")
-
-    # SIMPLIFIED kernel selection - use original logic that was working
-    if N >= 4096:
-        print(f"DEBUG: Using v4 kernel for large N={N}")
+    # Optimized kernel selection for small batches
+    if M <= 4 and N <= 4096:
+        # Very small batches: use v2 with minimal threading
+        bias = torch.empty(0)
+        kernel.matmul_free_vnni_v2(
+            x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, optimal_threads
+        )
+    elif N >= 4096:
+        # Large N: use v4
         kernel.matmul_free_vnni_v4_large_n(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
         )
     elif M >= 64:
-        print(f"DEBUG: Using v5 kernel for large M={M}")
+        # Large M: use v5
         kernel.matmul_free_vnni_v5_large_m(
             x_int8, scales, w_int8, w_sum, y_int32, M, N, K, optimal_threads
         )
     else:
-        print(f"DEBUG: Using v3 kernel for small M={M}, N={N}")
+        # Default: use v3
         bias = torch.empty(0)
         kernel.matmul_free_vnni_v3_int32_out(
             x_int8, scales, w_int8, w_sum, y_int32, bias, M, N, K, optimal_threads

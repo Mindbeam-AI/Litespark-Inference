@@ -80,12 +80,16 @@ def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 def get_inference_threads(M, N, base_threads):
     """Get optimal thread count for inference workloads"""
-    if M <= 8:
-        return 1                    # Single token generation - avoid thread overhead
+    if M == 1:
+        return 1                    # Single token: always 1 thread
+    elif M <= 4:
+        return 1                    # Very small batches: single thread
+    elif M <= 8:
+        return 2                    # Small batches: minimal threading
+    elif M <= 16:
+        return min(3, base_threads) # Small-medium batches
     elif M <= 32:
-        return min(2, base_threads) # Small sequences - minimal threading
-    elif M <= 128:
-        return min(4, base_threads) # Medium sequences - moderate threading
+        return min(4, base_threads) # Medium batches
     elif N >= 10000:
         return min(8, base_threads) # LM head needs more threads for large vocab
     else:
@@ -107,11 +111,17 @@ def ternary_linear(x: torch.Tensor, layer: TernaryLinear, kernel, num_threads: i
     y = torch.zeros(M, N, dtype=torch.float32)
     bias = layer.bias if layer.bias is not None else torch.Tensor()
 
-    # FIXED: Use original working kernel selection with adaptive threading
-    print(f"DEBUG: ternary_linear M={M}, N={N}, K={K}, threads={optimal_threads}")
-
-    if K <= 1024 and N <= 4096:
-        print(f"DEBUG: Using v2 kernel for small dims K={K}, N={N}")
+    # Optimized kernel selection for small batches
+    if M <= 4 and K <= 1024 and N <= 4096:
+        # Very small batches with small dimensions: use v2
+        kernel.matmul_free_vnni_v2(
+            x_int8, x_scale,
+            layer.w_int8, layer.w_sum,
+            y, bias,
+            M, N, K, optimal_threads
+        )
+    elif K <= 1024 and N <= 4096:
+        # Small dimensions: use v2
         kernel.matmul_free_vnni_v2(
             x_int8, x_scale,
             layer.w_int8, layer.w_sum,
@@ -119,7 +129,7 @@ def ternary_linear(x: torch.Tensor, layer: TernaryLinear, kernel, num_threads: i
             M, N, K, optimal_threads
         )
     else:
-        print(f"DEBUG: Using v3 kernel for large dims K={K}, N={N}")
+        # Larger dimensions: use v3
         kernel.matmul_free_vnni_v3(
             x_int8, x_scale,
             layer.w_int8, layer.w_sum,
