@@ -295,10 +295,75 @@ def native_fused_mlp(x_int8, x_scales, w_up, w_up_sum, w_down, w_down_sum, M, hi
     return y_int8, y_scales
 
 
+# ============================================================================
+# Fused Kernel Wrappers (NEW - matmul+softmax, QKV fusion, matmul+quantize)
+# ============================================================================
+
+def fused_matmul_softmax(x_int8, x_scales, w_int8, w_sum, M, N, K):
+    """
+    Fused matmul + softmax: int8 input -> int8 output (never writes int32 to memory).
+    Eliminates intermediate int32 storage.
+    """
+    y_int8 = torch.zeros(M, N, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.matmul_softmax_int8(
+        x_int8, x_scales, w_int8, w_sum,
+        y_int8, y_scales,
+        M, N, K, num_threads
+    )
+
+    return y_int8, y_scales
+
+
+def fused_qkv_softmax(x_int8, x_scales, wq, wq_sum, wk, wk_sum, wv, wv_sum, M, N, K):
+    """
+    Fused Q,K,V projection + softmax: reads input once, computes all three.
+    Returns q, k, v as int8 with softmax already applied.
+    """
+    q_int8 = torch.zeros(M, N, dtype=torch.int8)
+    q_scales = torch.zeros(M, dtype=torch.float32)
+    k_int8 = torch.zeros(M, N, dtype=torch.int8)
+    k_scales = torch.zeros(M, dtype=torch.float32)
+    v_int8 = torch.zeros(M, N, dtype=torch.int8)
+    v_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.matmul_qkv_softmax_int8(
+        x_int8, x_scales,
+        wq, wq_sum, wk, wk_sum, wv, wv_sum,
+        q_int8, q_scales, k_int8, k_scales, v_int8, v_scales,
+        M, N, K, num_threads
+    )
+
+    return q_int8, q_scales, k_int8, k_scales, v_int8, v_scales
+
+
+def fused_matmul_quantize(x_int8, x_scales, w_int8, w_sum, M, N, K):
+    """
+    Fused matmul + quantize: int8 input -> int8 output (never writes int32 to memory).
+    For use with down projection in MLP.
+    """
+    y_int8 = torch.zeros(M, N, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.matmul_quantize_int8(
+        x_int8, x_scales, w_int8, w_sum,
+        y_int8, y_scales,
+        M, N, K, num_threads
+    )
+
+    return y_int8, y_scales
+
+
 # Flag to enable/disable fused MLP (for A/B testing)
 # Fused MLP is better for large M (memory bound), separate kernels better for small M
-USE_FUSED_MLP = True
+USE_FUSED_MLP = False  # DISABLED - fused kernel is slower than separate kernels
 FUSED_MLP_MIN_M = 32  # Only use fused kernel when M >= this threshold
+
+# Flag to enable new fusion strategies
+USE_FUSED_MATMUL_SOFTMAX = True  # Fuse matmul + softmax (eliminates int32 writes)
+USE_FUSED_QKV = True  # Fuse Q,K,V projections (reads input once)
+USE_FUSED_MATMUL_QUANTIZE = True  # Fuse down matmul + quantize
 
 
 # ============================================================================
@@ -344,27 +409,53 @@ class TransformerLayerNative:
         Output: y_int8 [M, hidden_dim] int8, y_scales [M] float32
 
         ALL operations in int8/int32 - NO float32 except for scales.
+        Uses fused kernels when enabled to reduce memory traffic.
         """
         M = x_int8.shape[0]
 
         # === ATTENTION BLOCK ===
 
-        # Q Projection: [M, hidden_dim] -> [M, hidden_dim] int32
-        q_int32 = matmul_int32_out(x_int8, x_scales, self.w_q, self.w_q_sum,
-                                   M, self.hidden_dim, self.hidden_dim)
+        if USE_FUSED_QKV:
+            # Fused Q,K,V projection + softmax: reads input once
+            q_int8_sm, q_scales_sm, k_int8_sm, k_scales_sm, v_int8_sm, v_scales_sm = fused_qkv_softmax(
+                x_int8, x_scales,
+                self.w_q, self.w_q_sum,
+                self.w_k, self.w_k_sum,
+                self.w_v, self.w_v_sum,
+                M, self.hidden_dim, self.hidden_dim
+            )
+        elif USE_FUSED_MATMUL_SOFTMAX:
+            # Fused matmul + softmax for each projection separately
+            q_int8_sm, q_scales_sm = fused_matmul_softmax(
+                x_int8, x_scales, self.w_q, self.w_q_sum,
+                M, self.hidden_dim, self.hidden_dim
+            )
+            k_int8_sm, k_scales_sm = fused_matmul_softmax(
+                x_int8, x_scales, self.w_k, self.w_k_sum,
+                M, self.hidden_dim, self.hidden_dim
+            )
+            v_int8_sm, v_scales_sm = fused_matmul_softmax(
+                x_int8, x_scales, self.w_v, self.w_v_sum,
+                M, self.hidden_dim, self.hidden_dim
+            )
+        else:
+            # Original path: separate matmul and softmax
+            # Q Projection: [M, hidden_dim] -> [M, hidden_dim] int32
+            q_int32 = matmul_int32_out(x_int8, x_scales, self.w_q, self.w_q_sum,
+                                       M, self.hidden_dim, self.hidden_dim)
 
-        # K Projection: [M, hidden_dim] -> [M, hidden_dim] int32
-        k_int32 = matmul_int32_out(x_int8, x_scales, self.w_k, self.w_k_sum,
-                                   M, self.hidden_dim, self.hidden_dim)
+            # K Projection: [M, hidden_dim] -> [M, hidden_dim] int32
+            k_int32 = matmul_int32_out(x_int8, x_scales, self.w_k, self.w_k_sum,
+                                       M, self.hidden_dim, self.hidden_dim)
 
-        # V Projection: [M, hidden_dim] -> [M, hidden_dim] int32
-        v_int32 = matmul_int32_out(x_int8, x_scales, self.w_v, self.w_v_sum,
-                                   M, self.hidden_dim, self.hidden_dim)
+            # V Projection: [M, hidden_dim] -> [M, hidden_dim] int32
+            v_int32 = matmul_int32_out(x_int8, x_scales, self.w_v, self.w_v_sum,
+                                       M, self.hidden_dim, self.hidden_dim)
 
-        # Apply softmax to Q, K, V (as per requirement: softmax after QKV)
-        q_int8_sm, q_scales_sm = native_softmax(q_int32, x_scales, M, self.hidden_dim)
-        k_int8_sm, k_scales_sm = native_softmax(k_int32, x_scales, M, self.hidden_dim)
-        v_int8_sm, v_scales_sm = native_softmax(v_int32, x_scales, M, self.hidden_dim)
+            # Apply softmax to Q, K, V (as per requirement: softmax after QKV)
+            q_int8_sm, q_scales_sm = native_softmax(q_int32, x_scales, M, self.hidden_dim)
+            k_int8_sm, k_scales_sm = native_softmax(k_int32, x_scales, M, self.hidden_dim)
+            v_int8_sm, v_scales_sm = native_softmax(v_int32, x_scales, M, self.hidden_dim)
 
         # Native attention: Q @ K^T -> softmax -> @ V (all in int8/int32)
         attn_int8, attn_scales = native_attention(
@@ -373,12 +464,16 @@ class TransformerLayerNative:
             M, self.num_heads, self.head_dim, self.scale
         )
 
-        # Output Projection: [M, hidden_dim] -> [M, hidden_dim] int32
-        o_int32 = matmul_int32_out(attn_int8, attn_scales, self.w_o, self.w_o_sum,
-                                   M, self.hidden_dim, self.hidden_dim)
-
-        # Softmax after O projection
-        o_int8, o_scales = native_softmax(o_int32, attn_scales, M, self.hidden_dim)
+        # Output Projection: [M, hidden_dim] -> int8 with softmax
+        if USE_FUSED_MATMUL_SOFTMAX:
+            o_int8, o_scales = fused_matmul_softmax(
+                attn_int8, attn_scales, self.w_o, self.w_o_sum,
+                M, self.hidden_dim, self.hidden_dim
+            )
+        else:
+            o_int32 = matmul_int32_out(attn_int8, attn_scales, self.w_o, self.w_o_sum,
+                                       M, self.hidden_dim, self.hidden_dim)
+            o_int8, o_scales = native_softmax(o_int32, attn_scales, M, self.hidden_dim)
 
         # Fused residual: x + o -> int8 (no float32 intermediate)
         x_res_int8, x_res_scales = native_fused_residual(
@@ -405,14 +500,20 @@ class TransformerLayerNative:
             mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_res_scales,
                                                          M, self.mlp_hidden)
 
-            # MLP Down: [M, mlp_intermediate] -> [M, hidden_dim] int32
-            mlp_down_int32 = matmul_int32_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
-                                              M, self.hidden_dim, self.mlp_intermediate)
-
-            # Quantize int32 output to int8 (native kernel)
-            mlp_down_int8, mlp_down_scales = native_quantize_int32(
-                mlp_down_int32, mlp_act_scales, M, self.hidden_dim
-            )
+            # MLP Down: [M, mlp_intermediate] -> [M, hidden_dim]
+            if USE_FUSED_MATMUL_QUANTIZE:
+                # Fused matmul + quantize: eliminates int32 write
+                mlp_down_int8, mlp_down_scales = fused_matmul_quantize(
+                    mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
+                    M, self.hidden_dim, self.mlp_intermediate
+                )
+            else:
+                mlp_down_int32 = matmul_int32_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
+                                                  M, self.hidden_dim, self.mlp_intermediate)
+                # Quantize int32 output to int8 (native kernel)
+                mlp_down_int8, mlp_down_scales = native_quantize_int32(
+                    mlp_down_int32, mlp_act_scales, M, self.hidden_dim
+                )
 
         # Fused residual: x_res + mlp_down -> int8
         y_int8, y_scales = native_fused_residual(
@@ -586,6 +687,12 @@ def run_benchmarks():
     print(f"Head dim: {HEAD_DIM}")
     print(f"MLP hidden: {MLP_HIDDEN}")
     print(f"Layers: {N_LAYERS}")
+    print()
+    print("Fusion settings:")
+    print(f"  USE_FUSED_QKV: {USE_FUSED_QKV}")
+    print(f"  USE_FUSED_MATMUL_SOFTMAX: {USE_FUSED_MATMUL_SOFTMAX}")
+    print(f"  USE_FUSED_MATMUL_QUANTIZE: {USE_FUSED_MATMUL_QUANTIZE}")
+    print(f"  USE_FUSED_MLP: {USE_FUSED_MLP}")
     print()
 
     # Initialize models

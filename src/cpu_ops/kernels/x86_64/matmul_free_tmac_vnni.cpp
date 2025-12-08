@@ -1467,6 +1467,471 @@ void softmax_int8(
 }
 
 /**
+ * FUSION 1: Matmul + Softmax
+ *
+ * Fuses ternary matmul with softmax to avoid writing int32 intermediate.
+ * Computes: y_int8 = softmax(x_int8 @ W_ternary)
+ *
+ * Memory savings: Eliminates M×N int32 write + read
+ */
+void matmul_softmax_int8(
+    torch::Tensor x_int8_tensor,    // [M, K] int8 input
+    torch::Tensor x_scale_tensor,   // [M] float32 input scales
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8 ternary weights
+    torch::Tensor w_sum_tensor,     // [N] int32 weight sums
+    torch::Tensor y_tensor,         // [M, N] int8 output (softmax applied)
+    torch::Tensor y_scale_tensor,   // [M] float32 output scales
+    int M, int N, int K,
+    int num_threads
+) {
+    const int8_t* __restrict__ x_int8 = x_int8_tensor.data_ptr<int8_t>();
+    const float* __restrict__ x_scales = x_scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ w_sum = w_sum_tensor.data_ptr<int32_t>();
+    int8_t* __restrict__ y = y_tensor.data_ptr<int8_t>();
+    float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
+
+    const int K_padded = ((K + 63) / 64) * 64;
+    const int N_padded = ((N + 15) / 16) * 16;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel
+    {
+        // Thread-local buffers
+        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_padded);
+        float* matmul_out = (float*)aligned_alloc(64, N_padded * sizeof(float));
+
+        #pragma omp for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const int8_t* x_row = x_int8 + m * K;
+            float x_scale = x_scales[m];
+            int8_t* y_row = y + m * N;
+
+            // Convert input to uint8 (for VNNI)
+            const __m512i offset_vec = _mm512_set1_epi8((char)128);
+            int k = 0;
+            for (; k + 63 < K; k += 64) {
+                __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+                __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+                _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+            }
+            for (; k < K; k++) {
+                x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+            }
+            for (; k < K_padded; k++) {
+                x_uint8[k] = 128;
+            }
+
+            // Compute matmul and convert to float in one pass
+            __m512 max_vec = _mm512_set1_ps(-INFINITY);
+
+            int n = 0;
+            for (; n + 3 < N; n += 4) {
+                const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+
+                __m512i acc0 = _mm512_setzero_si512();
+                __m512i acc1 = _mm512_setzero_si512();
+                __m512i acc2 = _mm512_setzero_si512();
+                __m512i acc3 = _mm512_setzero_si512();
+
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                    acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                    acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                    acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+                }
+
+                // Convert to float immediately (no int32 write to memory)
+                float v0 = static_cast<float>(_mm512_reduce_add_epi32(acc0) - 128 * w_sum[n+0]) * x_scale;
+                float v1 = static_cast<float>(_mm512_reduce_add_epi32(acc1) - 128 * w_sum[n+1]) * x_scale;
+                float v2 = static_cast<float>(_mm512_reduce_add_epi32(acc2) - 128 * w_sum[n+2]) * x_scale;
+                float v3 = static_cast<float>(_mm512_reduce_add_epi32(acc3) - 128 * w_sum[n+3]) * x_scale;
+
+                matmul_out[n+0] = v0;
+                matmul_out[n+1] = v1;
+                matmul_out[n+2] = v2;
+                matmul_out[n+3] = v3;
+
+                // Track max for softmax
+                __m128 vals = _mm_set_ps(v3, v2, v1, v0);
+                max_vec = _mm512_max_ps(max_vec, _mm512_castps128_ps512(vals));
+            }
+            for (; n < N; n++) {
+                const int8_t* w_row = w_int8 + n * K_padded;
+                __m512i acc = _mm512_setzero_si512();
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                }
+                float v = static_cast<float>(_mm512_reduce_add_epi32(acc) - 128 * w_sum[n]) * x_scale;
+                matmul_out[n] = v;
+            }
+            // Pad with -inf
+            for (; n < N_padded; n++) {
+                matmul_out[n] = -INFINITY;
+            }
+
+            // Find max
+            float max_val = -INFINITY;
+            for (int i = 0; i < N; i++) {
+                max_val = std::max(max_val, matmul_out[i]);
+            }
+
+            // Compute exp(x - max) and sum
+            __m512 sum_vec = _mm512_setzero_ps();
+            __m512 max_broadcast = _mm512_set1_ps(max_val);
+            n = 0;
+            for (; n + 15 < N_padded; n += 16) {
+                __m512 vals = _mm512_load_ps(matmul_out + n);
+                __m512 shifted = _mm512_sub_ps(vals, max_broadcast);
+                __m512 exp_v = avx512_exp_fast(shifted);
+                _mm512_store_ps(matmul_out + n, exp_v);
+                sum_vec = _mm512_add_ps(sum_vec, exp_v);
+            }
+            float sum = _mm512_reduce_add_ps(sum_vec);
+
+            // Normalize and quantize to int8
+            float inv_sum = 1.0f / sum;
+            y_scales[m] = 1.0f / 127.0f;
+
+            __m512 inv_sum_vec = _mm512_set1_ps(inv_sum);
+            __m512 scale_127 = _mm512_set1_ps(127.0f);
+            __m512 zero_vec = _mm512_setzero_ps();
+            __m512 max_127 = _mm512_set1_ps(127.0f);
+
+            n = 0;
+            for (; n + 15 < N; n += 16) {
+                __m512 exp_v = _mm512_load_ps(matmul_out + n);
+                __m512 prob = _mm512_mul_ps(exp_v, inv_sum_vec);
+                __m512 scaled = _mm512_mul_ps(prob, scale_127);
+                scaled = _mm512_max_ps(scaled, zero_vec);
+                scaled = _mm512_min_ps(scaled, max_127);
+                scaled = _mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT);
+                __m512i int_vals = _mm512_cvtps_epi32(scaled);
+                __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+                _mm_storeu_si128((__m128i*)(y_row + n), packed);
+            }
+            for (; n < N; n++) {
+                float prob = matmul_out[n] * inv_sum;
+                int8_t q_val = static_cast<int8_t>(std::min(127.0f, std::round(prob * 127.0f)));
+                y_row[n] = q_val;
+            }
+        }
+
+        free(x_uint8);
+        free(matmul_out);
+    }
+}
+
+/**
+ * FUSION 2: QKV Projections (read input once)
+ *
+ * Computes Q, K, V projections together, reading input x only once.
+ * Includes softmax on each output.
+ *
+ * Memory savings: Read x once instead of 3 times
+ */
+void matmul_qkv_softmax_int8(
+    torch::Tensor x_int8_tensor,    // [M, K] int8 input
+    torch::Tensor x_scale_tensor,   // [M] float32 input scales
+    torch::Tensor wq_tensor,        // [N, K_padded] int8
+    torch::Tensor wq_sum_tensor,    // [N] int32
+    torch::Tensor wk_tensor,        // [N, K_padded] int8
+    torch::Tensor wk_sum_tensor,    // [N] int32
+    torch::Tensor wv_tensor,        // [N, K_padded] int8
+    torch::Tensor wv_sum_tensor,    // [N] int32
+    torch::Tensor q_tensor,         // [M, N] int8 output
+    torch::Tensor q_scale_tensor,   // [M] float32
+    torch::Tensor k_tensor,         // [M, N] int8 output
+    torch::Tensor k_scale_tensor,   // [M] float32
+    torch::Tensor v_tensor,         // [M, N] int8 output
+    torch::Tensor v_scale_tensor,   // [M] float32
+    int M, int N, int K,
+    int num_threads
+) {
+    const int8_t* __restrict__ x_int8 = x_int8_tensor.data_ptr<int8_t>();
+    const float* __restrict__ x_scales = x_scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ wq = wq_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ wq_sum = wq_sum_tensor.data_ptr<int32_t>();
+    const int8_t* __restrict__ wk = wk_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ wk_sum = wk_sum_tensor.data_ptr<int32_t>();
+    const int8_t* __restrict__ wv = wv_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ wv_sum = wv_sum_tensor.data_ptr<int32_t>();
+    int8_t* __restrict__ q_out = q_tensor.data_ptr<int8_t>();
+    float* __restrict__ q_scales = q_scale_tensor.data_ptr<float>();
+    int8_t* __restrict__ k_out = k_tensor.data_ptr<int8_t>();
+    float* __restrict__ k_scales = k_scale_tensor.data_ptr<float>();
+    int8_t* __restrict__ v_out = v_tensor.data_ptr<int8_t>();
+    float* __restrict__ v_scales = v_scale_tensor.data_ptr<float>();
+
+    const int K_padded = ((K + 63) / 64) * 64;
+    const int N_padded = ((N + 15) / 16) * 16;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel
+    {
+        // Thread-local buffers
+        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_padded);
+        float* q_float = (float*)aligned_alloc(64, N_padded * sizeof(float));
+        float* k_float = (float*)aligned_alloc(64, N_padded * sizeof(float));
+        float* v_float = (float*)aligned_alloc(64, N_padded * sizeof(float));
+
+        #pragma omp for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const int8_t* x_row = x_int8 + m * K;
+            float x_scale = x_scales[m];
+
+            // Convert input to uint8 ONCE (shared for Q, K, V)
+            const __m512i offset_vec = _mm512_set1_epi8((char)128);
+            int k = 0;
+            for (; k + 63 < K; k += 64) {
+                __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+                __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+                _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+            }
+            for (; k < K; k++) {
+                x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+            }
+            for (; k < K_padded; k++) {
+                x_uint8[k] = 128;
+            }
+
+            // Compute Q, K, V projections together
+            for (int n = 0; n < N; n++) {
+                const int8_t* wq_row = wq + n * K_padded;
+                const int8_t* wk_row = wk + n * K_padded;
+                const int8_t* wv_row = wv + n * K_padded;
+
+                __m512i acc_q = _mm512_setzero_si512();
+                __m512i acc_k = _mm512_setzero_si512();
+                __m512i acc_v = _mm512_setzero_si512();
+
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc_q = _mm512_dpbusd_epi32(acc_q, x_vec, _mm512_loadu_si512((__m512i*)(wq_row + kk)));
+                    acc_k = _mm512_dpbusd_epi32(acc_k, x_vec, _mm512_loadu_si512((__m512i*)(wk_row + kk)));
+                    acc_v = _mm512_dpbusd_epi32(acc_v, x_vec, _mm512_loadu_si512((__m512i*)(wv_row + kk)));
+                }
+
+                q_float[n] = static_cast<float>(_mm512_reduce_add_epi32(acc_q) - 128 * wq_sum[n]) * x_scale;
+                k_float[n] = static_cast<float>(_mm512_reduce_add_epi32(acc_k) - 128 * wk_sum[n]) * x_scale;
+                v_float[n] = static_cast<float>(_mm512_reduce_add_epi32(acc_v) - 128 * wv_sum[n]) * x_scale;
+            }
+            // Pad
+            for (int n = N; n < N_padded; n++) {
+                q_float[n] = -INFINITY;
+                k_float[n] = -INFINITY;
+                v_float[n] = -INFINITY;
+            }
+
+            // Apply softmax to each (Q, K, V)
+            auto apply_softmax = [&](float* data, int8_t* out, float* out_scale) {
+                // Find max
+                float max_val = -INFINITY;
+                for (int i = 0; i < N; i++) {
+                    max_val = std::max(max_val, data[i]);
+                }
+
+                // Compute exp and sum
+                float sum = 0.0f;
+                __m512 max_vec = _mm512_set1_ps(max_val);
+                __m512 sum_vec = _mm512_setzero_ps();
+
+                int n = 0;
+                for (; n + 15 < N_padded; n += 16) {
+                    __m512 vals = _mm512_load_ps(data + n);
+                    __m512 shifted = _mm512_sub_ps(vals, max_vec);
+                    __m512 exp_v = avx512_exp_fast(shifted);
+                    _mm512_store_ps(data + n, exp_v);
+                    sum_vec = _mm512_add_ps(sum_vec, exp_v);
+                }
+                sum = _mm512_reduce_add_ps(sum_vec);
+
+                // Normalize and quantize
+                float inv_sum = 1.0f / sum;
+                out_scale[m] = 1.0f / 127.0f;
+
+                __m512 inv_sum_vec = _mm512_set1_ps(inv_sum);
+                __m512 scale_127 = _mm512_set1_ps(127.0f);
+                __m512 zero_vec = _mm512_setzero_ps();
+                __m512 max_127 = _mm512_set1_ps(127.0f);
+
+                n = 0;
+                for (; n + 15 < N; n += 16) {
+                    __m512 exp_v = _mm512_load_ps(data + n);
+                    __m512 prob = _mm512_mul_ps(exp_v, inv_sum_vec);
+                    __m512 scaled = _mm512_mul_ps(prob, scale_127);
+                    scaled = _mm512_max_ps(scaled, zero_vec);
+                    scaled = _mm512_min_ps(scaled, max_127);
+                    scaled = _mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT);
+                    __m512i int_vals = _mm512_cvtps_epi32(scaled);
+                    __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+                    _mm_storeu_si128((__m128i*)(out + m * N + n), packed);
+                }
+                for (; n < N; n++) {
+                    float prob = data[n] * inv_sum;
+                    out[m * N + n] = static_cast<int8_t>(std::min(127.0f, std::round(prob * 127.0f)));
+                }
+            };
+
+            apply_softmax(q_float, q_out, q_scales);
+            apply_softmax(k_float, k_out, k_scales);
+            apply_softmax(v_float, v_out, v_scales);
+        }
+
+        free(x_uint8);
+        free(q_float);
+        free(k_float);
+        free(v_float);
+    }
+}
+
+/**
+ * FUSION 3: Matmul + Quantize
+ *
+ * Fuses ternary matmul with quantization to avoid writing int32 intermediate.
+ * Computes: y_int8 = quantize(x_int8 @ W_ternary)
+ *
+ * Different from matmul_softmax - this does simple per-row quantization
+ * (find max abs, scale to [-127, 127])
+ */
+void matmul_quantize_int8(
+    torch::Tensor x_int8_tensor,    // [M, K] int8 input
+    torch::Tensor x_scale_tensor,   // [M] float32 input scales
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8 ternary weights
+    torch::Tensor w_sum_tensor,     // [N] int32 weight sums
+    torch::Tensor y_tensor,         // [M, N] int8 output
+    torch::Tensor y_scale_tensor,   // [M] float32 output scales
+    int M, int N, int K,
+    int num_threads
+) {
+    const int8_t* __restrict__ x_int8 = x_int8_tensor.data_ptr<int8_t>();
+    const float* __restrict__ x_scales = x_scale_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ w_sum = w_sum_tensor.data_ptr<int32_t>();
+    int8_t* __restrict__ y = y_tensor.data_ptr<int8_t>();
+    float* __restrict__ y_scales = y_scale_tensor.data_ptr<float>();
+
+    const int K_padded = ((K + 63) / 64) * 64;
+
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel
+    {
+        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_padded);
+        float* matmul_out = (float*)aligned_alloc(64, ((N + 15) / 16) * 16 * sizeof(float));
+
+        #pragma omp for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const int8_t* x_row = x_int8 + m * K;
+            float x_scale = x_scales[m];
+            int8_t* y_row = y + m * N;
+
+            // Convert input to uint8
+            const __m512i offset_vec = _mm512_set1_epi8((char)128);
+            int k = 0;
+            for (; k + 63 < K; k += 64) {
+                __m512i x_vec = _mm512_loadu_si512((__m512i*)(x_row + k));
+                __m512i x_u8 = _mm512_add_epi8(x_vec, offset_vec);
+                _mm512_store_si512((__m512i*)(x_uint8 + k), x_u8);
+            }
+            for (; k < K; k++) {
+                x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
+            }
+            for (; k < K_padded; k++) {
+                x_uint8[k] = 128;
+            }
+
+            // Compute matmul and find max abs in one pass
+            float max_abs = 0.0f;
+
+            int n = 0;
+            for (; n + 3 < N; n += 4) {
+                const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+
+                __m512i acc0 = _mm512_setzero_si512();
+                __m512i acc1 = _mm512_setzero_si512();
+                __m512i acc2 = _mm512_setzero_si512();
+                __m512i acc3 = _mm512_setzero_si512();
+
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc0 = _mm512_dpbusd_epi32(acc0, x_vec, _mm512_loadu_si512((__m512i*)(w0 + kk)));
+                    acc1 = _mm512_dpbusd_epi32(acc1, x_vec, _mm512_loadu_si512((__m512i*)(w1 + kk)));
+                    acc2 = _mm512_dpbusd_epi32(acc2, x_vec, _mm512_loadu_si512((__m512i*)(w2 + kk)));
+                    acc3 = _mm512_dpbusd_epi32(acc3, x_vec, _mm512_loadu_si512((__m512i*)(w3 + kk)));
+                }
+
+                float v0 = static_cast<float>(_mm512_reduce_add_epi32(acc0) - 128 * w_sum[n+0]) * x_scale;
+                float v1 = static_cast<float>(_mm512_reduce_add_epi32(acc1) - 128 * w_sum[n+1]) * x_scale;
+                float v2 = static_cast<float>(_mm512_reduce_add_epi32(acc2) - 128 * w_sum[n+2]) * x_scale;
+                float v3 = static_cast<float>(_mm512_reduce_add_epi32(acc3) - 128 * w_sum[n+3]) * x_scale;
+
+                matmul_out[n+0] = v0;
+                matmul_out[n+1] = v1;
+                matmul_out[n+2] = v2;
+                matmul_out[n+3] = v3;
+
+                max_abs = std::max(max_abs, std::abs(v0));
+                max_abs = std::max(max_abs, std::abs(v1));
+                max_abs = std::max(max_abs, std::abs(v2));
+                max_abs = std::max(max_abs, std::abs(v3));
+            }
+            for (; n < N; n++) {
+                const int8_t* w_row = w_int8 + n * K_padded;
+                __m512i acc = _mm512_setzero_si512();
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                    acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                }
+                float v = static_cast<float>(_mm512_reduce_add_epi32(acc) - 128 * w_sum[n]) * x_scale;
+                matmul_out[n] = v;
+                max_abs = std::max(max_abs, std::abs(v));
+            }
+
+            // Quantize
+            float out_scale = max_abs / 127.0f;
+            if (out_scale == 0.0f) out_scale = 1.0f;
+            y_scales[m] = out_scale;
+
+            float inv_scale = 1.0f / out_scale;
+            __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+            __m512 min_val = _mm512_set1_ps(-127.0f);
+            __m512 max_val = _mm512_set1_ps(127.0f);
+
+            n = 0;
+            for (; n + 15 < N; n += 16) {
+                __m512 vals = _mm512_loadu_ps(matmul_out + n);
+                vals = _mm512_mul_ps(vals, inv_scale_vec);
+                vals = _mm512_max_ps(vals, min_val);
+                vals = _mm512_min_ps(vals, max_val);
+                vals = _mm512_roundscale_ps(vals, _MM_FROUND_TO_NEAREST_INT);
+                __m512i int_vals = _mm512_cvtps_epi32(vals);
+                __m128i packed = _mm512_cvtsepi32_epi8(int_vals);
+                _mm_storeu_si128((__m128i*)(y_row + n), packed);
+            }
+            for (; n < N; n++) {
+                float val = matmul_out[n] * inv_scale;
+                val = std::max(-127.0f, std::min(127.0f, val));
+                y_row[n] = static_cast<int8_t>(std::round(val));
+            }
+        }
+
+        free(x_uint8);
+        free(matmul_out);
+    }
+}
+
+/**
  * Fast AVX-512 sigmoid approximation
  * sigmoid(x) = 1 / (1 + exp(-x))
  */
@@ -2664,4 +3129,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "VNNI v5 optimized for large M (parallelizes over M×N tiles)");
     m.def("fused_mlp_int8", &fused_mlp_int8,
           "Fused MLP: up + swiglu + down");
+    m.def("matmul_softmax_int8", &matmul_softmax_int8,
+          "Fused matmul + softmax (never writes int32 to memory)");
+    m.def("matmul_qkv_softmax_int8", &matmul_qkv_softmax_int8,
+          "Fused Q,K,V projection + softmax (reads input once)");
+    m.def("matmul_quantize_int8", &matmul_quantize_int8,
+          "Fused matmul + quantize (for down projection)");
 }
