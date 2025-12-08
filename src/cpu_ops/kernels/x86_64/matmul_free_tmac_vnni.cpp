@@ -1386,7 +1386,6 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
 
     constexpr int N_TILE = 64;
     constexpr int M_TILE = 32;
-    constexpr int N_BLOCK = 4;
 
     omp_set_num_threads(num_threads);
 
@@ -1488,40 +1487,65 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
                 const uint8_t* x_uint8 = x_uint8_tile + m_local * K_padded;
                 float scale = scales[m];
 
-                // Compute all N outputs for Q, K, V together
+                // Compute all N outputs for Q, K, V together with 8-way blocking
                 for (int n_tile = 0; n_tile < N; n_tile += N_TILE) {
                     const int n_end_tile = std::min(n_tile + N_TILE, N);
 
                     int n = n_tile;
-                    for (; n + N_BLOCK - 1 < n_end_tile; n += N_BLOCK) {
+                    // 8-way blocking (24 accumulators total - fits in registers)
+                    for (; n + 7 < n_end_tile; n += 8) {
                         // Q accumulators
                         __m512i accq0 = _mm512_setzero_si512();
                         __m512i accq1 = _mm512_setzero_si512();
                         __m512i accq2 = _mm512_setzero_si512();
                         __m512i accq3 = _mm512_setzero_si512();
+                        __m512i accq4 = _mm512_setzero_si512();
+                        __m512i accq5 = _mm512_setzero_si512();
+                        __m512i accq6 = _mm512_setzero_si512();
+                        __m512i accq7 = _mm512_setzero_si512();
                         // K accumulators
                         __m512i acck0 = _mm512_setzero_si512();
                         __m512i acck1 = _mm512_setzero_si512();
                         __m512i acck2 = _mm512_setzero_si512();
                         __m512i acck3 = _mm512_setzero_si512();
+                        __m512i acck4 = _mm512_setzero_si512();
+                        __m512i acck5 = _mm512_setzero_si512();
+                        __m512i acck6 = _mm512_setzero_si512();
+                        __m512i acck7 = _mm512_setzero_si512();
                         // V accumulators
                         __m512i accv0 = _mm512_setzero_si512();
                         __m512i accv1 = _mm512_setzero_si512();
                         __m512i accv2 = _mm512_setzero_si512();
                         __m512i accv3 = _mm512_setzero_si512();
+                        __m512i accv4 = _mm512_setzero_si512();
+                        __m512i accv5 = _mm512_setzero_si512();
+                        __m512i accv6 = _mm512_setzero_si512();
+                        __m512i accv7 = _mm512_setzero_si512();
 
                         const int8_t* wq0 = wq + (n + 0) * K_padded;
                         const int8_t* wq1 = wq + (n + 1) * K_padded;
                         const int8_t* wq2 = wq + (n + 2) * K_padded;
                         const int8_t* wq3 = wq + (n + 3) * K_padded;
+                        const int8_t* wq4 = wq + (n + 4) * K_padded;
+                        const int8_t* wq5 = wq + (n + 5) * K_padded;
+                        const int8_t* wq6 = wq + (n + 6) * K_padded;
+                        const int8_t* wq7 = wq + (n + 7) * K_padded;
                         const int8_t* wk0 = wk + (n + 0) * K_padded;
                         const int8_t* wk1 = wk + (n + 1) * K_padded;
                         const int8_t* wk2 = wk + (n + 2) * K_padded;
                         const int8_t* wk3 = wk + (n + 3) * K_padded;
+                        const int8_t* wk4 = wk + (n + 4) * K_padded;
+                        const int8_t* wk5 = wk + (n + 5) * K_padded;
+                        const int8_t* wk6 = wk + (n + 6) * K_padded;
+                        const int8_t* wk7 = wk + (n + 7) * K_padded;
                         const int8_t* wv0 = wv + (n + 0) * K_padded;
                         const int8_t* wv1 = wv + (n + 1) * K_padded;
                         const int8_t* wv2 = wv + (n + 2) * K_padded;
                         const int8_t* wv3 = wv + (n + 3) * K_padded;
+                        const int8_t* wv4 = wv + (n + 4) * K_padded;
+                        const int8_t* wv5 = wv + (n + 5) * K_padded;
+                        const int8_t* wv6 = wv + (n + 6) * K_padded;
+                        const int8_t* wv7 = wv + (n + 7) * K_padded;
 
                         for (int kk = 0; kk < K_padded; kk += 64) {
                             __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
@@ -1530,16 +1554,28 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
                             accq1 = _mm512_dpbusd_epi32(accq1, x_vec, _mm512_loadu_si512((__m512i*)(wq1 + kk)));
                             accq2 = _mm512_dpbusd_epi32(accq2, x_vec, _mm512_loadu_si512((__m512i*)(wq2 + kk)));
                             accq3 = _mm512_dpbusd_epi32(accq3, x_vec, _mm512_loadu_si512((__m512i*)(wq3 + kk)));
+                            accq4 = _mm512_dpbusd_epi32(accq4, x_vec, _mm512_loadu_si512((__m512i*)(wq4 + kk)));
+                            accq5 = _mm512_dpbusd_epi32(accq5, x_vec, _mm512_loadu_si512((__m512i*)(wq5 + kk)));
+                            accq6 = _mm512_dpbusd_epi32(accq6, x_vec, _mm512_loadu_si512((__m512i*)(wq6 + kk)));
+                            accq7 = _mm512_dpbusd_epi32(accq7, x_vec, _mm512_loadu_si512((__m512i*)(wq7 + kk)));
                             // K
                             acck0 = _mm512_dpbusd_epi32(acck0, x_vec, _mm512_loadu_si512((__m512i*)(wk0 + kk)));
                             acck1 = _mm512_dpbusd_epi32(acck1, x_vec, _mm512_loadu_si512((__m512i*)(wk1 + kk)));
                             acck2 = _mm512_dpbusd_epi32(acck2, x_vec, _mm512_loadu_si512((__m512i*)(wk2 + kk)));
                             acck3 = _mm512_dpbusd_epi32(acck3, x_vec, _mm512_loadu_si512((__m512i*)(wk3 + kk)));
+                            acck4 = _mm512_dpbusd_epi32(acck4, x_vec, _mm512_loadu_si512((__m512i*)(wk4 + kk)));
+                            acck5 = _mm512_dpbusd_epi32(acck5, x_vec, _mm512_loadu_si512((__m512i*)(wk5 + kk)));
+                            acck6 = _mm512_dpbusd_epi32(acck6, x_vec, _mm512_loadu_si512((__m512i*)(wk6 + kk)));
+                            acck7 = _mm512_dpbusd_epi32(acck7, x_vec, _mm512_loadu_si512((__m512i*)(wk7 + kk)));
                             // V
                             accv0 = _mm512_dpbusd_epi32(accv0, x_vec, _mm512_loadu_si512((__m512i*)(wv0 + kk)));
                             accv1 = _mm512_dpbusd_epi32(accv1, x_vec, _mm512_loadu_si512((__m512i*)(wv1 + kk)));
                             accv2 = _mm512_dpbusd_epi32(accv2, x_vec, _mm512_loadu_si512((__m512i*)(wv2 + kk)));
                             accv3 = _mm512_dpbusd_epi32(accv3, x_vec, _mm512_loadu_si512((__m512i*)(wv3 + kk)));
+                            accv4 = _mm512_dpbusd_epi32(accv4, x_vec, _mm512_loadu_si512((__m512i*)(wv4 + kk)));
+                            accv5 = _mm512_dpbusd_epi32(accv5, x_vec, _mm512_loadu_si512((__m512i*)(wv5 + kk)));
+                            accv6 = _mm512_dpbusd_epi32(accv6, x_vec, _mm512_loadu_si512((__m512i*)(wv6 + kk)));
+                            accv7 = _mm512_dpbusd_epi32(accv7, x_vec, _mm512_loadu_si512((__m512i*)(wv7 + kk)));
                         }
 
                         // Store Q results
@@ -1547,16 +1583,28 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
                         q_buffer[n + 1] = static_cast<float>(_mm512_reduce_add_epi32(accq1) - 128 * wq_sum[n + 1]) * scale;
                         q_buffer[n + 2] = static_cast<float>(_mm512_reduce_add_epi32(accq2) - 128 * wq_sum[n + 2]) * scale;
                         q_buffer[n + 3] = static_cast<float>(_mm512_reduce_add_epi32(accq3) - 128 * wq_sum[n + 3]) * scale;
+                        q_buffer[n + 4] = static_cast<float>(_mm512_reduce_add_epi32(accq4) - 128 * wq_sum[n + 4]) * scale;
+                        q_buffer[n + 5] = static_cast<float>(_mm512_reduce_add_epi32(accq5) - 128 * wq_sum[n + 5]) * scale;
+                        q_buffer[n + 6] = static_cast<float>(_mm512_reduce_add_epi32(accq6) - 128 * wq_sum[n + 6]) * scale;
+                        q_buffer[n + 7] = static_cast<float>(_mm512_reduce_add_epi32(accq7) - 128 * wq_sum[n + 7]) * scale;
                         // Store K results
                         k_buffer[n + 0] = static_cast<float>(_mm512_reduce_add_epi32(acck0) - 128 * wk_sum[n + 0]) * scale;
                         k_buffer[n + 1] = static_cast<float>(_mm512_reduce_add_epi32(acck1) - 128 * wk_sum[n + 1]) * scale;
                         k_buffer[n + 2] = static_cast<float>(_mm512_reduce_add_epi32(acck2) - 128 * wk_sum[n + 2]) * scale;
                         k_buffer[n + 3] = static_cast<float>(_mm512_reduce_add_epi32(acck3) - 128 * wk_sum[n + 3]) * scale;
+                        k_buffer[n + 4] = static_cast<float>(_mm512_reduce_add_epi32(acck4) - 128 * wk_sum[n + 4]) * scale;
+                        k_buffer[n + 5] = static_cast<float>(_mm512_reduce_add_epi32(acck5) - 128 * wk_sum[n + 5]) * scale;
+                        k_buffer[n + 6] = static_cast<float>(_mm512_reduce_add_epi32(acck6) - 128 * wk_sum[n + 6]) * scale;
+                        k_buffer[n + 7] = static_cast<float>(_mm512_reduce_add_epi32(acck7) - 128 * wk_sum[n + 7]) * scale;
                         // Store V results
                         v_buffer[n + 0] = static_cast<float>(_mm512_reduce_add_epi32(accv0) - 128 * wv_sum[n + 0]) * scale;
                         v_buffer[n + 1] = static_cast<float>(_mm512_reduce_add_epi32(accv1) - 128 * wv_sum[n + 1]) * scale;
                         v_buffer[n + 2] = static_cast<float>(_mm512_reduce_add_epi32(accv2) - 128 * wv_sum[n + 2]) * scale;
                         v_buffer[n + 3] = static_cast<float>(_mm512_reduce_add_epi32(accv3) - 128 * wv_sum[n + 3]) * scale;
+                        v_buffer[n + 4] = static_cast<float>(_mm512_reduce_add_epi32(accv4) - 128 * wv_sum[n + 4]) * scale;
+                        v_buffer[n + 5] = static_cast<float>(_mm512_reduce_add_epi32(accv5) - 128 * wv_sum[n + 5]) * scale;
+                        v_buffer[n + 6] = static_cast<float>(_mm512_reduce_add_epi32(accv6) - 128 * wv_sum[n + 6]) * scale;
+                        v_buffer[n + 7] = static_cast<float>(_mm512_reduce_add_epi32(accv7) - 128 * wv_sum[n + 7]) * scale;
                     }
 
                     // Remainder
