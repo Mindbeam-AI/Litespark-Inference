@@ -302,12 +302,12 @@ def native_fused_mlp(x_int8, x_scales, w_up, w_up_sum, w_down, w_down_sum, M, hi
 def fused_matmul_softmax(x_int8, x_scales, w_int8, w_sum, M, N, K):
     """
     Fused matmul + softmax: int8 input -> int8 output (never writes int32 to memory).
-    Eliminates intermediate int32 storage.
+    Uses v3-based tiling for cache efficiency.
     """
     y_int8 = torch.zeros(M, N, dtype=torch.int8)
     y_scales = torch.zeros(M, dtype=torch.float32)
 
-    kernel.matmul_softmax_int8(
+    kernel.matmul_free_vnni_v3_fused_softmax(
         x_int8, x_scales, w_int8, w_sum,
         y_int8, y_scales,
         M, N, K, num_threads
@@ -319,6 +319,7 @@ def fused_matmul_softmax(x_int8, x_scales, w_int8, w_sum, M, N, K):
 def fused_qkv_softmax(x_int8, x_scales, wq, wq_sum, wk, wk_sum, wv, wv_sum, M, N, K):
     """
     Fused Q,K,V projection + softmax: reads input once, computes all three.
+    Uses v3-based tiling for cache efficiency.
     Returns q, k, v as int8 with softmax already applied.
     """
     q_int8 = torch.zeros(M, N, dtype=torch.int8)
@@ -328,7 +329,7 @@ def fused_qkv_softmax(x_int8, x_scales, wq, wq_sum, wk, wk_sum, wv, wv_sum, M, N
     v_int8 = torch.zeros(M, N, dtype=torch.int8)
     v_scales = torch.zeros(M, dtype=torch.float32)
 
-    kernel.matmul_qkv_softmax_int8(
+    kernel.matmul_free_vnni_v3_fused_qkv_softmax(
         x_int8, x_scales,
         wq, wq_sum, wk, wk_sum, wv, wv_sum,
         q_int8, q_scales, k_int8, k_scales, v_int8, v_scales,
@@ -341,12 +342,12 @@ def fused_qkv_softmax(x_int8, x_scales, wq, wq_sum, wk, wk_sum, wv, wv_sum, M, N
 def fused_matmul_quantize(x_int8, x_scales, w_int8, w_sum, M, N, K):
     """
     Fused matmul + quantize: int8 input -> int8 output (never writes int32 to memory).
-    For use with down projection in MLP.
+    Uses v3-based tiling for cache efficiency.
     """
     y_int8 = torch.zeros(M, N, dtype=torch.int8)
     y_scales = torch.zeros(M, dtype=torch.float32)
 
-    kernel.matmul_quantize_int8(
+    kernel.matmul_free_vnni_v3_fused_quantize(
         x_int8, x_scales, w_int8, w_sum,
         y_int8, y_scales,
         M, N, K, num_threads
