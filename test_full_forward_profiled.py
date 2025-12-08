@@ -3,6 +3,7 @@
 Profiled 24-Layer Transformer Forward Pass
 
 Adds detailed timing instrumentation to identify bottlenecks.
+Uses the FUSED kernels (same as test_full_forward.py).
 """
 
 import torch
@@ -27,6 +28,11 @@ MLP_INTERMEDIATE = 8192
 BATCH_SIZES = [1, 32, 128]
 WARMUP_ITERS = 3
 BENCH_ITERS = 10
+
+# Fusion flags (match test_full_forward.py)
+USE_FUSED_QKV = True
+USE_FUSED_MATMUL_SOFTMAX = True
+USE_FUSED_MATMUL_QUANTIZE = True
 
 # ============================================================================
 # Check Architecture
@@ -117,13 +123,17 @@ class Profiler:
 
         # Group by category
         categories = {
-            'Matmul (QKV)': ['q_matmul', 'k_matmul', 'v_matmul'],
+            'Fused QKV+Softmax': ['fused_qkv_softmax'],
+            'Fused O+Softmax': ['fused_o_softmax'],
+            'Fused Down+Quantize': ['fused_down_quantize'],
+            'Matmul (QKV separate)': ['q_matmul', 'k_matmul', 'v_matmul'],
             'Matmul (Other)': ['o_matmul', 'up_matmul', 'down_matmul'],
             'Attention': ['attention'],
-            'Softmax': ['softmax_q', 'softmax_k', 'softmax_v', 'softmax_o'],
+            'Softmax (separate)': ['softmax_q', 'softmax_k', 'softmax_v', 'softmax_o'],
+            'Up Matmul': ['up_matmul'],
             'SwiGLU': ['swiglu'],
             'Residual': ['residual_attn', 'residual_mlp'],
-            'Quantize': ['quantize_down'],
+            'Quantize (separate)': ['quantize_down'],
         }
 
         print("BY CATEGORY:")
@@ -257,6 +267,57 @@ def native_quantize_int32(x_int32, x_scales, M, N, op_name):
 
 
 # ============================================================================
+# Fused Kernel Wrappers with Profiling
+# ============================================================================
+
+def fused_qkv_softmax(x_int8, x_scales, wq, wq_sum, wk, wk_sum, wv, wv_sum, M, N, K, op_name):
+    profiler.start(op_name)
+    q_int8 = torch.zeros(M, N, dtype=torch.int8)
+    q_scales = torch.zeros(M, dtype=torch.float32)
+    k_int8 = torch.zeros(M, N, dtype=torch.int8)
+    k_scales = torch.zeros(M, dtype=torch.float32)
+    v_int8 = torch.zeros(M, N, dtype=torch.int8)
+    v_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.matmul_free_vnni_v3_fused_qkv_softmax(
+        x_int8, x_scales,
+        wq, wq_sum, wk, wk_sum, wv, wv_sum,
+        q_int8, q_scales, k_int8, k_scales, v_int8, v_scales,
+        M, N, K, num_threads
+    )
+    profiler.stop()
+    return q_int8, q_scales, k_int8, k_scales, v_int8, v_scales
+
+
+def fused_matmul_softmax(x_int8, x_scales, w_int8, w_sum, M, N, K, op_name):
+    profiler.start(op_name)
+    y_int8 = torch.zeros(M, N, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.matmul_free_vnni_v3_fused_softmax(
+        x_int8, x_scales, w_int8, w_sum,
+        y_int8, y_scales,
+        M, N, K, num_threads
+    )
+    profiler.stop()
+    return y_int8, y_scales
+
+
+def fused_matmul_quantize(x_int8, x_scales, w_int8, w_sum, M, N, K, op_name):
+    profiler.start(op_name)
+    y_int8 = torch.zeros(M, N, dtype=torch.int8)
+    y_scales = torch.zeros(M, dtype=torch.float32)
+
+    kernel.matmul_free_vnni_v3_fused_quantize(
+        x_int8, x_scales, w_int8, w_sum,
+        y_int8, y_scales,
+        M, N, K, num_threads
+    )
+    profiler.stop()
+    return y_int8, y_scales
+
+
+# ============================================================================
 # Profiled Transformer Layer
 # ============================================================================
 
@@ -279,18 +340,29 @@ class TransformerLayerProfiled:
     def forward(self, x_int8, x_scales):
         M = x_int8.shape[0]
 
-        # Q, K, V projections
-        q_int32 = matmul_int32_out(x_int8, x_scales, self.w_q, self.w_q_sum,
-                                   M, self.hidden_dim, self.hidden_dim, 'q_matmul')
-        k_int32 = matmul_int32_out(x_int8, x_scales, self.w_k, self.w_k_sum,
-                                   M, self.hidden_dim, self.hidden_dim, 'k_matmul')
-        v_int32 = matmul_int32_out(x_int8, x_scales, self.w_v, self.w_v_sum,
-                                   M, self.hidden_dim, self.hidden_dim, 'v_matmul')
+        # === ATTENTION BLOCK ===
 
-        # Softmax on Q, K, V
-        q_int8_sm, q_scales_sm = native_softmax(q_int32, x_scales, M, self.hidden_dim, 'softmax_q')
-        k_int8_sm, k_scales_sm = native_softmax(k_int32, x_scales, M, self.hidden_dim, 'softmax_k')
-        v_int8_sm, v_scales_sm = native_softmax(v_int32, x_scales, M, self.hidden_dim, 'softmax_v')
+        if USE_FUSED_QKV:
+            # Fused Q,K,V projection + softmax
+            q_int8_sm, q_scales_sm, k_int8_sm, k_scales_sm, v_int8_sm, v_scales_sm = fused_qkv_softmax(
+                x_int8, x_scales,
+                self.w_q, self.w_q_sum,
+                self.w_k, self.w_k_sum,
+                self.w_v, self.w_v_sum,
+                M, self.hidden_dim, self.hidden_dim, 'fused_qkv_softmax'
+            )
+        else:
+            # Separate Q, K, V projections
+            q_int32 = matmul_int32_out(x_int8, x_scales, self.w_q, self.w_q_sum,
+                                       M, self.hidden_dim, self.hidden_dim, 'q_matmul')
+            k_int32 = matmul_int32_out(x_int8, x_scales, self.w_k, self.w_k_sum,
+                                       M, self.hidden_dim, self.hidden_dim, 'k_matmul')
+            v_int32 = matmul_int32_out(x_int8, x_scales, self.w_v, self.w_v_sum,
+                                       M, self.hidden_dim, self.hidden_dim, 'v_matmul')
+            # Softmax on Q, K, V
+            q_int8_sm, q_scales_sm = native_softmax(q_int32, x_scales, M, self.hidden_dim, 'softmax_q')
+            k_int8_sm, k_scales_sm = native_softmax(k_int32, x_scales, M, self.hidden_dim, 'softmax_k')
+            v_int8_sm, v_scales_sm = native_softmax(v_int32, x_scales, M, self.hidden_dim, 'softmax_v')
 
         # Attention
         attn_int8, attn_scales = native_attention(
@@ -300,25 +372,41 @@ class TransformerLayerProfiled:
         )
 
         # Output projection + softmax
-        o_int32 = matmul_int32_out(attn_int8, attn_scales, self.w_o, self.w_o_sum,
-                                   M, self.hidden_dim, self.hidden_dim, 'o_matmul')
-        o_int8, o_scales = native_softmax(o_int32, attn_scales, M, self.hidden_dim, 'softmax_o')
+        if USE_FUSED_MATMUL_SOFTMAX:
+            o_int8, o_scales = fused_matmul_softmax(
+                attn_int8, attn_scales, self.w_o, self.w_o_sum,
+                M, self.hidden_dim, self.hidden_dim, 'fused_o_softmax'
+            )
+        else:
+            o_int32 = matmul_int32_out(attn_int8, attn_scales, self.w_o, self.w_o_sum,
+                                       M, self.hidden_dim, self.hidden_dim, 'o_matmul')
+            o_int8, o_scales = native_softmax(o_int32, attn_scales, M, self.hidden_dim, 'softmax_o')
 
         # Residual
         x_res_int8, x_res_scales = native_fused_residual(
             x_int8, x_scales, o_int8, o_scales, M, self.hidden_dim, 'residual_attn'
         )
 
-        # MLP
+        # === MLP BLOCK ===
+
+        # MLP Up + SwiGLU (not fused - separate kernels)
         mlp_up_int32 = matmul_int32_out(x_res_int8, x_res_scales, self.w_up, self.w_up_sum,
                                         M, self.mlp_hidden, self.hidden_dim, 'up_matmul')
         mlp_act_int8, mlp_act_scales = native_swiglu(mlp_up_int32, x_res_scales,
                                                      M, self.mlp_hidden, 'swiglu')
-        mlp_down_int32 = matmul_int32_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
-                                          M, self.hidden_dim, self.mlp_intermediate, 'down_matmul')
-        mlp_down_int8, mlp_down_scales = native_quantize_int32(
-            mlp_down_int32, mlp_act_scales, M, self.hidden_dim, 'quantize_down'
-        )
+
+        # MLP Down + Quantize
+        if USE_FUSED_MATMUL_QUANTIZE:
+            mlp_down_int8, mlp_down_scales = fused_matmul_quantize(
+                mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
+                M, self.hidden_dim, self.mlp_intermediate, 'fused_down_quantize'
+            )
+        else:
+            mlp_down_int32 = matmul_int32_out(mlp_act_int8, mlp_act_scales, self.w_down, self.w_down_sum,
+                                              M, self.hidden_dim, self.mlp_intermediate, 'down_matmul')
+            mlp_down_int8, mlp_down_scales = native_quantize_int32(
+                mlp_down_int32, mlp_act_scales, M, self.hidden_dim, 'quantize_down'
+            )
 
         # Final residual
         y_int8, y_scales = native_fused_residual(
