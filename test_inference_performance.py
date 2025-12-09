@@ -71,11 +71,11 @@ def test_inference_patterns():
     results = []
     
     for M, N, K, desc in test_cases:
-        # Create test data - ensure correct types for VNNI kernels
+        # Create test data - use EXACT same types as test_full_forward.py
         x_int8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
         scales = torch.randn(M, dtype=torch.float32)
         w_int8 = torch.randint(-1, 2, (N, K), dtype=torch.int8)  # Ternary weights
-        w_sum = torch.sum(w_int8.float(), dim=1).to(torch.float32)  # Ensure float32
+        w_sum = torch.sum(w_int8.int(), dim=1).to(torch.int32)  # Must be int32!
         y = torch.zeros(M, N, dtype=torch.float32)
         bias = torch.zeros(N, dtype=torch.float32)
         
@@ -113,12 +113,13 @@ def test_inference_patterns():
             # v3 kernel for small operations - use int32 output version for consistency
             y_out = torch.zeros(M, N, dtype=torch.int32)
             kernel_name = "v3_int32"
-            use_bias = True
+            # v3_int32_out uses empty bias, not zeros bias
+            bias_v3 = torch.empty(0)
 
         # Warmup
         for _ in range(3):
             if kernel_name == "v3_int32":
-                kernel.matmul_free_vnni_v3_int32_out(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+                kernel.matmul_free_vnni_v3_int32_out(x_int8, scales, w_int8, w_sum, y_out, bias_v3, M, N, K, threads)
             elif kernel_name == "v4":
                 kernel.matmul_free_vnni_v4_large_n(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
             elif kernel_name == "v5":
@@ -129,7 +130,7 @@ def test_inference_patterns():
 
         for _ in range(10):
             if kernel_name == "v3_int32":
-                kernel.matmul_free_vnni_v3_int32_out(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+                kernel.matmul_free_vnni_v3_int32_out(x_int8, scales, w_int8, w_sum, y_out, bias_v3, M, N, K, threads)
             elif kernel_name == "v4":
                 kernel.matmul_free_vnni_v4_large_n(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
             elif kernel_name == "v5":
