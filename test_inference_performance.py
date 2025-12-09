@@ -10,6 +10,9 @@ the actual optimized kernels, not the fallback implementations.
 import torch
 import time
 import platform
+import matplotlib.pyplot as plt
+import numpy as np
+import os
 from torch.utils.cpp_extension import load
 
 def test_inference_patterns():
@@ -198,7 +201,201 @@ def test_inference_patterns():
     print(f"\n🏆 Top 3 speedups:")
     for i, result in enumerate(best_speedups, 1):
         print(f"  {i}. {result['description']}: {result['speedup']:.2f}x ({result['kernel']})")
+
+    # Create visualizations
+    create_inference_plots(results, batch_groups)
     print("✅ Inference performance test completed successfully!")
+
+def create_inference_plots(results, batch_groups):
+    """Create comprehensive plots grouped by batch size M."""
+
+    # Create output directory
+    plot_dir = "benchmark_plots_inference"
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Set up matplotlib style
+    plt.style.use('default')
+    plt.rcParams['figure.figsize'] = (12, 8)
+    plt.rcParams['font.size'] = 10
+
+    # Define operation types and colors
+    op_types = {
+        'Attention QKV': '#1f77b4',
+        'MLP up': '#ff7f0e',
+        'MLP down': '#2ca02c',
+        'LM head (vocab)': '#d62728'
+    }
+
+    # 1. Speedup comparison by batch size
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('GPT-2 Inference Performance: VNNI vs PyTorch', fontsize=16, fontweight='bold')
+
+    batch_sizes = sorted(batch_groups.keys())
+
+    for idx, M in enumerate(batch_sizes):
+        row = idx // 2
+        col = idx % 2
+        ax = axes[row, col]
+
+        group = batch_groups[M]
+
+        # Extract data for this batch size
+        operations = []
+        vnni_times = []
+        pytorch_times = []
+        speedups = []
+        colors = []
+        kernels = []
+
+        for result in group:
+            # Extract operation type from description
+            desc = result['description']
+            for op_type in op_types:
+                if op_type in desc:
+                    operations.append(op_type)
+                    colors.append(op_types[op_type])
+                    break
+            else:
+                operations.append(desc.split(' - ')[-1])
+                colors.append('#gray')
+
+            vnni_times.append(result['vnni_time_ms'])
+            pytorch_times.append(result['pytorch_time_ms'])
+            speedups.append(result['speedup'])
+            kernels.append(result['kernel'].replace('_int32', ''))
+
+        # Create grouped bar chart
+        x = np.arange(len(operations))
+        width = 0.35
+
+        bars1 = ax.bar(x - width/2, vnni_times, width, label='VNNI Optimized',
+                      color=colors, alpha=0.8)
+        bars2 = ax.bar(x + width/2, pytorch_times, width, label='PyTorch Baseline',
+                      color=colors, alpha=0.4)
+
+        # Add speedup annotations
+        for i, (speedup, kernel) in enumerate(zip(speedups, kernels)):
+            height = max(vnni_times[i], pytorch_times[i])
+            ax.annotate(f'{speedup:.2f}x\n({kernel})',
+                       xy=(i, height), xytext=(0, 10),
+                       textcoords='offset points', ha='center', va='bottom',
+                       fontsize=8, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+
+        ax.set_xlabel('Operation Type')
+        ax.set_ylabel('Time (ms)')
+        ax.set_title(f'Batch Size M={M}', fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(operations, rotation=45, ha='right')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{plot_dir}/speedup_by_batch_size.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 2. Overall speedup summary
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Speedup by batch size
+    batch_speedups = [sum(r['speedup'] for r in batch_groups[M]) / len(batch_groups[M])
+                     for M in batch_sizes]
+
+    bars = ax1.bar(range(len(batch_sizes)), batch_speedups,
+                   color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+    ax1.set_xlabel('Batch Size (M)')
+    ax1.set_ylabel('Average Speedup')
+    ax1.set_title('Average Speedup by Batch Size', fontweight='bold')
+    ax1.set_xticks(range(len(batch_sizes)))
+    ax1.set_xticklabels([f'M={M}' for M in batch_sizes])
+    ax1.grid(True, alpha=0.3)
+
+    # Add value labels on bars
+    for bar, speedup in zip(bars, batch_speedups):
+        height = bar.get_height()
+        ax1.annotate(f'{speedup:.2f}x',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha='center', va='bottom', fontweight='bold')
+
+    # Speedup by operation type
+    op_speedups = {}
+    for result in results:
+        desc = result['description']
+        for op_type in op_types:
+            if op_type in desc:
+                if op_type not in op_speedups:
+                    op_speedups[op_type] = []
+                op_speedups[op_type].append(result['speedup'])
+                break
+
+    op_names = list(op_speedups.keys())
+    op_avg_speedups = [sum(op_speedups[op]) / len(op_speedups[op]) for op in op_names]
+    op_colors = [op_types[op] for op in op_names]
+
+    bars = ax2.bar(range(len(op_names)), op_avg_speedups, color=op_colors)
+    ax2.set_xlabel('Operation Type')
+    ax2.set_ylabel('Average Speedup')
+    ax2.set_title('Average Speedup by Operation Type', fontweight='bold')
+    ax2.set_xticks(range(len(op_names)))
+    ax2.set_xticklabels(op_names, rotation=45, ha='right')
+    ax2.grid(True, alpha=0.3)
+
+    # Add value labels on bars
+    for bar, speedup in zip(bars, op_avg_speedups):
+        height = bar.get_height()
+        ax2.annotate(f'{speedup:.2f}x',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha='center', va='bottom', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(f'{plot_dir}/speedup_summary.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 3. Kernel usage analysis
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    kernel_counts = {}
+    kernel_speedups = {}
+    for result in results:
+        kernel = result['kernel'].replace('_int32', '')
+        if kernel not in kernel_counts:
+            kernel_counts[kernel] = 0
+            kernel_speedups[kernel] = []
+        kernel_counts[kernel] += 1
+        kernel_speedups[kernel].append(result['speedup'])
+
+    kernels = list(kernel_counts.keys())
+    counts = [kernel_counts[k] for k in kernels]
+    avg_speedups = [sum(kernel_speedups[k]) / len(kernel_speedups[k]) for k in kernels]
+
+    # Create bubble chart
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c'][:len(kernels)]
+    scatter = ax.scatter(range(len(kernels)), avg_speedups, s=[c*100 for c in counts],
+                        c=colors, alpha=0.6)
+
+    for i, (kernel, count, speedup) in enumerate(zip(kernels, counts, avg_speedups)):
+        ax.annotate(f'{kernel}\n({count} ops)\n{speedup:.2f}x avg',
+                   xy=(i, speedup), xytext=(0, 0),
+                   textcoords='offset points', ha='center', va='center',
+                   fontweight='bold')
+
+    ax.set_xlabel('Kernel Type')
+    ax.set_ylabel('Average Speedup')
+    ax.set_title('Kernel Performance Analysis', fontweight='bold')
+    ax.set_xticks(range(len(kernels)))
+    ax.set_xticklabels(kernels)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{plot_dir}/kernel_analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"\n📊 Plots saved to: {plot_dir}/")
+    print(f"   - speedup_by_batch_size.png: Detailed comparison by batch size")
+    print(f"   - speedup_summary.png: Overall speedup analysis")
+    print(f"   - kernel_analysis.png: Kernel performance breakdown")
 
 if __name__ == "__main__":
     test_inference_patterns()
