@@ -71,11 +71,11 @@ def test_inference_patterns():
     results = []
     
     for M, N, K, desc in test_cases:
-        # Create test data
+        # Create test data - ensure correct types for VNNI kernels
         x_int8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
         scales = torch.randn(M, dtype=torch.float32)
         w_int8 = torch.randint(-1, 2, (N, K), dtype=torch.int8)  # Ternary weights
-        w_sum = torch.sum(w_int8.float(), dim=1)
+        w_sum = torch.sum(w_int8.float(), dim=1).to(torch.float32)  # Ensure float32
         y = torch.zeros(M, N, dtype=torch.float32)
         bias = torch.zeros(N, dtype=torch.float32)
         
@@ -90,41 +90,50 @@ def test_inference_patterns():
             
         # Use same kernel selection logic as matmul_int32_out in test_full_forward.py
         if N >= 8192:
-            kernel_func = kernel.matmul_free_vnni_v4_large_n
+            # v4 kernel for large N - outputs int32
             y_out = torch.zeros(M, N, dtype=torch.int32)
             kernel_name = "v4"
+            use_bias = False
         elif N >= 4096 and M >= 16:
-            kernel_func = kernel.matmul_free_vnni_v4_large_n
+            # v4 kernel for large N with medium+ M - outputs int32
             y_out = torch.zeros(M, N, dtype=torch.int32)
             kernel_name = "v4"
+            use_bias = False
         elif M >= 64:
-            kernel_func = kernel.matmul_free_vnni_v5_large_m
+            # v5 kernel for large M - outputs int32
             y_out = torch.zeros(M, N, dtype=torch.int32)
             kernel_name = "v5"
+            use_bias = False
         elif M >= 32 and N >= 2048:
-            kernel_func = kernel.matmul_free_vnni_v5_large_m
+            # v5 kernel for medium M with medium N - outputs int32
             y_out = torch.zeros(M, N, dtype=torch.int32)
             kernel_name = "v5"
+            use_bias = False
         else:
-            kernel_func = kernel.matmul_free_vnni_v3
+            # v3 kernel for small operations - outputs float32
             y_out = y  # v3 outputs float32
             kernel_name = "v3"
+            use_bias = True
 
         # Warmup
         for _ in range(3):
             if kernel_name == "v3":
-                kernel_func(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
-            else:
-                kernel_func(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
+                kernel.matmul_free_vnni_v3(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+            elif kernel_name == "v4":
+                kernel.matmul_free_vnni_v4_large_n(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
+            elif kernel_name == "v5":
+                kernel.matmul_free_vnni_v5_large_m(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
 
         # Benchmark
         start_time = time.time()
 
         for _ in range(10):
             if kernel_name == "v3":
-                kernel_func(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
-            else:
-                kernel_func(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
+                kernel.matmul_free_vnni_v3(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+            elif kernel_name == "v4":
+                kernel.matmul_free_vnni_v4_large_n(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
+            elif kernel_name == "v5":
+                kernel.matmul_free_vnni_v5_large_m(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
 
         end_time = time.time()
 
