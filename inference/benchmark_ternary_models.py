@@ -307,16 +307,94 @@ def benchmark_perplexity(
 
 
 # ============================================================================
-# PyTorch Baseline Comparison
+# PyTorch Baseline Models
 # ============================================================================
 
-def load_pytorch_baseline(model_key: str):
-    """Load original HuggingFace model for comparison."""
+class PyTorchTernaryLinear(torch.nn.Module):
+    """
+    PyTorch baseline for ternary matmul.
+    Same operation as our kernel but using PyTorch ops.
+    """
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer('weight_int8', None)
+        self.register_buffer('weight_sum', None)
+        self.scale = 1.0
+
+    def load_from_weight(self, weight: torch.Tensor):
+        """Load from float weight tensor."""
+        # Convert to ternary
+        w_ternary = weight.round().clamp(-1, 1).to(torch.int8)
+
+        # Compute scale
+        mask = w_ternary != 0
+        if mask.any():
+            self.scale = weight[mask].abs().mean().item()
+
+        self.weight_int8 = w_ternary
+        self.weight_sum = w_ternary.sum(dim=1, dtype=torch.int32)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """PyTorch ternary matmul: quantize input, int matmul, dequantize."""
+        original_shape = x.shape
+        x = x.view(-1, self.in_features)
+
+        # Quantize input to int8
+        x_abs_max = x.abs().max(dim=1, keepdim=True).values
+        x_scale = x_abs_max / 127.0
+        x_scale = torch.where(x_scale == 0, torch.ones_like(x_scale), x_scale)
+        x_int8 = (x / x_scale).round().clamp(-127, 127).to(torch.int8)
+
+        # Int8 matmul via float (PyTorch doesn't have native int8 matmul on CPU)
+        # This simulates: y = x_int8 @ weight_int8.T
+        y_int32 = torch.matmul(x_int8.float(), self.weight_int8.float().T).to(torch.int32)
+
+        # Dequantize: y_float = y_int32 * x_scale * w_scale - offset_correction
+        # Offset correction for unsigned x: sum(w) * 128 * x_scale
+        offset = (self.weight_sum.float() * 128.0 * x_scale.squeeze(1)).unsqueeze(1)
+        y_float = (y_int32.float() - offset) * x_scale * self.scale
+
+        output_shape = original_shape[:-1] + (self.out_features,)
+        return y_float.view(output_shape)
+
+
+def build_pytorch_ternary_model(ternary_model, model_key: str):
+    """
+    Build a PyTorch baseline model with same architecture but using PyTorch ops.
+    Copies weights from our ternary model.
+    """
+    import copy
+
+    # Deep copy the model structure
+    baseline = copy.deepcopy(ternary_model)
+
+    # Replace all TernaryLinear with PyTorchTernaryLinear
+    def replace_ternary_linear(module):
+        for name, child in module.named_children():
+            if child.__class__.__name__ == 'TernaryLinear':
+                # Create PyTorch version
+                pytorch_linear = PyTorchTernaryLinear(child.in_features, child.out_features)
+                pytorch_linear.weight_int8 = child.w_int8[:, :child.in_features].clone()
+                pytorch_linear.weight_sum = child.w_sum.clone()
+                pytorch_linear.scale = child.scale
+                setattr(module, name, pytorch_linear)
+            else:
+                replace_ternary_linear(child)
+
+    replace_ternary_linear(baseline)
+    baseline.eval()
+    return baseline
+
+
+def load_pytorch_fp32_baseline(model_key: str):
+    """Load original HuggingFace FP32 model for comparison."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     hf_name = AVAILABLE_MODELS[model_key][0]
 
-    print(f"  Loading PyTorch baseline: {hf_name}")
+    print(f"  Loading HuggingFace FP32 model: {hf_name}")
     model = AutoModelForCausalLM.from_pretrained(hf_name, trust_remote_code=True)
     model.eval()
 
@@ -327,50 +405,88 @@ def load_pytorch_baseline(model_key: str):
     return model, tokenizer
 
 
-def compare_vs_baseline(
+def compare_vs_baselines(
     ternary_model,
-    baseline_model,
     tokenizer,
+    model_key: str,
     prompts: List[str],
     num_tokens: int = 30,
     num_runs: int = 3
 ) -> Dict:
     """
-    Compare our ternary kernels vs PyTorch FP32 baseline.
+    Compare our ternary kernels vs two baselines:
+    1. PyTorch Ternary: Same ternary matmul using PyTorch ops
+    2. PyTorch FP32: Original HuggingFace model
     """
     results = {
-        'ternary': {},
+        'our_kernel': {},
+        'pytorch_ternary': {},
         'pytorch_fp32': {},
-        'speedup': {}
+        'speedup_vs_pytorch_ternary': {},
+        'speedup_vs_fp32': {}
     }
 
-    # Benchmark ternary model
-    print("  Benchmarking ternary model...")
-    ternary_ttft = benchmark_ttft(ternary_model, tokenizer, prompts, num_runs=num_runs)
-    ternary_throughput = benchmark_throughput(ternary_model, tokenizer, prompts[1], num_tokens=num_tokens, num_runs=num_runs)
+    # 1. Benchmark our ternary kernel
+    print("  [1/3] Benchmarking our ternary kernel...")
+    our_ttft = benchmark_ttft(ternary_model, tokenizer, prompts, num_runs=num_runs)
+    our_throughput = benchmark_throughput(ternary_model, tokenizer, prompts[1], num_tokens=num_tokens, num_runs=num_runs)
 
-    results['ternary'] = {
-        'ttft_mean_ms': ternary_ttft['mean_ms'],
-        'ttft_p95_ms': ternary_ttft['p95_ms'],
-        'tokens_per_sec': ternary_throughput['mean_tokens_per_sec']
+    results['our_kernel'] = {
+        'ttft_mean_ms': our_ttft['mean_ms'],
+        'ttft_p95_ms': our_ttft['p95_ms'],
+        'tokens_per_sec': our_throughput['mean_tokens_per_sec']
     }
 
-    # Benchmark PyTorch baseline
-    print("  Benchmarking PyTorch FP32 baseline...")
-    baseline_ttft = benchmark_ttft(baseline_model, tokenizer, prompts, num_runs=num_runs)
-    baseline_throughput = benchmark_throughput(baseline_model, tokenizer, prompts[1], num_tokens=num_tokens, num_runs=num_runs)
+    # 2. Benchmark PyTorch ternary baseline (same operation, PyTorch implementation)
+    print("  [2/3] Benchmarking PyTorch ternary baseline...")
+    pytorch_ternary_model = build_pytorch_ternary_model(ternary_model, model_key)
 
-    results['pytorch_fp32'] = {
-        'ttft_mean_ms': baseline_ttft['mean_ms'],
-        'ttft_p95_ms': baseline_ttft['p95_ms'],
-        'tokens_per_sec': baseline_throughput['mean_tokens_per_sec']
+    pytorch_ternary_ttft = benchmark_ttft(pytorch_ternary_model, tokenizer, prompts, num_runs=num_runs)
+    pytorch_ternary_throughput = benchmark_throughput(pytorch_ternary_model, tokenizer, prompts[1], num_tokens=num_tokens, num_runs=num_runs)
+
+    results['pytorch_ternary'] = {
+        'ttft_mean_ms': pytorch_ternary_ttft['mean_ms'],
+        'ttft_p95_ms': pytorch_ternary_ttft['p95_ms'],
+        'tokens_per_sec': pytorch_ternary_throughput['mean_tokens_per_sec']
     }
 
-    # Compute speedups
-    results['speedup'] = {
-        'ttft': baseline_ttft['mean_ms'] / ternary_ttft['mean_ms'],
-        'throughput': ternary_throughput['mean_tokens_per_sec'] / baseline_throughput['mean_tokens_per_sec']
+    del pytorch_ternary_model
+    gc.collect()
+
+    # 3. Benchmark PyTorch FP32 baseline (original HuggingFace model)
+    print("  [3/3] Benchmarking PyTorch FP32 baseline...")
+    try:
+        fp32_model, _ = load_pytorch_fp32_baseline(model_key)
+
+        fp32_ttft = benchmark_ttft(fp32_model, tokenizer, prompts, num_runs=num_runs)
+        fp32_throughput = benchmark_throughput(fp32_model, tokenizer, prompts[1], num_tokens=num_tokens, num_runs=num_runs)
+
+        results['pytorch_fp32'] = {
+            'ttft_mean_ms': fp32_ttft['mean_ms'],
+            'ttft_p95_ms': fp32_ttft['p95_ms'],
+            'tokens_per_sec': fp32_throughput['mean_tokens_per_sec']
+        }
+
+        del fp32_model
+        gc.collect()
+    except Exception as e:
+        print(f"  Warning: Could not load FP32 baseline: {e}")
+        results['pytorch_fp32'] = None
+
+    # Compute speedups vs PyTorch ternary
+    results['speedup_vs_pytorch_ternary'] = {
+        'ttft': pytorch_ternary_ttft['mean_ms'] / our_ttft['mean_ms'],
+        'throughput': our_throughput['mean_tokens_per_sec'] / pytorch_ternary_throughput['mean_tokens_per_sec']
     }
+
+    # Compute speedups vs FP32
+    if results['pytorch_fp32']:
+        results['speedup_vs_fp32'] = {
+            'ttft': fp32_ttft['mean_ms'] / our_ttft['mean_ms'],
+            'throughput': our_throughput['mean_tokens_per_sec'] / fp32_throughput['mean_tokens_per_sec']
+        }
+    else:
+        results['speedup_vs_fp32'] = None
 
     return results
 
@@ -494,27 +610,38 @@ def run_full_benchmark(
         print("\n[5/7] Perplexity benchmark skipped")
         results['perplexity'] = {'perplexity': float('nan'), 'num_tokens': 0}
 
-    # PyTorch Baseline Comparison
+    # PyTorch Baseline Comparison (both ternary and FP32)
     if compare_baseline:
-        print("\n[6/7] Comparing vs PyTorch FP32 baseline...")
+        print("\n[6/7] Comparing vs baselines...")
         try:
-            baseline_model, _ = load_pytorch_baseline(model_key)
-            comparison = compare_vs_baseline(model, baseline_model, tokenizer, prompts, num_tokens=max_tokens, num_runs=num_runs)
-            results['vs_baseline'] = comparison
+            comparison = compare_vs_baselines(model, tokenizer, model_key, prompts, num_tokens=max_tokens, num_runs=num_runs)
+            results['vs_baselines'] = comparison
 
-            print(f"\n  {'Metric':<20} {'Ternary':<15} {'PyTorch FP32':<15} {'Speedup':<10}")
-            print(f"  {'-'*60}")
-            print(f"  {'TTFT (ms)':<20} {comparison['ternary']['ttft_mean_ms']:<15.2f} {comparison['pytorch_fp32']['ttft_mean_ms']:<15.2f} {comparison['speedup']['ttft']:<10.2f}x")
-            print(f"  {'Tokens/sec':<20} {comparison['ternary']['tokens_per_sec']:<15.1f} {comparison['pytorch_fp32']['tokens_per_sec']:<15.1f} {comparison['speedup']['throughput']:<10.2f}x")
+            print(f"\n  {'Metric':<15} {'Our Kernel':<15} {'PyTorch Ternary':<18} {'PyTorch FP32':<15}")
+            print(f"  {'-'*65}")
 
-            del baseline_model
-            gc.collect()
+            our = comparison['our_kernel']
+            pt_tern = comparison['pytorch_ternary']
+            pt_fp32 = comparison['pytorch_fp32']
+
+            fp32_ttft = f"{pt_fp32['ttft_mean_ms']:.2f}" if pt_fp32 else "N/A"
+            fp32_tps = f"{pt_fp32['tokens_per_sec']:.1f}" if pt_fp32 else "N/A"
+
+            print(f"  {'TTFT (ms)':<15} {our['ttft_mean_ms']:<15.2f} {pt_tern['ttft_mean_ms']:<18.2f} {fp32_ttft:<15}")
+            print(f"  {'Tokens/sec':<15} {our['tokens_per_sec']:<15.1f} {pt_tern['tokens_per_sec']:<18.1f} {fp32_tps:<15}")
+
+            print(f"\n  Speedup vs PyTorch Ternary: {comparison['speedup_vs_pytorch_ternary']['ttft']:.2f}x TTFT, {comparison['speedup_vs_pytorch_ternary']['throughput']:.2f}x throughput")
+            if comparison['speedup_vs_fp32']:
+                print(f"  Speedup vs PyTorch FP32:    {comparison['speedup_vs_fp32']['ttft']:.2f}x TTFT, {comparison['speedup_vs_fp32']['throughput']:.2f}x throughput")
+
         except Exception as e:
-            print(f"  Warning: Could not load baseline: {e}")
-            results['vs_baseline'] = None
+            print(f"  Warning: Baseline comparison failed: {e}")
+            import traceback
+            traceback.print_exc()
+            results['vs_baselines'] = None
     else:
         print("\n[6/7] Baseline comparison skipped")
-        results['vs_baseline'] = None
+        results['vs_baselines'] = None
 
     # Sample Generation
     print("\n[7/7] Sample generation...")
@@ -540,8 +667,11 @@ def run_full_benchmark(
     print(f"Throughput:   {throughput_results['mean_tokens_per_sec']:.1f} tokens/sec")
     if not skip_perplexity:
         print(f"Perplexity:   {results['perplexity']['perplexity']:.2f}")
-    if results['vs_baseline']:
-        print(f"Speedup:      {results['vs_baseline']['speedup']['ttft']:.2f}x TTFT, {results['vs_baseline']['speedup']['throughput']:.2f}x throughput")
+    if results.get('vs_baselines'):
+        comp = results['vs_baselines']
+        print(f"\nSpeedup vs PyTorch Ternary: {comp['speedup_vs_pytorch_ternary']['ttft']:.2f}x TTFT, {comp['speedup_vs_pytorch_ternary']['throughput']:.2f}x throughput")
+        if comp['speedup_vs_fp32']:
+            print(f"Speedup vs PyTorch FP32:    {comp['speedup_vs_fp32']['ttft']:.2f}x TTFT, {comp['speedup_vs_fp32']['throughput']:.2f}x throughput")
     print("=" * 80)
 
     # Save results
