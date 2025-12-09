@@ -65,9 +65,9 @@ def test_inference_patterns():
     ]
     
     print(f"Testing {len(test_cases)} inference patterns...")
-    print(f"{'Description':<35} {'M':<4} {'N':<6} {'K':<6} {'Time (ms)':<10} {'GFLOPS':<8} {'Kernel'}")
-    print("-" * 85)
-    
+    print(f"{'Description':<35} {'M':<4} {'N':<6} {'K':<6} {'VNNI (ms)':<10} {'PyTorch (ms)':<12} {'Speedup':<8} {'Kernel'}")
+    print("-" * 105)
+
     results = []
     
     for M, N, K, desc in test_cases:
@@ -137,20 +137,35 @@ def test_inference_patterns():
                 kernel.matmul_free_vnni_v5_large_m(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
 
         end_time = time.time()
+        vnni_time_ms = (end_time - start_time) * 1000 / 10
 
-        # Calculate metrics
-        avg_time_ms = (end_time - start_time) * 1000 / 10
-        flops = 2 * M * N * K  # Approximate FLOPs for matmul
-        gflops = flops / (avg_time_ms * 1e6)
+        # PyTorch baseline comparison
+        x_float = torch.randn(M, K, dtype=torch.float32)
+        w_float = torch.randn(N, K, dtype=torch.float32)
+
+        # Warmup PyTorch
+        for _ in range(3):
+            torch.mm(x_float, w_float.t())
+
+        # Benchmark PyTorch
+        start_time = time.time()
+        for _ in range(10):
+            torch.mm(x_float, w_float.t())
+        end_time = time.time()
+        pytorch_time_ms = (end_time - start_time) * 1000 / 10
+
+        # Calculate speedup
+        speedup = pytorch_time_ms / vnni_time_ms
 
         kernel_display = kernel_name.replace("_int32", "")  # Clean up display name
-        print(f"{desc:<35} {M:<4} {N:<6} {K:<6} {avg_time_ms:<10.2f} {gflops:<8.1f} ({kernel_display})")
+        print(f"{desc:<35} {M:<4} {N:<6} {K:<6} {vnni_time_ms:<10.2f} {pytorch_time_ms:<12.2f} {speedup:<8.2f}x ({kernel_display})")
 
         results.append({
             'description': desc,
             'M': M, 'N': N, 'K': K,
-            'time_ms': avg_time_ms,
-            'gflops': gflops,
+            'vnni_time_ms': vnni_time_ms,
+            'pytorch_time_ms': pytorch_time_ms,
+            'speedup': speedup,
             'kernel': kernel_name
         })
 
@@ -169,12 +184,20 @@ def test_inference_patterns():
 
     for M in sorted(batch_groups.keys()):
         group = batch_groups[M]
-        avg_gflops = sum(r['gflops'] for r in group) / len(group)
-        total_time = sum(r['time_ms'] for r in group)
+        avg_speedup = sum(r['speedup'] for r in group) / len(group)
+        total_vnni_time = sum(r['vnni_time_ms'] for r in group)
+        total_pytorch_time = sum(r['pytorch_time_ms'] for r in group)
 
-        print(f"Batch M={M:<3}: {len(group)} operations, {avg_gflops:.1f} avg GFLOPS, {total_time:.1f}ms total")
+        print(f"Batch M={M:<3}: {len(group)} operations, {avg_speedup:.2f}x avg speedup, {total_vnni_time:.1f}ms vs {total_pytorch_time:.1f}ms")
 
-    print(f"\nOverall average: {sum(r['gflops'] for r in results) / len(results):.1f} GFLOPS")
+    overall_speedup = sum(r['speedup'] for r in results) / len(results)
+    print(f"\n🚀 Overall average speedup: {overall_speedup:.2f}x faster than PyTorch!")
+
+    # Highlight best performers
+    best_speedups = sorted(results, key=lambda x: x['speedup'], reverse=True)[:3]
+    print(f"\n🏆 Top 3 speedups:")
+    for i, result in enumerate(best_speedups, 1):
+        print(f"  {i}. {result['description']}: {result['speedup']:.2f}x ({result['kernel']})")
     print("✅ Inference performance test completed successfully!")
 
 if __name__ == "__main__":
