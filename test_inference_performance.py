@@ -2,32 +2,31 @@
 """
 Simple Inference Performance Test
 
-Tests the optimized kernels on realistic GPT-2 inference workloads
-without requiring external dependencies.
+Tests the optimized VNNI kernels on realistic GPT-2 inference workloads.
+Uses the same kernel loading as test_full_forward.py to ensure we test
+the actual optimized kernels, not the fallback implementations.
 """
 
 import torch
 import time
-import sys
 import platform
-from pathlib import Path
 from torch.utils.cpp_extension import load
 
 def test_inference_patterns():
     """Test performance on realistic inference patterns."""
     
-    print("=" * 70)
-    print("GPT-2 Inference Performance Test")
-    print("=" * 70)
+    print("=" * 80)
+    print("GPT-2 Inference Performance Test - Optimized VNNI Kernels")
+    print("=" * 80)
     
     # Load kernels - EXACTLY the same as test_full_forward.py
     arch = platform.machine().lower()
     if arch not in ['x86_64', 'amd64']:
         print(f"Unsupported architecture: {arch}")
         return
-
-    print("Loading VNNI kernels...")
-
+        
+    print("Loading optimized VNNI kernels...")
+    
     # Use exact same loading as test_full_forward.py to ensure we get the optimized kernels
     kernel = load(
         name="vnni_kernel_inference_test",
@@ -36,11 +35,12 @@ def test_inference_patterns():
         extra_ldflags=['-lgomp'],
         verbose=True  # Show compilation to verify correct kernel
     )
-
+    
     print("✅ VNNI kernels loaded successfully")
     print("✅ Using optimized VNNI v2/v3/v4/v5/v6 kernels (same as transformer benchmark)")
+    print()
     
-    # GPT-2 layer dimensions
+    # GPT-2 layer dimensions - realistic inference patterns
     test_cases = [
         # (M, N, K, description)
         (1, 2048, 2048, "Single token - Attention QKV"),
@@ -64,9 +64,9 @@ def test_inference_patterns():
         (128, 50257, 2048, "Large batch - LM head (vocab)"),
     ]
     
-    print(f"\nTesting {len(test_cases)} inference patterns...")
+    print(f"Testing {len(test_cases)} inference patterns...")
     print(f"{'Description':<35} {'M':<4} {'N':<6} {'K':<6} {'Time (ms)':<10} {'GFLOPS':<8} {'Kernel'}")
-    print("-" * 80)
+    print("-" * 85)
     
     results = []
     
@@ -87,7 +87,7 @@ def test_inference_patterns():
             threads = min(6, base_threads)
         else:
             threads = base_threads
-
+            
         # Use same kernel selection logic as matmul_int32_out in test_full_forward.py
         if N >= 8192:
             kernel_func = kernel.matmul_free_vnni_v4_large_n
@@ -125,27 +125,29 @@ def test_inference_patterns():
                 kernel_func(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
             else:
                 kernel_func(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
+
         end_time = time.time()
-        
+
         # Calculate metrics
         avg_time_ms = (end_time - start_time) * 1000 / 10
         flops = 2 * M * N * K  # Approximate FLOPs for matmul
         gflops = flops / (avg_time_ms * 1e6)
-        
+
         print(f"{desc:<35} {M:<4} {N:<6} {K:<6} {avg_time_ms:<10.2f} {gflops:<8.1f} ({kernel_name})")
-        
+
         results.append({
             'description': desc,
             'M': M, 'N': N, 'K': K,
             'time_ms': avg_time_ms,
-            'gflops': gflops
+            'gflops': gflops,
+            'kernel': kernel_name
         })
-    
+
     # Summary
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("INFERENCE PERFORMANCE SUMMARY")
-    print("=" * 70)
-    
+    print("=" * 80)
+
     # Group by batch size
     batch_groups = {}
     for result in results:
@@ -153,16 +155,16 @@ def test_inference_patterns():
         if M not in batch_groups:
             batch_groups[M] = []
         batch_groups[M].append(result)
-    
+
     for M in sorted(batch_groups.keys()):
         group = batch_groups[M]
         avg_gflops = sum(r['gflops'] for r in group) / len(group)
         total_time = sum(r['time_ms'] for r in group)
-        
+
         print(f"Batch M={M:<3}: {len(group)} operations, {avg_gflops:.1f} avg GFLOPS, {total_time:.1f}ms total")
-    
+
     print(f"\nOverall average: {sum(r['gflops'] for r in results) / len(results):.1f} GFLOPS")
-    print("Test completed successfully!")
+    print("✅ Inference performance test completed successfully!")
 
 if __name__ == "__main__":
     test_inference_patterns()
