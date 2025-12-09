@@ -110,15 +110,15 @@ def test_inference_patterns():
             kernel_name = "v5"
             use_bias = False
         else:
-            # v3 kernel for small operations - outputs float32
-            y_out = y  # v3 outputs float32
-            kernel_name = "v3"
+            # v3 kernel for small operations - use int32 output version for consistency
+            y_out = torch.zeros(M, N, dtype=torch.int32)
+            kernel_name = "v3_int32"
             use_bias = True
 
         # Warmup
         for _ in range(3):
-            if kernel_name == "v3":
-                kernel.matmul_free_vnni_v3(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+            if kernel_name == "v3_int32":
+                kernel.matmul_free_vnni_v3_int32_out(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
             elif kernel_name == "v4":
                 kernel.matmul_free_vnni_v4_large_n(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
             elif kernel_name == "v5":
@@ -128,8 +128,8 @@ def test_inference_patterns():
         start_time = time.time()
 
         for _ in range(10):
-            if kernel_name == "v3":
-                kernel.matmul_free_vnni_v3(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
+            if kernel_name == "v3_int32":
+                kernel.matmul_free_vnni_v3_int32_out(x_int8, scales, w_int8, w_sum, y_out, bias, M, N, K, threads)
             elif kernel_name == "v4":
                 kernel.matmul_free_vnni_v4_large_n(x_int8, scales, w_int8, w_sum, y_out, M, N, K, threads)
             elif kernel_name == "v5":
@@ -142,7 +142,8 @@ def test_inference_patterns():
         flops = 2 * M * N * K  # Approximate FLOPs for matmul
         gflops = flops / (avg_time_ms * 1e6)
 
-        print(f"{desc:<35} {M:<4} {N:<6} {K:<6} {avg_time_ms:<10.2f} {gflops:<8.1f} ({kernel_name})")
+        kernel_display = kernel_name.replace("_int32", "")  # Clean up display name
+        print(f"{desc:<35} {M:<4} {N:<6} {K:<6} {avg_time_ms:<10.2f} {gflops:<8.1f} ({kernel_display})")
 
         results.append({
             'description': desc,
