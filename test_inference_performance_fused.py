@@ -290,11 +290,11 @@ def test_fused_inference_patterns():
 
 
 def compare_fused_vs_separate():
-    """Compare fused kernels against separate operations."""
+    """Compare fused kernels against separate operations and PyTorch baseline."""
 
-    print("\n" + "=" * 90)
-    print("COMPARISON: Fused Kernels vs Separate Operations")
-    print("=" * 90)
+    print("\n" + "=" * 100)
+    print("COMPARISON: PyTorch FP32 vs Separate VNNI vs Fused VNNI")
+    print("=" * 100)
 
     arch = platform.machine().lower()
     if arch not in ['x86_64', 'amd64']:
@@ -315,33 +315,54 @@ def compare_fused_vs_separate():
     threads = min(os.cpu_count() or 8, 8)
 
     test_sizes = [
-        (32, 2048, 2048, "Medium batch - typical"),
+        (1, 2048, 2048, "Single token"),
+        (1, 8192, 2048, "Single token - large N"),
+        (8, 2048, 2048, "Small batch"),
+        (8, 8192, 2048, "Small batch - large N"),
+        (32, 2048, 2048, "Medium batch"),
         (32, 8192, 2048, "Medium batch - large N"),
-        (128, 2048, 2048, "Large batch - typical"),
+        (128, 2048, 2048, "Large batch"),
         (128, 8192, 2048, "Large batch - large N"),
     ]
 
-    print(f"\n{'Description':<30} {'Separate (ms)':<15} {'Fused (ms)':<15} {'Speedup':<10}")
-    print("-" * 75)
+    print(f"\n{'Description':<25} {'PyTorch':<12} {'Separate':<12} {'Fused':<12} {'vs PyTorch':<12} {'vs Separate':<12}")
+    print("-" * 100)
+
+    results = []
 
     for M, N, K, desc in test_sizes:
         K_padded = get_k_padded(K)
 
-        # Prepare data
+        # =====================================================================
+        # PyTorch FP32 baseline: matmul + softmax
+        # =====================================================================
+        x_float = torch.randn(M, K, dtype=torch.float32)
+        w_float = torch.randint(-1, 2, (N, K), dtype=torch.float32)
+
+        # Warmup PyTorch
+        for _ in range(3):
+            y_pt = torch.mm(x_float, w_float.T)
+            y_pt = torch.softmax(y_pt, dim=-1)
+
+        start = time.time()
+        for _ in range(10):
+            y_pt = torch.mm(x_float, w_float.T)
+            y_pt = torch.softmax(y_pt, dim=-1)
+        pytorch_time = (time.time() - start) * 1000 / 10
+
+        # =====================================================================
+        # Separate VNNI: matmul kernel + PyTorch softmax + quantize
+        # =====================================================================
         x_int8 = torch.randint(-128, 127, (M, K_padded), dtype=torch.int8).contiguous()
         x_scales = torch.rand(M, dtype=torch.float32).contiguous() * 0.1
         w_int8 = torch.randint(-1, 2, (N, K_padded), dtype=torch.int8).contiguous()
         w_sum = torch.sum(w_int8.to(torch.int32), dim=1).to(torch.int32).contiguous()
 
-        # Separate: matmul + manual softmax
         y_int32 = torch.zeros(M, N, dtype=torch.int32).contiguous()
-        y_float = torch.zeros(M, N, dtype=torch.float32).contiguous()
-        y_int8_sep = torch.zeros(M, N, dtype=torch.int8).contiguous()
 
         # Warmup separate
         for _ in range(3):
             kernel.matmul_free_vnni_v4_large_n(x_int8, x_scales, w_int8, w_sum, y_int32, M, N, K, threads)
-            # Manual softmax would go here (simulated with torch)
             y_float = y_int32.float() * x_scales.unsqueeze(1)
             y_float = torch.softmax(y_float, dim=-1)
             y_int8_sep = (y_float * 127).clamp(-127, 127).to(torch.int8)
@@ -354,7 +375,9 @@ def compare_fused_vs_separate():
             y_int8_sep = (y_float * 127).clamp(-127, 127).to(torch.int8)
         separate_time = (time.time() - start) * 1000 / 10
 
-        # Fused
+        # =====================================================================
+        # Fused VNNI: matmul + softmax + quantize in one kernel
+        # =====================================================================
         y_int8_fused = torch.zeros(M, N, dtype=torch.int8).contiguous()
         y_scales_out = torch.zeros(M, dtype=torch.float32).contiguous()
 
@@ -370,10 +393,40 @@ def compare_fused_vs_separate():
             )
         fused_time = (time.time() - start) * 1000 / 10
 
-        speedup = separate_time / fused_time
-        print(f"{desc:<30} {separate_time:<15.3f} {fused_time:<15.3f} {speedup:<10.2f}x")
+        # Calculate speedups
+        speedup_vs_pytorch = pytorch_time / fused_time
+        speedup_vs_separate = separate_time / fused_time
 
-    print("\nNote: 'Separate' includes PyTorch softmax overhead. Pure C++ comparison would differ.")
+        print(f"{desc:<25} {pytorch_time:<12.3f} {separate_time:<12.3f} {fused_time:<12.3f} {speedup_vs_pytorch:<12.2f}x {speedup_vs_separate:<12.2f}x")
+
+        results.append({
+            'desc': desc, 'M': M, 'N': N, 'K': K,
+            'pytorch_ms': pytorch_time,
+            'separate_ms': separate_time,
+            'fused_ms': fused_time,
+            'speedup_vs_pytorch': speedup_vs_pytorch,
+            'speedup_vs_separate': speedup_vs_separate
+        })
+
+    # Summary
+    print()
+    print("-" * 100)
+    avg_vs_pytorch = sum(r['speedup_vs_pytorch'] for r in results) / len(results)
+    avg_vs_separate = sum(r['speedup_vs_separate'] for r in results) / len(results)
+    print(f"{'AVERAGE':<25} {'':<12} {'':<12} {'':<12} {avg_vs_pytorch:<12.2f}x {avg_vs_separate:<12.2f}x")
+
+    # Best/worst cases
+    best_pytorch = max(results, key=lambda x: x['speedup_vs_pytorch'])
+    worst_pytorch = min(results, key=lambda x: x['speedup_vs_pytorch'])
+    print()
+    print(f"Best vs PyTorch:  {best_pytorch['speedup_vs_pytorch']:.2f}x at M={best_pytorch['M']}, N={best_pytorch['N']}")
+    print(f"Worst vs PyTorch: {worst_pytorch['speedup_vs_pytorch']:.2f}x at M={worst_pytorch['M']}, N={worst_pytorch['N']}")
+
+    print()
+    print("Legend:")
+    print("  PyTorch:  torch.mm() + torch.softmax() [FP32]")
+    print("  Separate: VNNI matmul kernel + torch.softmax() + quantize [int8]")
+    print("  Fused:    Single fused_softmax kernel [int8, all ops combined]")
 
 
 if __name__ == "__main__":
