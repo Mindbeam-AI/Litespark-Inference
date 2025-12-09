@@ -676,7 +676,7 @@ def load_ternary_model(model_key: str, num_threads: int = None):
         model: Loaded model with VNNI kernels
         tokenizer: HuggingFace tokenizer
     """
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, LlamaTokenizer
 
     if model_key not in AVAILABLE_MODELS:
         raise ValueError(f"Unknown model: {model_key}. Available: {list(AVAILABLE_MODELS.keys())}")
@@ -688,7 +688,22 @@ def load_ternary_model(model_key: str, num_threads: int = None):
     model.eval()
 
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(hf_name, trust_remote_code=True)
+    # BitNet uses a custom tokenizer class that may not load with AutoTokenizer
+    # Use LlamaTokenizer directly with the tokenizer.model file
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(hf_name, trust_remote_code=True)
+    except (ValueError, OSError, ImportError) as e:
+        print(f"  AutoTokenizer failed: {e}")
+        print("  Loading tokenizer.model directly with LlamaTokenizer...")
+        try:
+            # BitNet tokenizer is sentencepiece-based, compatible with LlamaTokenizer
+            tokenizer = LlamaTokenizer.from_pretrained(hf_name)
+        except Exception as e2:
+            print(f"  LlamaTokenizer failed: {e2}")
+            # Last resort: use the tokenizer.json with a generic tokenizer
+            from transformers import PreTrainedTokenizerFast
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(hf_name)
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
