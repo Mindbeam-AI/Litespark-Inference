@@ -97,7 +97,7 @@ def test_fused_inference_patterns():
         x_int8 = torch.randint(-128, 127, (M, K_padded), dtype=torch.int8).contiguous()
         x_scales = torch.rand(M, dtype=torch.float32).contiguous() * 0.1
         w_int8 = torch.randint(-1, 2, (N, K_padded), dtype=torch.int8).contiguous()
-        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).contiguous()
+        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).to(torch.int32).contiguous()
 
         # Output tensors
         y_int8 = torch.zeros(M, N, dtype=torch.int8).contiguous()
@@ -165,7 +165,7 @@ def test_fused_inference_patterns():
         x_int8 = torch.randint(-128, 127, (M, K_padded), dtype=torch.int8).contiguous()
         x_scales = torch.rand(M, dtype=torch.float32).contiguous() * 0.1
         w_int8 = torch.randint(-1, 2, (N, K_padded), dtype=torch.int8).contiguous()
-        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).contiguous()
+        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).to(torch.int32).contiguous()
 
         # Output tensors
         y_int8 = torch.zeros(M, N, dtype=torch.int8).contiguous()
@@ -232,7 +232,7 @@ def test_fused_inference_patterns():
         x_int8 = torch.randint(-128, 127, (M, K_padded), dtype=torch.int8).contiguous()
         x_scales = torch.rand(M, dtype=torch.float32).contiguous() * 0.1
         w_int8 = torch.randint(-1, 2, (N, K_padded), dtype=torch.int8).contiguous()
-        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).contiguous()
+        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).to(torch.int32).contiguous()
 
         # Output tensors (N/2 because SwiGLU halves the output)
         y_int8 = torch.zeros(M, out_dim, dtype=torch.int8).contiguous()
@@ -331,7 +331,7 @@ def compare_fused_vs_separate():
         x_int8 = torch.randint(-128, 127, (M, K_padded), dtype=torch.int8).contiguous()
         x_scales = torch.rand(M, dtype=torch.float32).contiguous() * 0.1
         w_int8 = torch.randint(-1, 2, (N, K_padded), dtype=torch.int8).contiguous()
-        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).contiguous()
+        w_sum = torch.sum(w_int8.to(torch.int32), dim=1).to(torch.int32).contiguous()
 
         # Separate: matmul + manual softmax
         y_int32 = torch.zeros(M, N, dtype=torch.int32).contiguous()
