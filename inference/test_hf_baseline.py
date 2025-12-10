@@ -1,39 +1,45 @@
 #!/usr/bin/env python3
 """
-Test HuggingFace BitNet model structure.
+Test HuggingFace BitNet model structure by loading safetensors directly.
 """
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from safetensors import safe_open
+from huggingface_hub import hf_hub_download
+import json
 
 MODEL = 'microsoft/bitnet-b1.58-2B-4T-bf16'
 
-print(f"Loading config: {MODEL}")
-config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
-print(f"Config: {config}")
+# Download and read config
+print(f"Downloading config from {MODEL}...")
+config_path = hf_hub_download(MODEL, 'config.json')
+with open(config_path) as f:
+    config = json.load(f)
+print(f"Config: {json.dumps(config, indent=2)}")
 
-print(f"\nLoading model: {MODEL}")
-model = AutoModelForCausalLM.from_pretrained(MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16)
+# Download safetensors
+print(f"\nDownloading model weights...")
+model_path = hf_hub_download(MODEL, 'model.safetensors')
 
-print("\nModel structure:")
-print(f"  Layers: {len(model.model.layers)}")
-layer = model.model.layers[0]
-print(f"  Layer 0 children: {list(layer.named_children())}")
-print(f"  Attention: {layer.self_attn}")
-print(f"  MLP: {layer.mlp}")
+# Inspect weight names and shapes
+print("\nWeight tensors:")
+with safe_open(model_path, framework="pt") as f:
+    keys = list(f.keys())
+    print(f"Total tensors: {len(keys)}")
 
-# Check weight shapes
-print("\nWeight shapes:")
-print(f"  q_proj: {layer.self_attn.q_proj.weight.shape}")
-print(f"  k_proj: {layer.self_attn.k_proj.weight.shape}")
-print(f"  v_proj: {layer.self_attn.v_proj.weight.shape}")
-print(f"  gate_proj: {layer.mlp.gate_proj.weight.shape}")
-print(f"  up_proj: {layer.mlp.up_proj.weight.shape}")
-print(f"  down_proj: {layer.mlp.down_proj.weight.shape}")
+    # Show first layer structure
+    layer0_keys = [k for k in keys if 'layers.0.' in k]
+    print(f"\nLayer 0 tensors:")
+    for k in sorted(layer0_keys):
+        tensor = f.get_tensor(k)
+        print(f"  {k}: {tensor.shape} {tensor.dtype}")
 
-# Test generation
-print("\nTesting generation...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-input_ids = tokenizer('The future of AI is', return_tensors='pt')['input_ids']
-outputs = model.generate(input_ids, max_new_tokens=30, do_sample=False)
-print(tokenizer.decode(outputs[0]))
+    # Check a weight's value range (to see if it's already quantized)
+    print("\nSample weight stats (q_proj):")
+    w = f.get_tensor('model.layers.0.self_attn.q_proj.weight')
+    print(f"  Shape: {w.shape}")
+    print(f"  Dtype: {w.dtype}")
+    print(f"  Min: {w.min().item():.6f}")
+    print(f"  Max: {w.max().item():.6f}")
+    print(f"  Mean: {w.mean().item():.6f}")
+    print(f"  Unique values (sample): {torch.unique(w[:100,:100]).numel()}")
