@@ -409,6 +409,37 @@ class PyTorchBitNet(nn.Module):
 
 
 # ============================================================================
+# HuggingFace Official Model Wrapper
+# ============================================================================
+
+class HuggingFaceModelWrapper(nn.Module):
+    """Wrapper to make HuggingFace model compatible with our benchmark interface."""
+
+    def __init__(self, hf_model):
+        super().__init__()
+        self.model = hf_model
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Return logits in same format as our models."""
+        outputs = self.model(input_ids)
+        return outputs.logits
+
+    @classmethod
+    def from_pretrained(cls, model_name: str):
+        """Load HuggingFace model."""
+        from transformers import AutoModelForCausalLM
+
+        print(f"  Loading HuggingFace model: {model_name}")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,  # Use float32 for fair CPU comparison
+            device_map=None,  # CPU only
+            trust_remote_code=True,
+        )
+        return cls(hf_model)
+
+
+# ============================================================================
 # Benchmark Functions
 # ============================================================================
 
@@ -836,11 +867,25 @@ def main():
     pytorch_model.eval()
     results.append(benchmark_model(pytorch_model, tokenizer, "PyTorch (ternary)"))
 
+    # 3. HuggingFace official model
+    print("\n" + "=" * 70)
+    print("3. Loading HuggingFace official model...")
+    print("=" * 70)
+    try:
+        hf_model = HuggingFaceModelWrapper.from_pretrained(MODEL_NAME)
+        hf_model.eval()
+        results.append(benchmark_model(hf_model, tokenizer, "HuggingFace (official)"))
+        hf_loaded = True
+    except Exception as e:
+        print(f"  [!] Failed to load HuggingFace model: {e}")
+        hf_model = None
+        hf_loaded = False
+
     # ========================================================================
     # Numerical Accuracy Comparison
     # ========================================================================
     print("\n" + "=" * 70)
-    print("3. Numerical Accuracy Comparison")
+    print("4. Numerical Accuracy Comparison")
     print("=" * 70)
 
     test_prompts = [
@@ -861,7 +906,7 @@ def main():
     # Perplexity Evaluation
     # ========================================================================
     print("\n" + "=" * 70)
-    print("4. Perplexity Evaluation (WikiText-2)")
+    print("5. Perplexity Evaluation (WikiText-2)")
     print("=" * 70)
 
     print("\n  VNNI Kernels:")
@@ -874,9 +919,17 @@ def main():
     results[1]['perplexity'] = pytorch_ppl
     print(f"    Perplexity: {pytorch_ppl:.2f}")
 
+    if hf_loaded:
+        print("\n  HuggingFace official:")
+        hf_ppl = evaluate_perplexity(hf_model, tokenizer, max_samples=50)
+        results[2]['perplexity'] = hf_ppl
+        print(f"    Perplexity: {hf_ppl:.2f}")
+
     # Clean up models
     del vnni_model
     del pytorch_model
+    if hf_loaded:
+        del hf_model
     gc.collect()
 
     # ========================================================================
@@ -903,10 +956,19 @@ def main():
     print(f"  TTFT: {pytorch_ttft / vnni_ttft:.2f}x")
     print(f"  Throughput: {vnni_tps / pytorch_tps:.2f}x")
 
+    if len(results) > 2:
+        hf_ttft = results[2]['mean_ttft_ms']
+        hf_tps = results[2]['tokens_per_sec']
+        print(f"\nSpeedup vs HuggingFace (official):")
+        print(f"  TTFT: {hf_ttft / vnni_ttft:.2f}x")
+        print(f"  Throughput: {vnni_tps / hf_tps:.2f}x")
+
     # Memory comparison
     print(f"\nMemory Usage:")
     print(f"  VNNI Kernels: {results[0]['memory_mb']:.1f} MB")
     print(f"  PyTorch: {results[1]['memory_mb']:.1f} MB")
+    if len(results) > 2:
+        print(f"  HuggingFace: {results[2]['memory_mb']:.1f} MB")
 
     # Numerical accuracy summary
     print(f"\nNumerical Accuracy:")
