@@ -594,9 +594,11 @@ def profile_vnni_kernel(model, tokenizer):
         up = mlp.up_proj(x_in)
     up_time = (time.perf_counter() - start) * 1000
 
+    # Use correct intermediate size input for down_proj
+    hidden = gate * up
     start = time.perf_counter()
     with torch.no_grad():
-        down = mlp.down_proj(x_in)  # Wrong input but just timing
+        down = mlp.down_proj(hidden)
     down_time = (time.perf_counter() - start) * 1000
 
     print(f"  Gate proj: {gate_time:.2f} ms")
