@@ -187,6 +187,7 @@ else
         --instance-type "$INSTANCE_TYPE" \
         --key-name "$KEY_NAME" \
         --security-group-ids "$SG_ID" \
+        --associate-public-ip-address \
         --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":50,"VolumeType":"gp3"}}]' \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=graviton-benchmark}]" \
         --query 'Instances[0].InstanceId' \
