@@ -255,8 +255,8 @@ class TernaryLinear(nn.Module):
         self.scale = 1.0
 
         # Determine which kernel variant to use based on dimensions
-        # v4_large_n is ~17x faster for large N (MLP projections)
-        self.use_v4_large_n = out_features >= 4096
+        # v4_large_n is 4-8x faster for N >= 1024 (all major projections)
+        self.use_v4_large_n = out_features >= 1024
 
     def load_from_weight(self, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
         """Load from a float weight tensor."""
@@ -558,8 +558,8 @@ class BitNetLinear(nn.Module):
         self.scale = 1.0
 
         # Determine which kernel variant to use based on dimensions
-        # v4_large_n is ~17x faster for large N (MLP projections)
-        self.use_v4_large_n = out_features >= 4096
+        # v4_large_n is 4-8x faster for N >= 1024 (all major projections)
+        self.use_v4_large_n = out_features >= 1024
 
     def load_from_weight(self, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
         """Load from a float weight tensor using BitNet quantization."""
