@@ -490,6 +490,117 @@ class MMFreeLM(nn.Module):
 
 
 # ============================================================================
+# BitNet Linear Layer (with BitNet-specific architecture)
+# ============================================================================
+
+class BitNetLinear(nn.Module):
+    """
+    BitNet-specific linear layer.
+
+    Same as TernaryLinear but designed for BitNet's architecture.
+    Uses the same underlying VNNI/Graviton kernels.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        num_threads: int = None
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        k_pad = get_k_padding()
+        self.K_padded = ((in_features + k_pad - 1) // k_pad) * k_pad
+        self.num_threads = num_threads or torch.get_num_threads()
+
+        # Will be set by load_from_weight
+        self.register_buffer('w_int8', None)
+        self.register_buffer('w_sum', None)
+        self.register_buffer('bias_tensor', None)
+        self.scale = 1.0
+
+    def load_from_weight(self, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
+        """Load from a float weight tensor using BitNet quantization."""
+        self.w_int8, self.w_sum, self.scale = prepare_ternary_weight(weight)
+        if bias is not None:
+            self.bias_tensor = bias.clone()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using architecture-appropriate kernel."""
+        original_shape = x.shape
+        x = x.view(-1, self.in_features)
+        M = x.shape[0]
+
+        # Quantize input
+        x_int8, x_scale = quantize_activation(x)
+
+        # Allocate output
+        y = torch.zeros(M, self.out_features, dtype=torch.float32)
+        bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
+
+        # Select kernel based on architecture and dimensions
+        kernel = get_kernel()
+        kernel_type = get_kernel_type()
+
+        if kernel_type == 'vnni':
+            if self.in_features <= 1024 and self.out_features <= 4096:
+                kernel.matmul_free_vnni_v2(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                kernel.matmul_free_vnni_v3(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+        elif kernel_type == 'graviton':
+            if self.in_features <= 1024 and self.out_features <= 4096:
+                kernel.matmul_free_graviton_v2(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                kernel.matmul_free_graviton_v3(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+        elif kernel_type == 'neon':
+            if self.in_features <= 1024 and self.out_features <= 4096:
+                kernel.matmul_free_neon_sdot_v2(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                kernel.matmul_free_neon_sdot_v3(
+                    x_int8, x_scale,
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+        else:
+            raise RuntimeError(f"Unknown kernel type: {kernel_type}")
+
+        # Apply scale
+        y = y * self.scale
+
+        # Reshape back
+        output_shape = original_shape[:-1] + (self.out_features,)
+        return y.view(output_shape)
+
+
+# ============================================================================
 # BitNet Loader
 # ============================================================================
 
@@ -500,13 +611,13 @@ class BitNetConfig:
     num_layers: int = 26
     num_heads: int = 32
     intermediate_size: int = 8640
-    vocab_size: int = 32000
+    vocab_size: int = 32002  # BitNet uses 32002
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-6
 
 
 class BitNetAttention(nn.Module):
-    """BitNet attention layer."""
+    """BitNet attention layer (standard Llama-style attention with ternary weights)."""
 
     def __init__(self, config: BitNetConfig, num_threads: int):
         super().__init__()
@@ -515,19 +626,26 @@ class BitNetAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_heads
         self.num_threads = num_threads
 
-        self.q_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.k_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.v_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.o_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
+        # Projections using BitNetLinear
+        self.q_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
+        self.k_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
+        self.v_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
+        self.o_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
 
         self.scale = 1.0 / (self.head_dim ** 0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
-        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # Project Q, K, V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape for multi-head attention
+        q = q.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         # Attention
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
@@ -544,13 +662,13 @@ class BitNetAttention(nn.Module):
 
 
 class BitNetMLP(nn.Module):
-    """BitNet MLP layer."""
+    """BitNet MLP layer (standard Llama-style MLP with ternary weights)."""
 
     def __init__(self, config: BitNetConfig, num_threads: int):
         super().__init__()
-        self.gate_proj = TernaryLinear(config.hidden_size, config.intermediate_size, num_threads=num_threads)
-        self.up_proj = TernaryLinear(config.hidden_size, config.intermediate_size, num_threads=num_threads)
-        self.down_proj = TernaryLinear(config.intermediate_size, config.hidden_size, num_threads=num_threads)
+        self.gate_proj = BitNetLinear(config.hidden_size, config.intermediate_size, num_threads=num_threads)
+        self.up_proj = BitNetLinear(config.hidden_size, config.intermediate_size, num_threads=num_threads)
+        self.down_proj = BitNetLinear(config.intermediate_size, config.hidden_size, num_threads=num_threads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = F.silu(self.gate_proj(x))
@@ -575,7 +693,7 @@ class BitNetBlock(nn.Module):
 
 
 class BitNet(nn.Module):
-    """BitNet b1.58 with VNNI kernels."""
+    """BitNet b1.58 with VNNI/Graviton kernels."""
 
     def __init__(self, config: BitNetConfig, num_threads: int = None):
         super().__init__()
@@ -625,7 +743,7 @@ class BitNet(nn.Module):
         return model
 
     def _load_hf_weights(self, hf_model):
-        """Load weights from HuggingFace model."""
+        """Load weights from HuggingFace BitNet model."""
         # Embeddings
         self.embed_tokens.weight.data = hf_model.model.embed_tokens.weight.data.clone()
 
@@ -633,18 +751,18 @@ class BitNet(nn.Module):
         for i, layer in enumerate(self.layers):
             hf_layer = hf_model.model.layers[i]
 
-            # Attention
+            # Attention projections
             layer.attn.q_proj.load_from_weight(hf_layer.self_attn.q_proj.weight.data)
             layer.attn.k_proj.load_from_weight(hf_layer.self_attn.k_proj.weight.data)
             layer.attn.v_proj.load_from_weight(hf_layer.self_attn.v_proj.weight.data)
             layer.attn.o_proj.load_from_weight(hf_layer.self_attn.o_proj.weight.data)
 
-            # MLP
+            # MLP projections
             layer.mlp.gate_proj.load_from_weight(hf_layer.mlp.gate_proj.weight.data)
             layer.mlp.up_proj.load_from_weight(hf_layer.mlp.up_proj.weight.data)
             layer.mlp.down_proj.load_from_weight(hf_layer.mlp.down_proj.weight.data)
 
-            # Norms
+            # Block norms
             layer.input_norm.weight.data = hf_layer.input_layernorm.weight.data.clone()
             layer.post_attn_norm.weight.data = hf_layer.post_attention_layernorm.weight.data.clone()
 
