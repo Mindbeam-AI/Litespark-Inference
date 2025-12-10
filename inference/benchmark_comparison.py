@@ -606,6 +606,132 @@ def profile_vnni_kernel(model, tokenizer):
     print(f"  Down proj: {down_time:.2f} ms")
     print(f"  Total projections: {gate_time + up_time + down_time:.2f} ms")
 
+    # Profile quantization overhead vs kernel time
+    print("\n" + "=" * 70)
+    print("Quantization vs Kernel Breakdown")
+    print("=" * 70)
+
+    from inference.ternary_models import quantize_activation, get_kernel, get_kernel_type
+
+    # Get a projection to test
+    proj = layer.attn.q_proj
+    x_test = normed.clone()
+
+    # Time full forward (includes quantization)
+    times_full = []
+    for _ in range(10):
+        start = time.perf_counter()
+        with torch.no_grad():
+            _ = proj(x_test)
+        times_full.append((time.perf_counter() - start) * 1000)
+    full_time = sum(times_full) / len(times_full)
+
+    # Time just quantization
+    times_quant = []
+    for _ in range(10):
+        x_flat = x_test.view(-1, proj.in_features)
+        start = time.perf_counter()
+        x_int8, x_scale = quantize_activation(x_flat)
+        times_quant.append((time.perf_counter() - start) * 1000)
+    quant_time = sum(times_quant) / len(times_quant)
+
+    # Time just kernel call
+    kernel = get_kernel()
+    kernel_type = get_kernel_type()
+    x_flat = x_test.view(-1, proj.in_features)
+    x_int8, x_scale = quantize_activation(x_flat)
+    M = x_flat.shape[0]
+    y = torch.zeros(M, proj.out_features, dtype=torch.float32)
+    bias = torch.Tensor()
+
+    times_kernel = []
+    for _ in range(10):
+        y.zero_()
+        start = time.perf_counter()
+        kernel.matmul_free_vnni_v3(
+            x_int8, x_scale,
+            proj.w_int8, proj.w_sum,
+            y, bias,
+            M, proj.out_features, proj.in_features, proj.num_threads
+        )
+        times_kernel.append((time.perf_counter() - start) * 1000)
+    kernel_time = sum(times_kernel) / len(times_kernel)
+
+    # Time scale multiplication
+    times_scale = []
+    for _ in range(10):
+        start = time.perf_counter()
+        _ = y * proj.scale
+        times_scale.append((time.perf_counter() - start) * 1000)
+    scale_time = sum(times_scale) / len(times_scale)
+
+    print(f"\nQ projection (2560 -> 2560) breakdown:")
+    print(f"  Full forward:     {full_time:.3f} ms")
+    print(f"  - Quantization:   {quant_time:.3f} ms ({100*quant_time/full_time:.1f}%)")
+    print(f"  - Kernel:         {kernel_time:.3f} ms ({100*kernel_time/full_time:.1f}%)")
+    print(f"  - Scale multiply: {scale_time:.3f} ms ({100*scale_time/full_time:.1f}%)")
+    print(f"  - Other overhead: {full_time - quant_time - kernel_time - scale_time:.3f} ms")
+
+    # Test MLP projection too (larger)
+    proj = layer.mlp.gate_proj
+    x_test = normed2.clone()
+
+    times_full = []
+    for _ in range(10):
+        start = time.perf_counter()
+        with torch.no_grad():
+            _ = proj(x_test)
+        times_full.append((time.perf_counter() - start) * 1000)
+    full_time = sum(times_full) / len(times_full)
+
+    times_quant = []
+    for _ in range(10):
+        x_flat = x_test.view(-1, proj.in_features)
+        start = time.perf_counter()
+        x_int8, x_scale = quantize_activation(x_flat)
+        times_quant.append((time.perf_counter() - start) * 1000)
+    quant_time = sum(times_quant) / len(times_quant)
+
+    x_flat = x_test.view(-1, proj.in_features)
+    x_int8, x_scale = quantize_activation(x_flat)
+    M = x_flat.shape[0]
+    y = torch.zeros(M, proj.out_features, dtype=torch.float32)
+
+    times_kernel = []
+    for _ in range(10):
+        y.zero_()
+        start = time.perf_counter()
+        kernel.matmul_free_vnni_v3(
+            x_int8, x_scale,
+            proj.w_int8, proj.w_sum,
+            y, bias,
+            M, proj.out_features, proj.in_features, proj.num_threads
+        )
+        times_kernel.append((time.perf_counter() - start) * 1000)
+    kernel_time = sum(times_kernel) / len(times_kernel)
+
+    print(f"\nGate projection (2560 -> 6912) breakdown:")
+    print(f"  Full forward:     {full_time:.3f} ms")
+    print(f"  - Quantization:   {quant_time:.3f} ms ({100*quant_time/full_time:.1f}%)")
+    print(f"  - Kernel:         {kernel_time:.3f} ms ({100*kernel_time/full_time:.1f}%)")
+    print(f"  - Other overhead: {full_time - quant_time - kernel_time:.3f} ms")
+
+    # Compare with PyTorch matmul for same operation
+    print(f"\nComparison with PyTorch F.linear:")
+    w_float = proj.w_int8.float() * proj.scale  # Reconstruct float weight
+    x_float = x_test.view(-1, proj.in_features)
+
+    times_pytorch = []
+    for _ in range(10):
+        start = time.perf_counter()
+        _ = F.linear(x_float, w_float)
+        times_pytorch.append((time.perf_counter() - start) * 1000)
+    pytorch_time = sum(times_pytorch) / len(times_pytorch)
+
+    print(f"  PyTorch F.linear: {pytorch_time:.3f} ms")
+    print(f"  Our kernel only:  {kernel_time:.3f} ms")
+    print(f"  Kernel speedup:   {pytorch_time/kernel_time:.2f}x")
+
 
 def main():
     print("=" * 70)
