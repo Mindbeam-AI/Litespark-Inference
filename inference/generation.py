@@ -42,13 +42,13 @@ def _sample_next_token(
     config: GenerationConfig
 ) -> torch.Tensor:
     """Sample next token from logits."""
-    # Apply temperature
-    if config.temperature != 1.0:
-        logits = logits / config.temperature
-
+    # Greedy decoding (no temperature needed)
     if not config.do_sample:
-        # Greedy decoding
         return logits.argmax(dim=-1, keepdim=True)
+
+    # Apply temperature (only for sampling, avoid division by zero)
+    if config.temperature > 0 and config.temperature != 1.0:
+        logits = logits / config.temperature
 
     # Apply top-k filtering
     if config.top_k > 0:
