@@ -732,6 +732,51 @@ def profile_vnni_kernel(model, tokenizer):
     print(f"  Our kernel only:  {kernel_time:.3f} ms")
     print(f"  Kernel speedup:   {pytorch_time/kernel_time:.2f}x")
 
+    # Test kernel performance across different M sizes
+    print("\n" + "=" * 70)
+    print("Kernel Performance vs Batch Size (M)")
+    print("=" * 70)
+    print(f"\nGate projection shape: K=2560 -> N=6912")
+    print(f"{'M':<6} {'VNNI (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+    print("-" * 45)
+
+    K, N = 2560, 6912
+    K_pad = ((K + 63) // 64) * 64
+    w_test = torch.randint(-1, 2, (N, K_pad), dtype=torch.int8)
+    w_sum_test = w_test.sum(dim=1, dtype=torch.int32)
+    w_float = w_test[:, :K].float()
+
+    for M in [1, 6, 16, 64, 128, 256]:
+        x_int8 = torch.randint(-127, 127, (M, K_pad), dtype=torch.int8)
+        x_scale = torch.ones(M)
+        x_float = x_int8[:, :K].float()
+        y = torch.zeros(M, N)
+        bias = torch.Tensor()
+
+        # Time VNNI kernel
+        for _ in range(3):
+            kernel.matmul_free_vnni_v3(x_int8, x_scale, w_test, w_sum_test, y, bias, M, N, K, 16)
+        times_vnni = []
+        for _ in range(10):
+            y.zero_()
+            start = time.perf_counter()
+            kernel.matmul_free_vnni_v3(x_int8, x_scale, w_test, w_sum_test, y, bias, M, N, K, 16)
+            times_vnni.append((time.perf_counter() - start) * 1000)
+        vnni_time = sum(times_vnni) / len(times_vnni)
+
+        # Time PyTorch
+        for _ in range(3):
+            _ = F.linear(x_float, w_float)
+        times_pt = []
+        for _ in range(10):
+            start = time.perf_counter()
+            _ = F.linear(x_float, w_float)
+            times_pt.append((time.perf_counter() - start) * 1000)
+        pt_time = sum(times_pt) / len(times_pt)
+
+        speedup = pt_time / vnni_time
+        print(f"{M:<6} {vnni_time:<12.3f} {pt_time:<14.3f} {speedup:<10.2f}x")
+
 
 def main():
     print("=" * 70)
