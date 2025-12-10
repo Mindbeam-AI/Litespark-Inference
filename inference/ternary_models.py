@@ -601,38 +601,79 @@ class BitNetLinear(nn.Module):
 
 
 # ============================================================================
-# BitNet Loader
+# BitNet Loader (Microsoft BitNet b1.58-2B-4T architecture)
 # ============================================================================
 
 @dataclass
 class BitNetConfig:
-    """Configuration for BitNet."""
-    hidden_size: int = 3200
-    num_layers: int = 26
-    num_heads: int = 32
-    intermediate_size: int = 8640
-    vocab_size: int = 32002  # BitNet uses 32002
-    max_position_embeddings: int = 2048
-    rms_norm_eps: float = 1e-6
+    """Configuration for Microsoft BitNet b1.58-2B-4T."""
+    hidden_size: int = 2560
+    num_layers: int = 30
+    num_heads: int = 20  # Query heads
+    num_kv_heads: int = 5  # Key/Value heads (GQA)
+    intermediate_size: int = 6912
+    vocab_size: int = 128256
+    max_position_embeddings: int = 4096
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 500000.0
+
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    """ReLU squared activation (BitNet uses this instead of SiLU)."""
+    return F.relu(x) ** 2
 
 
 class BitNetAttention(nn.Module):
-    """BitNet attention layer (standard Llama-style attention with ternary weights)."""
+    """BitNet attention with GQA and sub-norm."""
 
     def __init__(self, config: BitNetConfig, num_threads: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
         self.head_dim = config.hidden_size // config.num_heads
+        self.num_kv_groups = config.num_heads // config.num_kv_heads
         self.num_threads = num_threads
 
-        # Projections using BitNetLinear
+        # Q projection: [hidden_size, hidden_size]
         self.q_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.k_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.v_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
+        # K/V projections: [hidden_size, num_kv_heads * head_dim] for GQA
+        kv_dim = config.num_kv_heads * self.head_dim
+        self.k_proj = BitNetLinear(config.hidden_size, kv_dim, num_threads=num_threads)
+        self.v_proj = BitNetLinear(config.hidden_size, kv_dim, num_threads=num_threads)
         self.o_proj = BitNetLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
 
+        # BitNet-specific sub-norm after attention
+        self.attn_sub_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
         self.scale = 1.0 / (self.head_dim ** 0.5)
+
+        # Precompute RoPE frequencies
+        self.rope_theta = config.rope_theta
+        self._init_rope(config.max_position_embeddings)
+
+    def _init_rope(self, max_seq_len: int):
+        """Initialize rotary position embeddings."""
+        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer('cos_cached', emb.cos(), persistent=False)
+        self.register_buffer('sin_cached', emb.sin(), persistent=False)
+
+    def _apply_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Apply rotary position embeddings."""
+        cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(0)
+        sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(0)
+
+        # Rotate half
+        x1 = x[..., :self.head_dim // 2]
+        x2 = x[..., self.head_dim // 2:]
+        rotated = torch.cat((-x2, x1), dim=-1)
+
+        return x * cos + rotated * sin
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
@@ -644,8 +685,16 @@ class BitNetAttention(nn.Module):
 
         # Reshape for multi-head attention
         q = q.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE
+        q = self._apply_rope(q, seq_len)
+        k = self._apply_rope(k, seq_len)
+
+        # Expand K/V for GQA (repeat each KV head for its group of Q heads)
+        k = k.repeat_interleave(self.num_kv_groups, dim=1)
+        v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
         # Attention
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
@@ -658,11 +707,14 @@ class BitNetAttention(nn.Module):
         out = torch.matmul(attn, v)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_size)
+
+        # BitNet: apply sub-norm before output projection
+        out = self.attn_sub_norm(out)
         return self.o_proj(out)
 
 
 class BitNetMLP(nn.Module):
-    """BitNet MLP layer (standard Llama-style MLP with ternary weights)."""
+    """BitNet MLP with relu2 activation and sub-norm."""
 
     def __init__(self, config: BitNetConfig, num_threads: int):
         super().__init__()
@@ -670,10 +722,18 @@ class BitNetMLP(nn.Module):
         self.up_proj = BitNetLinear(config.hidden_size, config.intermediate_size, num_threads=num_threads)
         self.down_proj = BitNetLinear(config.intermediate_size, config.hidden_size, num_threads=num_threads)
 
+        # BitNet-specific sub-norm after gated activation
+        self.ffn_sub_norm = nn.RMSNorm(config.intermediate_size, eps=config.rms_norm_eps)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = F.silu(self.gate_proj(x))
+        # BitNet uses relu2 instead of SiLU
+        gate = relu2(self.gate_proj(x))
         up = self.up_proj(x)
-        return self.down_proj(gate * up)
+        hidden = gate * up
+
+        # Apply sub-norm before down projection
+        hidden = self.ffn_sub_norm(hidden)
+        return self.down_proj(hidden)
 
 
 class BitNetBlock(nn.Module):
@@ -693,7 +753,7 @@ class BitNetBlock(nn.Module):
 
 
 class BitNet(nn.Module):
-    """BitNet b1.58 with VNNI/Graviton kernels."""
+    """Microsoft BitNet b1.58-2B-4T with VNNI/Graviton kernels."""
 
     def __init__(self, config: BitNetConfig, num_threads: int = None):
         super().__init__()
@@ -706,7 +766,8 @@ class BitNet(nn.Module):
             for _ in range(config.num_layers)
         ])
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Note: BitNet ties embeddings to lm_head
+        self.lm_head = None  # Will share embed_tokens weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
@@ -715,61 +776,82 @@ class BitNet(nn.Module):
             x = layer(x)
 
         x = self.norm(x)
-        return self.lm_head(x)
+        # Tied embeddings: use embed_tokens weight for lm_head
+        return F.linear(x, self.embed_tokens.weight)
 
     @classmethod
     def from_pretrained(cls, model_name: str, num_threads: int = None):
-        """Load from HuggingFace."""
-        from transformers import AutoModelForCausalLM, AutoConfig
+        """Load from safetensors (Microsoft BitNet bf16 format)."""
+        from safetensors import safe_open
+        from huggingface_hub import hf_hub_download
+        import json
 
         print(f"Loading {model_name}...")
-        hf_model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
-        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+        # Download config
+        config_path = hf_hub_download(model_name, 'config.json')
+        with open(config_path) as f:
+            hf_config = json.load(f)
 
         config = BitNetConfig(
-            hidden_size=hf_config.hidden_size,
-            num_layers=hf_config.num_hidden_layers,
-            num_heads=hf_config.num_attention_heads,
-            intermediate_size=hf_config.intermediate_size,
-            vocab_size=hf_config.vocab_size,
-            rms_norm_eps=getattr(hf_config, 'rms_norm_eps', 1e-6),
+            hidden_size=hf_config['hidden_size'],
+            num_layers=hf_config['num_hidden_layers'],
+            num_heads=hf_config['num_attention_heads'],
+            num_kv_heads=hf_config.get('num_key_value_heads', hf_config['num_attention_heads']),
+            intermediate_size=hf_config['intermediate_size'],
+            vocab_size=hf_config['vocab_size'],
+            max_position_embeddings=hf_config.get('max_position_embeddings', 4096),
+            rms_norm_eps=hf_config.get('rms_norm_eps', 1e-5),
+            rope_theta=hf_config.get('rope_theta', 500000.0),
         )
 
         model = cls(config, num_threads)
 
+        # Download and load safetensors
+        print("Downloading model weights...")
+        model_path = hf_hub_download(model_name, 'model.safetensors')
+
         print("Converting weights to ternary format...")
-        model._load_hf_weights(hf_model)
+        model._load_safetensors_weights(model_path)
 
         return model
 
-    def _load_hf_weights(self, hf_model):
-        """Load weights from HuggingFace BitNet model."""
-        # Embeddings
-        self.embed_tokens.weight.data = hf_model.model.embed_tokens.weight.data.clone()
+    def _load_safetensors_weights(self, model_path: str):
+        """Load weights from safetensors file and quantize to ternary."""
+        from safetensors import safe_open
 
-        # Layers
-        for i, layer in enumerate(self.layers):
-            hf_layer = hf_model.model.layers[i]
+        with safe_open(model_path, framework="pt") as f:
+            # Embeddings (kept as float)
+            self.embed_tokens.weight.data = f.get_tensor('model.embed_tokens.weight').float()
 
-            # Attention projections
-            layer.attn.q_proj.load_from_weight(hf_layer.self_attn.q_proj.weight.data)
-            layer.attn.k_proj.load_from_weight(hf_layer.self_attn.k_proj.weight.data)
-            layer.attn.v_proj.load_from_weight(hf_layer.self_attn.v_proj.weight.data)
-            layer.attn.o_proj.load_from_weight(hf_layer.self_attn.o_proj.weight.data)
+            # Layers
+            for i, layer in enumerate(self.layers):
+                prefix = f'model.layers.{i}'
 
-            # MLP projections
-            layer.mlp.gate_proj.load_from_weight(hf_layer.mlp.gate_proj.weight.data)
-            layer.mlp.up_proj.load_from_weight(hf_layer.mlp.up_proj.weight.data)
-            layer.mlp.down_proj.load_from_weight(hf_layer.mlp.down_proj.weight.data)
+                # Attention projections (quantize to ternary)
+                layer.attn.q_proj.load_from_weight(f.get_tensor(f'{prefix}.self_attn.q_proj.weight').float())
+                layer.attn.k_proj.load_from_weight(f.get_tensor(f'{prefix}.self_attn.k_proj.weight').float())
+                layer.attn.v_proj.load_from_weight(f.get_tensor(f'{prefix}.self_attn.v_proj.weight').float())
+                layer.attn.o_proj.load_from_weight(f.get_tensor(f'{prefix}.self_attn.o_proj.weight').float())
 
-            # Block norms
-            layer.input_norm.weight.data = hf_layer.input_layernorm.weight.data.clone()
-            layer.post_attn_norm.weight.data = hf_layer.post_attention_layernorm.weight.data.clone()
+                # Attention sub-norm
+                layer.attn.attn_sub_norm.weight.data = f.get_tensor(f'{prefix}.self_attn.attn_sub_norm.weight').float()
 
-        # Final norm and head
-        self.norm.weight.data = hf_model.model.norm.weight.data.clone()
-        if hasattr(hf_model, 'lm_head') and hf_model.lm_head is not None:
-            self.lm_head.weight.data = hf_model.lm_head.weight.data.clone()
+                # MLP projections (quantize to ternary)
+                layer.mlp.gate_proj.load_from_weight(f.get_tensor(f'{prefix}.mlp.gate_proj.weight').float())
+                layer.mlp.up_proj.load_from_weight(f.get_tensor(f'{prefix}.mlp.up_proj.weight').float())
+                layer.mlp.down_proj.load_from_weight(f.get_tensor(f'{prefix}.mlp.down_proj.weight').float())
+
+                # MLP sub-norm
+                layer.mlp.ffn_sub_norm.weight.data = f.get_tensor(f'{prefix}.mlp.ffn_sub_norm.weight').float()
+
+                # Block norms
+                layer.input_norm.weight.data = f.get_tensor(f'{prefix}.input_layernorm.weight').float()
+                layer.post_attn_norm.weight.data = f.get_tensor(f'{prefix}.post_attention_layernorm.weight').float()
+
+            # Final norm
+            self.norm.weight.data = f.get_tensor('model.norm.weight').float()
+            # lm_head is tied to embed_tokens, no separate weight
 
 
 # ============================================================================
@@ -782,12 +864,8 @@ AVAILABLE_MODELS = {
     'mmfreelm-1.3b': ('ridger/MMfreeLM-1.3B', MMFreeLM),
     'mmfreelm-2.7b': ('ridger/MMfreeLM-2.7B', MMFreeLM),
 
-    # BitNet
-    'bitnet-3b': ('1bitLLM/bitnet_b1_58-3B', BitNet),
-    'bitnet-large': ('1bitLLM/bitnet_b1_58-large', BitNet),
-
-    # Microsoft BitNet (bf16 weights for loading)
-    'bitnet-2b-ms': ('microsoft/bitnet-b1.58-2B-4T-bf16', BitNet),
+    # Microsoft BitNet (official release, bf16 weights)
+    'bitnet-2b': ('microsoft/bitnet-b1.58-2B-4T-bf16', BitNet),
 }
 
 
