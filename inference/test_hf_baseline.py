@@ -8,6 +8,6 @@ model = AutoModelForCausalLM.from_pretrained('1bitLLM/bitnet_b1_58-3B', trust_re
 tokenizer = PreTrainedTokenizerFast.from_pretrained('1bitLLM/bitnet_b1_58-3B')
 
 print("Generating...")
-inputs = tokenizer('The future of AI is', return_tensors='pt')
-outputs = model.generate(**inputs, max_new_tokens=30)
+input_ids = tokenizer('The future of AI is', return_tensors='pt')['input_ids']
+outputs = model.generate(input_ids, max_new_tokens=30)
 print(tokenizer.decode(outputs[0]))
