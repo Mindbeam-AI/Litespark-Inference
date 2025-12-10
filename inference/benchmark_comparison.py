@@ -429,44 +429,33 @@ class HuggingFaceModelWrapper(nn.Module):
         """
         Load HuggingFace model.
 
-        Note: BitNet models use model_type="bitnet" which is not in standard
-        transformers. We try multiple approaches:
-        1. Standard AutoModelForCausalLM with trust_remote_code
-        2. Load as LlamaForCausalLM (BitNet is LLaMA-like architecture)
+        BitNet is now supported in transformers >= 4.48.0
+        Use the packed model (bitnet-b1.58-2B-4T), NOT bf16 version
+        Do NOT use trust_remote_code for BitNet models
         """
         from transformers import AutoModelForCausalLM, AutoConfig
 
         print(f"  Loading HuggingFace model: {model_name}")
 
-        # First, check the config to see if it's a BitNet model
+        # Check the config
         try:
-            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            config = AutoConfig.from_pretrained(model_name)
             model_type = getattr(config, 'model_type', 'unknown')
             print(f"  Model type: {model_type}")
         except Exception as e:
             print(f"  Could not load config: {e}")
             raise
 
-        # BitNet models need special handling - they're not in standard transformers
+        # BitNet models - now in standard transformers (>= 4.48.0)
+        # Do NOT use trust_remote_code, use bfloat16 as recommended
         if model_type == 'bitnet':
-            # Try to load with trust_remote_code first
-            try:
-                hf_model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float32,
-                    device_map=None,
-                    trust_remote_code=True,
-                )
-                return cls(hf_model)
-            except Exception as e:
-                # BitNet architecture not available in transformers
-                # The model repo doesn't include modeling code
-                raise RuntimeError(
-                    f"BitNet model requires 'bitnet' package or custom modeling code. "
-                    f"The HuggingFace repo doesn't include modeling_bitnet.py. "
-                    f"Install: pip install bitnet (if available) or use our PyTorch baseline. "
-                    f"Original error: {e}"
-                )
+            print("  Loading BitNet with bfloat16 (HF recommended)")
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=None,
+            )
+            return cls(hf_model)
 
         # For standard models
         hf_model = AutoModelForCausalLM.from_pretrained(
@@ -906,21 +895,23 @@ def main():
     pytorch_model.eval()
     results.append(benchmark_model(pytorch_model, tokenizer, "PyTorch (ternary)"))
 
-    # 3. HuggingFace official model (skip for BitNet - not supported)
-    # Note: Microsoft's BitNet model uses model_type="bitnet" which is not in
-    # standard HuggingFace transformers. The repo doesn't include modeling code.
-    # Our PyTorch baseline is effectively the "official" comparison since it:
-    # - Loads the same safetensors weights
-    # - Applies the same ternary quantization
-    # - Uses standard PyTorch matmul (same as HF would)
+    # 3. HuggingFace official BitNet model
+    # Note: Use the packed model (bitnet-b1.58-2B-4T), not the bf16 version
+    # BitNet is now in transformers - no trust_remote_code needed
     print("\n" + "=" * 70)
-    print("3. HuggingFace Official Model")
+    print("3. Loading HuggingFace official BitNet model...")
     print("=" * 70)
-    print("  [!] BitNet models use custom architecture not in standard transformers.")
-    print("  [!] Microsoft's repo doesn't include modeling_bitnet.py.")
-    print("  [!] PyTorch baseline above serves as the reference implementation.")
-    hf_model = None
-    hf_loaded = False
+    HF_BITNET_MODEL = 'microsoft/bitnet-b1.58-2B-4T'  # Packed 1.58-bit weights
+    try:
+        hf_model = HuggingFaceModelWrapper.from_pretrained(HF_BITNET_MODEL)
+        hf_model.eval()
+        results.append(benchmark_model(hf_model, tokenizer, "HuggingFace (BitNet)"))
+        hf_loaded = True
+    except Exception as e:
+        print(f"  [!] Failed to load HuggingFace model: {e}")
+        print("  [!] You may need: pip install transformers>=4.48.0")
+        hf_model = None
+        hf_loaded = False
 
     # ========================================================================
     # Numerical Accuracy Comparison
