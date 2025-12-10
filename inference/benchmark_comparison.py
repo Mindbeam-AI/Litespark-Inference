@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Benchmark comparison: VNNI kernels vs PyTorch baseline vs Microsoft bf16
+Benchmark comparison: VNNI kernels vs PyTorch baseline
 
 Compares:
 1. Our VNNI/Graviton kernels (ternary quantized)
 2. PyTorch baseline (ternary weights with torch.matmul)
-3. Microsoft bf16 original (full precision)
+
+Metrics:
+- TTFT (Time-to-First-Token)
+- Throughput (tokens/sec)
+- Memory usage (RSS)
+- Perplexity on WikiText-2
+- Numerical accuracy (logits comparison)
 """
 
 import torch
@@ -13,9 +19,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import sys
+import gc
+import platform
+import resource
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -23,6 +32,174 @@ from inference.ternary_models import (
     BitNet, BitNetConfig, load_ternary_model, get_arch_info,
     prepare_ternary_weight
 )
+
+
+# ============================================================================
+# Memory Tracking Utilities
+# ============================================================================
+
+def get_memory_mb() -> float:
+    """Get current process RSS memory in MB."""
+    if platform.system() == 'Darwin':
+        # macOS: ru_maxrss is in bytes
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+    else:
+        # Linux: ru_maxrss is in KB
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def get_peak_memory_mb() -> float:
+    """Get peak RSS memory usage."""
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmHWM:'):  # High water mark
+                    return int(line.split()[1]) / 1024.0
+    except:
+        pass
+    return get_memory_mb()
+
+
+# ============================================================================
+# Perplexity Evaluation
+# ============================================================================
+
+def evaluate_perplexity(model, tokenizer, max_samples: int = 100, max_length: int = 512) -> float:
+    """
+    Evaluate perplexity on WikiText-2 test set.
+
+    Args:
+        model: The language model
+        tokenizer: Tokenizer
+        max_samples: Maximum number of samples to evaluate
+        max_length: Maximum sequence length per sample
+
+    Returns:
+        Perplexity score (lower is better)
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("  [!] datasets library not installed, skipping perplexity")
+        return float('nan')
+
+    print("  Loading WikiText-2 test set...")
+    try:
+        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    except Exception as e:
+        print(f"  [!] Failed to load WikiText-2: {e}")
+        return float('nan')
+
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+
+    print(f"  Evaluating on {min(max_samples, len(dataset))} samples...")
+
+    with torch.no_grad():
+        for i, sample in enumerate(dataset):
+            if i >= max_samples:
+                break
+
+            text = sample['text']
+            if not text.strip():
+                continue
+
+            # Tokenize
+            encodings = tokenizer(text, return_tensors='pt', truncation=True, max_length=max_length)
+            input_ids = encodings['input_ids']
+
+            if input_ids.shape[1] < 2:
+                continue
+
+            # Get model outputs
+            logits = model(input_ids)
+
+            # Calculate cross-entropy loss
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction='sum'
+            )
+
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
+
+    if total_tokens == 0:
+        return float('nan')
+
+    avg_loss = total_loss / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+
+    return perplexity
+
+
+# ============================================================================
+# Numerical Accuracy Comparison
+# ============================================================================
+
+def compare_outputs(model1, model2, tokenizer, prompts: List[str], tolerance: float = 1e-4) -> Dict:
+    """
+    Compare outputs between two models for numerical accuracy.
+
+    Args:
+        model1: First model (e.g., VNNI kernels)
+        model2: Second model (e.g., PyTorch baseline)
+        tokenizer: Tokenizer
+        prompts: List of test prompts
+        tolerance: Tolerance for considering outputs "matching"
+
+    Returns:
+        Dictionary with comparison metrics
+    """
+    model1.eval()
+    model2.eval()
+
+    results = {
+        'max_abs_diff': 0.0,
+        'mean_abs_diff': 0.0,
+        'matches_within_tolerance': 0,
+        'total_comparisons': 0,
+        'token_agreement': 0,
+        'total_tokens': 0,
+    }
+
+    all_diffs = []
+
+    with torch.no_grad():
+        for prompt in prompts:
+            input_ids = tokenizer.encode(prompt, return_tensors='pt')
+
+            logits1 = model1(input_ids)
+            logits2 = model2(input_ids)
+
+            # Compare logits
+            diff = (logits1 - logits2).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            all_diffs.append(mean_diff)
+            results['max_abs_diff'] = max(results['max_abs_diff'], max_diff)
+            results['total_comparisons'] += 1
+
+            if max_diff < tolerance:
+                results['matches_within_tolerance'] += 1
+
+            # Check if top tokens agree
+            top1_model1 = logits1[0, -1, :].argmax().item()
+            top1_model2 = logits2[0, -1, :].argmax().item()
+
+            results['total_tokens'] += 1
+            if top1_model1 == top1_model2:
+                results['token_agreement'] += 1
+
+    results['mean_abs_diff'] = sum(all_diffs) / len(all_diffs) if all_diffs else 0.0
+
+    return results
 
 
 # ============================================================================
@@ -232,187 +409,21 @@ class PyTorchBitNet(nn.Module):
 
 
 # ============================================================================
-# BF16 Baseline (Microsoft original weights, no quantization)
-# ============================================================================
-
-class BF16BitNetAttention(nn.Module):
-    """BitNet attention with bf16 weights (no quantization)."""
-
-    def __init__(self, config: BitNetConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_heads
-        self.num_kv_heads = config.num_kv_heads
-        self.head_dim = config.hidden_size // config.num_heads
-        self.num_kv_groups = config.num_heads // config.num_kv_heads
-
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        kv_dim = config.num_kv_heads * self.head_dim
-        self.k_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
-        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-
-        self.attn_sub_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.scale = 1.0 / (self.head_dim ** 0.5)
-
-        self.rope_theta = config.rope_theta
-        self._init_rope(config.max_position_embeddings)
-
-    def _init_rope(self, max_seq_len: int):
-        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer('cos_cached', emb.cos(), persistent=False)
-        self.register_buffer('sin_cached', emb.sin(), persistent=False)
-
-    def _apply_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(0)
-        sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(0)
-        x1 = x[..., :self.head_dim // 2]
-        x2 = x[..., self.head_dim // 2:]
-        rotated = torch.cat((-x2, x1), dim=-1)
-        return x * cos + rotated * sin
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        q = q.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        q = self._apply_rope(q, seq_len)
-        k = self._apply_rope(k, seq_len)
-
-        k = k.repeat_interleave(self.num_kv_groups, dim=1)
-        v = v.repeat_interleave(self.num_kv_groups, dim=1)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1)
-        attn = attn.masked_fill(causal_mask, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
-
-        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_size)
-        out = self.attn_sub_norm(out)
-        return self.o_proj(out)
-
-
-class BF16BitNetMLP(nn.Module):
-    def __init__(self, config: BitNetConfig):
-        super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.ffn_sub_norm = nn.RMSNorm(config.intermediate_size, eps=config.rms_norm_eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = relu2(self.gate_proj(x))
-        up = self.up_proj(x)
-        hidden = gate * up
-        hidden = self.ffn_sub_norm(hidden)
-        return self.down_proj(hidden)
-
-
-class BF16BitNetBlock(nn.Module):
-    def __init__(self, config: BitNetConfig):
-        super().__init__()
-        self.input_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = BF16BitNetAttention(config)
-        self.post_attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = BF16BitNetMLP(config)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.input_norm(x))
-        x = x + self.mlp(self.post_attn_norm(x))
-        return x
-
-
-class BF16BitNet(nn.Module):
-    """BitNet with original bf16 weights (no quantization)."""
-
-    def __init__(self, config: BitNetConfig):
-        super().__init__()
-        self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([BF16BitNetBlock(config) for _ in range(config.num_layers)])
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.norm(x)
-        return F.linear(x, self.embed_tokens.weight)
-
-    @classmethod
-    def from_safetensors(cls, model_name: str):
-        """Load bf16 weights directly (no quantization)."""
-        from safetensors import safe_open
-        from huggingface_hub import hf_hub_download
-        import json
-
-        config_path = hf_hub_download(model_name, 'config.json')
-        with open(config_path) as f:
-            hf_config = json.load(f)
-
-        config = BitNetConfig(
-            hidden_size=hf_config['hidden_size'],
-            num_layers=hf_config['num_hidden_layers'],
-            num_heads=hf_config['num_attention_heads'],
-            num_kv_heads=hf_config.get('num_key_value_heads', hf_config['num_attention_heads']),
-            intermediate_size=hf_config['intermediate_size'],
-            vocab_size=hf_config['vocab_size'],
-            max_position_embeddings=hf_config.get('max_position_embeddings', 4096),
-            rms_norm_eps=hf_config.get('rms_norm_eps', 1e-5),
-            rope_theta=hf_config.get('rope_theta', 500000.0),
-        )
-
-        model = cls(config)
-        model_path = hf_hub_download(model_name, 'model.safetensors')
-
-        with safe_open(model_path, framework="pt") as f:
-            model.embed_tokens.weight.data = f.get_tensor('model.embed_tokens.weight').float()
-
-            for i, layer in enumerate(model.layers):
-                prefix = f'model.layers.{i}'
-
-                layer.attn.q_proj.weight.data = f.get_tensor(f'{prefix}.self_attn.q_proj.weight').float()
-                layer.attn.k_proj.weight.data = f.get_tensor(f'{prefix}.self_attn.k_proj.weight').float()
-                layer.attn.v_proj.weight.data = f.get_tensor(f'{prefix}.self_attn.v_proj.weight').float()
-                layer.attn.o_proj.weight.data = f.get_tensor(f'{prefix}.self_attn.o_proj.weight').float()
-                layer.attn.attn_sub_norm.weight.data = f.get_tensor(f'{prefix}.self_attn.attn_sub_norm.weight').float()
-
-                layer.mlp.gate_proj.weight.data = f.get_tensor(f'{prefix}.mlp.gate_proj.weight').float()
-                layer.mlp.up_proj.weight.data = f.get_tensor(f'{prefix}.mlp.up_proj.weight').float()
-                layer.mlp.down_proj.weight.data = f.get_tensor(f'{prefix}.mlp.down_proj.weight').float()
-                layer.mlp.ffn_sub_norm.weight.data = f.get_tensor(f'{prefix}.mlp.ffn_sub_norm.weight').float()
-
-                layer.input_norm.weight.data = f.get_tensor(f'{prefix}.input_layernorm.weight').float()
-                layer.post_attn_norm.weight.data = f.get_tensor(f'{prefix}.post_attention_layernorm.weight').float()
-
-            model.norm.weight.data = f.get_tensor('model.norm.weight').float()
-
-        return model
-
-
-# ============================================================================
 # Benchmark Functions
 # ============================================================================
 
 def benchmark_model(model, tokenizer, name: str, num_runs: int = 5, gen_tokens: int = 20):
-    """Benchmark a single model."""
+    """Benchmark a single model with memory tracking."""
     model.eval()
+    gc.collect()
 
     prompts = [
         "The future of AI is",
         "Once upon a time",
     ]
+
+    # Measure memory before
+    mem_before = get_memory_mb()
 
     # Warmup
     print(f"  Warming up {name}...")
@@ -420,6 +431,9 @@ def benchmark_model(model, tokenizer, name: str, num_runs: int = 5, gen_tokens: 
         input_ids = tokenizer.encode(prompts[0], return_tensors='pt')
         with torch.no_grad():
             _ = model(input_ids)
+
+    # Measure memory after warmup (model fully loaded)
+    mem_after_warmup = get_memory_mb()
 
     # TTFT benchmark
     ttft_times = []
@@ -446,6 +460,9 @@ def benchmark_model(model, tokenizer, name: str, num_runs: int = 5, gen_tokens: 
         total_time = (time.perf_counter() - start) * 1000
         gen_times.append(total_time)
 
+    # Measure peak memory
+    mem_peak = get_peak_memory_mb()
+
     # Sample generation for quality check
     input_ids = tokenizer.encode(prompts[0], return_tensors='pt')
     generated = input_ids.clone()
@@ -462,6 +479,8 @@ def benchmark_model(model, tokenizer, name: str, num_runs: int = 5, gen_tokens: 
         'mean_gen_time_ms': sum(gen_times) / len(gen_times),
         'tokens_per_sec': gen_tokens / (sum(gen_times) / len(gen_times) / 1000),
         'sample_output': sample_output,
+        'memory_mb': mem_after_warmup,
+        'peak_memory_mb': mem_peak,
     }
 
 
@@ -780,7 +799,7 @@ def profile_vnni_kernel(model, tokenizer):
 
 def main():
     print("=" * 70)
-    print("BitNet Benchmark: VNNI Kernels vs PyTorch vs BF16")
+    print("BitNet Benchmark: VNNI/Graviton Kernels vs PyTorch")
     print("=" * 70)
 
     arch = get_arch_info()
@@ -808,7 +827,6 @@ def main():
 
     # Profile VNNI kernel
     profile_vnni_kernel(vnni_model, tokenizer)
-    del vnni_model
 
     # 2. PyTorch baseline (ternary)
     print("\n" + "=" * 70)
@@ -817,33 +835,67 @@ def main():
     pytorch_model = PyTorchBitNet.from_safetensors(MODEL_NAME)
     pytorch_model.eval()
     results.append(benchmark_model(pytorch_model, tokenizer, "PyTorch (ternary)"))
+
+    # ========================================================================
+    # Numerical Accuracy Comparison
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("3. Numerical Accuracy Comparison")
+    print("=" * 70)
+
+    test_prompts = [
+        "The future of AI is",
+        "Once upon a time",
+        "The meaning of life is",
+        "In a world where",
+        "Scientists have discovered",
+    ]
+
+    accuracy = compare_outputs(vnni_model, pytorch_model, tokenizer, test_prompts)
+    print(f"\n  Comparing VNNI Kernels vs PyTorch baseline:")
+    print(f"    Max absolute difference: {accuracy['max_abs_diff']:.6f}")
+    print(f"    Mean absolute difference: {accuracy['mean_abs_diff']:.6f}")
+    print(f"    Token agreement: {accuracy['token_agreement']}/{accuracy['total_tokens']} ({100*accuracy['token_agreement']/accuracy['total_tokens']:.1f}%)")
+
+    # ========================================================================
+    # Perplexity Evaluation
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("4. Perplexity Evaluation (WikiText-2)")
+    print("=" * 70)
+
+    print("\n  VNNI Kernels:")
+    vnni_ppl = evaluate_perplexity(vnni_model, tokenizer, max_samples=50)
+    results[0]['perplexity'] = vnni_ppl
+    print(f"    Perplexity: {vnni_ppl:.2f}")
+
+    print("\n  PyTorch baseline:")
+    pytorch_ppl = evaluate_perplexity(pytorch_model, tokenizer, max_samples=50)
+    results[1]['perplexity'] = pytorch_ppl
+    print(f"    Perplexity: {pytorch_ppl:.2f}")
+
+    # Clean up models
+    del vnni_model
     del pytorch_model
+    gc.collect()
 
-    # 3. BF16 baseline (no quantization)
+    # ========================================================================
+    # Print Results Summary
+    # ========================================================================
     print("\n" + "=" * 70)
-    print("3. Loading BF16 baseline model (full precision)...")
-    print("=" * 70)
-    bf16_model = BF16BitNet.from_safetensors(MODEL_NAME)
-    bf16_model.eval()
-    results.append(benchmark_model(bf16_model, tokenizer, "BF16 (full precision)"))
-    del bf16_model
-
-    # Print results
-    print("\n" + "=" * 70)
-    print("RESULTS")
+    print("RESULTS SUMMARY")
     print("=" * 70)
 
-    print(f"\n{'Model':<25} {'TTFT (ms)':<12} {'Gen (ms)':<12} {'Tok/s':<10}")
-    print("-" * 60)
+    print(f"\n{'Model':<25} {'TTFT (ms)':<12} {'Tok/s':<10} {'Memory (MB)':<14} {'Perplexity':<12}")
+    print("-" * 75)
     for r in results:
-        print(f"{r['name']:<25} {r['mean_ttft_ms']:<12.1f} {r['mean_gen_time_ms']:<12.1f} {r['tokens_per_sec']:<10.2f}")
+        ppl_str = f"{r.get('perplexity', float('nan')):.2f}"
+        print(f"{r['name']:<25} {r['mean_ttft_ms']:<12.1f} {r['tokens_per_sec']:<10.2f} {r['memory_mb']:<14.1f} {ppl_str:<12}")
 
     # Speedups
-    print("\n" + "-" * 60)
+    print("\n" + "-" * 75)
     pytorch_ttft = results[1]['mean_ttft_ms']
     pytorch_tps = results[1]['tokens_per_sec']
-    bf16_ttft = results[2]['mean_ttft_ms']
-    bf16_tps = results[2]['tokens_per_sec']
     vnni_ttft = results[0]['mean_ttft_ms']
     vnni_tps = results[0]['tokens_per_sec']
 
@@ -851,9 +903,15 @@ def main():
     print(f"  TTFT: {pytorch_ttft / vnni_ttft:.2f}x")
     print(f"  Throughput: {vnni_tps / pytorch_tps:.2f}x")
 
-    print(f"\nSpeedup vs BF16 (full precision):")
-    print(f"  TTFT: {bf16_ttft / vnni_ttft:.2f}x")
-    print(f"  Throughput: {vnni_tps / bf16_tps:.2f}x")
+    # Memory comparison
+    print(f"\nMemory Usage:")
+    print(f"  VNNI Kernels: {results[0]['memory_mb']:.1f} MB")
+    print(f"  PyTorch: {results[1]['memory_mb']:.1f} MB")
+
+    # Numerical accuracy summary
+    print(f"\nNumerical Accuracy:")
+    print(f"  Max logit difference: {accuracy['max_abs_diff']:.6f}")
+    print(f"  Top-1 token agreement: {100*accuracy['token_agreement']/accuracy['total_tokens']:.1f}%")
 
     # Sample outputs
     print("\n" + "=" * 70)
