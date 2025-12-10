@@ -465,6 +465,146 @@ def benchmark_model(model, tokenizer, name: str, num_runs: int = 5, gen_tokens: 
     }
 
 
+def profile_vnni_kernel(model, tokenizer):
+    """Profile where time is spent in VNNI kernel model."""
+    import torch.profiler as profiler
+
+    print("\n" + "=" * 70)
+    print("VNNI Kernel Profiling")
+    print("=" * 70)
+
+    prompt = "The future of AI is"
+    input_ids = tokenizer.encode(prompt, return_tensors='pt')
+
+    # Warmup
+    with torch.no_grad():
+        for _ in range(3):
+            _ = model(input_ids)
+
+    # Manual timing breakdown
+    print("\nManual timing breakdown (single forward pass):")
+
+    # Time embedding
+    start = time.perf_counter()
+    with torch.no_grad():
+        x = model.embed_tokens(input_ids)
+    embed_time = (time.perf_counter() - start) * 1000
+
+    # Time each layer
+    layer_times = []
+    with torch.no_grad():
+        for i, layer in enumerate(model.layers):
+            start = time.perf_counter()
+            x = layer(x)
+            layer_times.append((time.perf_counter() - start) * 1000)
+
+    # Time final norm + lm_head
+    start = time.perf_counter()
+    with torch.no_grad():
+        x = model.norm(x)
+        logits = F.linear(x, model.embed_tokens.weight)
+    head_time = (time.perf_counter() - start) * 1000
+
+    print(f"  Embedding: {embed_time:.2f} ms")
+    print(f"  Layers (avg): {sum(layer_times)/len(layer_times):.2f} ms x {len(layer_times)} = {sum(layer_times):.2f} ms")
+    print(f"  Layer breakdown:")
+    print(f"    First 3: {layer_times[0]:.2f}, {layer_times[1]:.2f}, {layer_times[2]:.2f} ms")
+    print(f"    Last 3: {layer_times[-3]:.2f}, {layer_times[-2]:.2f}, {layer_times[-1]:.2f} ms")
+    print(f"  Norm + LM Head: {head_time:.2f} ms")
+    print(f"  Total: {embed_time + sum(layer_times) + head_time:.2f} ms")
+
+    # Profile a single layer in detail
+    print("\nDetailed layer 0 breakdown:")
+    layer = model.layers[0]
+    x = model.embed_tokens(input_ids)
+
+    # Input norm
+    start = time.perf_counter()
+    with torch.no_grad():
+        normed = layer.input_norm(x)
+    norm_time = (time.perf_counter() - start) * 1000
+
+    # Attention
+    start = time.perf_counter()
+    with torch.no_grad():
+        attn_out = layer.attn(normed)
+    attn_time = (time.perf_counter() - start) * 1000
+
+    # Post-attn norm
+    x_after_attn = x + attn_out
+    start = time.perf_counter()
+    with torch.no_grad():
+        normed2 = layer.post_attn_norm(x_after_attn)
+    norm2_time = (time.perf_counter() - start) * 1000
+
+    # MLP
+    start = time.perf_counter()
+    with torch.no_grad():
+        mlp_out = layer.mlp(normed2)
+    mlp_time = (time.perf_counter() - start) * 1000
+
+    print(f"  Input norm: {norm_time:.2f} ms")
+    print(f"  Attention: {attn_time:.2f} ms")
+    print(f"  Post-attn norm: {norm2_time:.2f} ms")
+    print(f"  MLP: {mlp_time:.2f} ms")
+
+    # Profile attention in detail
+    print("\nDetailed attention breakdown:")
+    attn = layer.attn
+    x_in = normed
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        q = attn.q_proj(x_in)
+    q_time = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        k = attn.k_proj(x_in)
+    k_time = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        v = attn.v_proj(x_in)
+    v_time = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        o = attn.o_proj(x_in)  # Just timing the projection
+    o_time = (time.perf_counter() - start) * 1000
+
+    print(f"  Q proj: {q_time:.2f} ms")
+    print(f"  K proj: {k_time:.2f} ms")
+    print(f"  V proj: {v_time:.2f} ms")
+    print(f"  O proj: {o_time:.2f} ms")
+    print(f"  Total projections: {q_time + k_time + v_time + o_time:.2f} ms")
+
+    # Profile MLP in detail
+    print("\nDetailed MLP breakdown:")
+    mlp = layer.mlp
+    x_in = normed2
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        gate = mlp.gate_proj(x_in)
+    gate_time = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        up = mlp.up_proj(x_in)
+    up_time = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        down = mlp.down_proj(x_in)  # Wrong input but just timing
+    down_time = (time.perf_counter() - start) * 1000
+
+    print(f"  Gate proj: {gate_time:.2f} ms")
+    print(f"  Up proj: {up_time:.2f} ms")
+    print(f"  Down proj: {down_time:.2f} ms")
+    print(f"  Total projections: {gate_time + up_time + down_time:.2f} ms")
+
+
 def main():
     print("=" * 70)
     print("BitNet Benchmark: VNNI Kernels vs PyTorch vs BF16")
@@ -492,6 +632,9 @@ def main():
     vnni_model, _ = load_ternary_model('bitnet-2b')
     vnni_model.eval()
     results.append(benchmark_model(vnni_model, tokenizer, "VNNI Kernels (ternary)"))
+
+    # Profile VNNI kernel
+    profile_vnni_kernel(vnni_model, tokenizer)
     del vnni_model
 
     # 2. PyTorch baseline (ternary)
