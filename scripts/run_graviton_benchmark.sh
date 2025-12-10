@@ -101,11 +101,11 @@ echo "Step 1: Checking SSH key pair..."
 if [ ! -f "$KEY_FILE" ]; then
     echo "Key file not found at $KEY_FILE"
 
-    # Check if key exists in AWS
+    # Check if key exists in AWS - if so, delete it (we can't recover the private key)
     if aws ec2 describe-key-pairs --key-names "$KEY_NAME" --region "$REGION" >/dev/null 2>&1; then
-        echo "ERROR: Key pair '$KEY_NAME' exists in AWS but no local .pem file found."
-        echo "Please download the key or delete the AWS key pair and re-run."
-        exit 1
+        echo "Key pair '$KEY_NAME' exists in AWS but no local .pem file."
+        echo "Deleting orphaned AWS key pair (private key is unrecoverable)..."
+        aws ec2 delete-key-pair --key-name "$KEY_NAME" --region "$REGION"
     fi
 
     echo "Creating new key pair..."
