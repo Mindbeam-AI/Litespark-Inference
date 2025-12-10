@@ -178,32 +178,41 @@ def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 def prepare_ternary_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
-    Prepare weight tensor for kernel.
+    Prepare weight tensor for kernel using BitNet-style quantization.
+
+    BitNet stores weights as float and quantizes at runtime using:
+        scale = 1 / weight.abs().mean()
+        w_quant = round(weight * scale).clamp(-1, 1)
+        output = w_quant / scale  (i.e., w_quant * (1/scale) = w_quant * weight.abs().mean())
 
     Args:
-        weight: Float tensor [out_features, in_features] with values ~{-1, 0, +1}
+        weight: Float tensor [out_features, in_features]
 
     Returns:
-        w_int8: Padded int8 tensor [N, K_padded]
+        w_int8: Padded int8 tensor [N, K_padded] with values in {-1, 0, +1}
         w_sum: Row sums as int32 [N]
-        scale: Scale factor for the weights
+        scale: Scale factor = weight.abs().mean() for dequantization
     """
     N, K = weight.shape
     k_pad = get_k_padding()
     K_padded = ((K + k_pad - 1) // k_pad) * k_pad
 
-    # Convert to ternary int8
-    # For properly trained ternary models, weights should already be ~{-1, 0, +1}
-    w_ternary = weight.round().clamp(-1, 1).to(torch.int8)
-
-    # Compute scale from original weights
-    mask = w_ternary != 0
-    if mask.any():
-        scale = weight[mask].abs().mean().item()
+    # BitNet quantization formula:
+    # scale_inv = 1 / weight.abs().mean()
+    # w_ternary = round(weight * scale_inv).clamp(-1, 1)
+    # At inference: output = matmul(x, w_ternary) * (1 / scale_inv) = matmul(x, w_ternary) * scale
+    weight_abs_mean = weight.abs().mean()
+    if weight_abs_mean > 0:
+        scale = weight_abs_mean.item()
+        scale_inv = 1.0 / scale
     else:
         scale = 1.0
+        scale_inv = 1.0
 
-    # Pad
+    # Quantize to ternary {-1, 0, +1}
+    w_ternary = (weight * scale_inv).round().clamp(-1, 1).to(torch.int8)
+
+    # Pad to kernel alignment
     w_int8 = torch.zeros(N, K_padded, dtype=torch.int8)
     w_int8[:, :K] = w_ternary
 

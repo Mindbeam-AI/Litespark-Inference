@@ -323,23 +323,11 @@ class PyTorchTernaryLinear(torch.nn.Module):
         self.register_buffer('weight_sum', None)
         self.scale = 1.0
 
-    def load_from_weight(self, weight: torch.Tensor):
-        """Load from float weight tensor."""
-        # Convert to ternary
-        w_ternary = weight.round().clamp(-1, 1).to(torch.int8)
-
-        # Compute scale
-        mask = w_ternary != 0
-        if mask.any():
-            self.scale = weight[mask].abs().mean().item()
-
-        self.weight_int8 = w_ternary
-        self.weight_sum = w_ternary.sum(dim=1, dtype=torch.int32)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch ternary matmul: quantize input, int matmul, dequantize."""
         original_shape = x.shape
         x = x.view(-1, self.in_features)
+        M = x.shape[0]
 
         # Quantize input to int8
         x_abs_max = x.abs().max(dim=1, keepdim=True).values
@@ -348,13 +336,12 @@ class PyTorchTernaryLinear(torch.nn.Module):
         x_int8 = (x / x_scale).round().clamp(-127, 127).to(torch.int8)
 
         # Int8 matmul via float (PyTorch doesn't have native int8 matmul on CPU)
-        # This simulates: y = x_int8 @ weight_int8.T
-        y_int32 = torch.matmul(x_int8.float(), self.weight_int8.float().T).to(torch.int32)
+        # y = x_int8 @ weight_int8.T
+        y_int32 = torch.matmul(x_int8.float(), self.weight_int8.float().T)
 
-        # Dequantize: y_float = y_int32 * x_scale * w_scale - offset_correction
-        # Offset correction for unsigned x: sum(w) * 128 * x_scale
-        offset = (self.weight_sum.float() * 128.0 * x_scale.squeeze(1)).unsqueeze(1)
-        y_float = (y_int32.float() - offset) * x_scale * self.scale
+        # Dequantize: y_float = y_int32 * x_scale * w_scale
+        # Note: No offset correction needed since we use signed int8 for both x and w
+        y_float = y_int32 * x_scale * self.scale
 
         output_shape = original_shape[:-1] + (self.out_features,)
         return y_float.view(output_shape)
