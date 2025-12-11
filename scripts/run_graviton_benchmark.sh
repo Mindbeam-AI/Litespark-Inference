@@ -339,7 +339,7 @@ Console output logs:
 - benchmark_short_results.txt
 - benchmark_long_results.txt
 
-Structured results and graphs (in benchmark_results/):
+Structured results and graphs (in benchmark_inference_graviton/):
 - benchmark_results.json (short benchmark)
 - benchmark_summary.txt (short benchmark)
 - benchmark_long_results.json (long benchmark)
@@ -371,9 +371,9 @@ $SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_long_results.txt" "$RESULTS_DIR/" ||
 $SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_summary.txt" "$RESULTS_DIR/" || true
 
 # Download structured results (JSON, text summaries, graphs)
-# These are saved to ~/matmulMM/inference/benchmark_results/
+# These are saved to ~/matmulMM/inference/benchmark_inference_graviton/
 echo "Downloading structured results and graphs..."
-$SCP_CMD -r "ec2-user@$INSTANCE_IP:~/matmulMM/inference/benchmark_results/" "$RESULTS_DIR/benchmark_results/" || true
+$SCP_CMD -r "ec2-user@$INSTANCE_IP:~/matmulMM/inference/benchmark_inference_graviton/" "$RESULTS_DIR/benchmark_inference_graviton/" || true
 
 # List all downloaded files
 echo ""
@@ -383,7 +383,7 @@ echo "Console output logs:"
 ls -la "$RESULTS_DIR"/*.txt 2>/dev/null || echo "  (none)"
 echo ""
 echo "Structured results and graphs:"
-ls -la "$RESULTS_DIR/benchmark_results/" 2>/dev/null || echo "  (none)"
+ls -la "$RESULTS_DIR/benchmark_inference_graviton/" 2>/dev/null || echo "  (none)"
 
 # Step 7: Optionally terminate
 if [ "$TERMINATE_AFTER" = true ]; then

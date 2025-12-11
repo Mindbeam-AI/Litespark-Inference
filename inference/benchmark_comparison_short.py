@@ -889,13 +889,16 @@ def profile_vnni_kernel(model, tokenizer):
     return kernel_results
 
 
-def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_dir: Path):
+def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_dir: Path, arch_info: Dict):
     """Create and save benchmark comparison graphs."""
     if not HAS_MATPLOTLIB:
         print("Skipping graphs - matplotlib not available")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine display name based on architecture
+    arch_display = "X86" if arch_info['machine'] == 'x86_64' else "Graviton"
 
     # Graph 1: Model comparison (TTFT, Throughput, Memory)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -948,7 +951,7 @@ def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_d
         speedups = kernel_results['speedups']
 
         # Left: Execution time
-        ax1.plot(batch_sizes, vnni_times, 'b-o', label='Graviton Kernel', linewidth=2, markersize=8)
+        ax1.plot(batch_sizes, vnni_times, 'b-o', label=f'{arch_display} Kernel', linewidth=2, markersize=8)
         ax1.plot(batch_sizes, pytorch_times, 'r-s', label='PyTorch F.linear', linewidth=2, markersize=8)
         ax1.set_xlabel('Batch Size (M)', fontsize=12)
         ax1.set_ylabel('Execution Time (ms)', fontsize=12)
@@ -963,7 +966,7 @@ def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_d
         ax2.axhline(y=1, color='black', linestyle='--', linewidth=1)
         ax2.set_xlabel('Batch Size (M)', fontsize=12)
         ax2.set_ylabel('Speedup (x)', fontsize=12)
-        ax2.set_title('Graviton Kernel Speedup vs PyTorch', fontsize=14)
+        ax2.set_title(f'{arch_display} Kernel Speedup vs PyTorch', fontsize=14)
         ax2.set_xticks(range(len(batch_sizes)))
         ax2.set_xticklabels([str(b) for b in batch_sizes])
         ax2.grid(True, alpha=0.3, axis='y')
@@ -995,7 +998,7 @@ def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_d
         bars = ax.bar(metrics, values, color=colors_summary, alpha=0.8, edgecolor='black')
         ax.axhline(y=1, color='black', linestyle='--', linewidth=1, label='Parity')
         ax.set_ylabel('Factor (x)', fontsize=12)
-        ax.set_title('Graviton Kernel vs PyTorch Summary', fontsize=14)
+        ax.set_title(f'{arch_display} Kernel vs PyTorch Summary', fontsize=14)
         ax.grid(True, alpha=0.3, axis='y')
 
         for bar, val in zip(bars, values):
@@ -1032,10 +1035,12 @@ def save_results(results: List[Dict], kernel_results: Dict, accuracy: Dict,
     print(f"Saved: {results_file}")
 
     # Also save a human-readable summary
+    # Determine display name based on architecture
+    arch_display = "X86" if arch_info['machine'] == 'x86_64' else "GRAVITON"
     summary_file = output_dir / 'benchmark_summary.txt'
     with open(summary_file, 'w') as f:
         f.write("=" * 70 + "\n")
-        f.write("GRAVITON BENCHMARK SUMMARY\n")
+        f.write(f"{arch_display} BENCHMARK SUMMARY\n")
         f.write("=" * 70 + "\n\n")
         f.write(f"Date: {all_results['timestamp']}\n")
         f.write(f"Platform: {arch_info['machine']}\n")
@@ -1084,8 +1089,9 @@ def main():
     print(f"Threads: {torch.get_num_threads()}")
     print()
 
-    # Create output directory for results
-    output_dir = Path(__file__).parent.parent / 'benchmark_results'
+    # Create output directory for results (architecture-specific)
+    arch_suffix = "x86" if arch['machine'] == 'x86_64' else "graviton"
+    output_dir = Path(__file__).parent / f'benchmark_inference_{arch_suffix}'
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results will be saved to: {output_dir}")
 
@@ -1249,7 +1255,7 @@ def main():
     save_results(results, kernel_results, accuracy, arch, output_dir)
 
     # Create graphs
-    create_comparison_graphs(results, kernel_results, output_dir)
+    create_comparison_graphs(results, kernel_results, output_dir, arch)
 
     # List all generated files
     print("\nGenerated files:")

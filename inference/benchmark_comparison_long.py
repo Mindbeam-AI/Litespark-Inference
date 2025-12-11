@@ -156,13 +156,16 @@ def save_results(results: Dict[str, Any], output_dir: Path):
     print(f"Summary saved to: {txt_path}")
 
 
-def create_scaling_graphs(results: Dict[str, Any], output_dir: Path):
+def create_scaling_graphs(results: Dict[str, Any], output_dir: Path, arch_info: Dict = None):
     """Create graphs for scaling benchmark results."""
     if not HAS_MATPLOTLIB:
         print("Skipping graphs (matplotlib not available)")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine display name based on architecture
+    arch_display = "X86" if (arch_info and arch_info.get('machine') == 'x86_64') else "Graviton"
 
     # Color scheme
     colors = {
@@ -214,7 +217,7 @@ def create_scaling_graphs(results: Dict[str, Any], output_dir: Path):
                     ax2.set_xticklabels([str(l) for l in valid_lengths])
                     ax2.set_xlabel('Prompt Length (tokens)', fontsize=12)
                     ax2.set_ylabel('Speedup (x)', fontsize=12)
-                    ax2.set_title('VNNI Speedup vs PyTorch', fontsize=14)
+                    ax2.set_title(f'{arch_display} Kernel Speedup vs PyTorch', fontsize=14)
                     ax2.axhline(y=1, color='red', linestyle='--', alpha=0.5, label='Baseline')
                     ax2.grid(True, alpha=0.3, axis='y')
 
@@ -270,7 +273,7 @@ def create_scaling_graphs(results: Dict[str, Any], output_dir: Path):
                     ax2.set_xticklabels([str(bs) for bs in valid_bs])
                     ax2.set_xlabel('Batch Size', fontsize=12)
                     ax2.set_ylabel('Speedup (x)', fontsize=12)
-                    ax2.set_title('VNNI Throughput Speedup vs PyTorch', fontsize=14)
+                    ax2.set_title(f'{arch_display} Kernel Throughput Speedup vs PyTorch', fontsize=14)
                     ax2.axhline(y=1, color='red', linestyle='--', alpha=0.5)
                     ax2.grid(True, alpha=0.3, axis='y')
 
@@ -325,7 +328,7 @@ def create_scaling_graphs(results: Dict[str, Any], output_dir: Path):
                     ax2.set_xticklabels([str(gl) for gl in valid_gl])
                     ax2.set_xlabel('Generation Length (tokens)', fontsize=12)
                     ax2.set_ylabel('Speedup (x)', fontsize=12)
-                    ax2.set_title('VNNI Generation Speedup vs PyTorch', fontsize=14)
+                    ax2.set_title(f'{arch_display} Kernel Generation Speedup vs PyTorch', fontsize=14)
                     ax2.axhline(y=1, color='red', linestyle='--', alpha=0.5)
                     ax2.grid(True, alpha=0.3, axis='y')
 
@@ -374,7 +377,7 @@ def create_scaling_graphs(results: Dict[str, Any], output_dir: Path):
         ax.set_ylim(0, max([speedups.get(k, 1) for k in speedups.keys()] + [1.5]) * 1.2)
         ax.grid(True, alpha=0.3, axis='y')
 
-    plt.suptitle('VNNI Kernel Speedups vs PyTorch (Higher is Better)', fontsize=16, y=1.02)
+    plt.suptitle(f'{arch_display} Kernel Speedups vs PyTorch (Higher is Better)', fontsize=16, y=1.02)
     plt.tight_layout()
     plt.savefig(output_dir / 'speedup_summary_long.png', dpi=150, bbox_inches='tight')
     plt.close()
@@ -667,8 +670,9 @@ def main():
     print(f"Threads: {torch.get_num_threads()}")
     print()
 
-    # Create output directory
-    output_dir = Path(__file__).parent / 'benchmark_results'
+    # Create output directory (architecture-specific)
+    arch_suffix = "x86" if arch['machine'] == 'x86_64' else "graviton"
+    output_dir = Path(__file__).parent / f'benchmark_inference_{arch_suffix}'
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results will be saved to: {output_dir}")
 
@@ -783,7 +787,7 @@ def main():
 
     # Save results and create graphs
     save_results(all_results, output_dir)
-    create_scaling_graphs(all_results, output_dir)
+    create_scaling_graphs(all_results, output_dir, arch)
 
     print("\n" + "=" * 80)
     print("Benchmark complete!")
