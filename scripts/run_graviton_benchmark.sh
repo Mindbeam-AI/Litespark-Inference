@@ -22,9 +22,11 @@ KEY_NAME="graviton-benchmark-key"
 SECURITY_GROUP="graviton-benchmark-ssh"
 REGION="us-east-1"
 KEY_FILE="$HOME/.ssh/${KEY_NAME}.pem"
-REPO_URL="https://github.com/tonymindbeam/matmulMM.git"
-BRANCH="cpu-dev"
 RESULTS_DIR="./graviton_results_$(date +%Y%m%d_%H%M%S)"
+
+# Get the local repo directory (parent of scripts/)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCAL_REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse arguments
 TERMINATE_AFTER=false
@@ -171,30 +173,62 @@ if [ -n "$INSTANCE_ID" ]; then
         exit 1
     fi
 else
-    # Find the right AMI for Graviton in the region
-    echo "Finding Amazon Linux 2023 ARM64 AMI..."
-    AMI_ID=$(aws ec2 describe-images \
-        --owners amazon \
-        --filters "Name=name,Values=al2023-ami-2023*-arm64" "Name=state,Values=available" \
-        --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+    # Check for existing graviton-benchmark instance
+    echo "Checking for existing graviton-benchmark instance..."
+    EXISTING_INSTANCE=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=graviton-benchmark" "Name=instance-state-name,Values=running,stopped" \
+        --query 'Reservations[0].Instances[0].InstanceId' \
         --output text \
-        --region "$REGION")
-    echo "Using AMI: $AMI_ID"
+        --region "$REGION" 2>/dev/null)
 
-    echo "Launching new Graviton instance..."
-    INSTANCE_ID=$(aws ec2 run-instances \
-        --image-id "$AMI_ID" \
-        --instance-type "$INSTANCE_TYPE" \
-        --key-name "$KEY_NAME" \
-        --security-group-ids "$SG_ID" \
-        --associate-public-ip-address \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":50,"VolumeType":"gp3"}}]' \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=graviton-benchmark}]" \
-        --query 'Instances[0].InstanceId' \
-        --output text \
-        --region "$REGION")
-    echo "Launched instance: $INSTANCE_ID"
-    wait_for_instance "$INSTANCE_ID"
+    if [ -n "$EXISTING_INSTANCE" ] && [ "$EXISTING_INSTANCE" != "None" ]; then
+        INSTANCE_ID="$EXISTING_INSTANCE"
+        echo "Found existing instance: $INSTANCE_ID"
+
+        STATE=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text \
+            --region "$REGION")
+
+        if [ "$STATE" == "stopped" ]; then
+            echo "Starting stopped instance..."
+            aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
+            wait_for_instance "$INSTANCE_ID"
+        elif [ "$STATE" == "running" ]; then
+            echo "Instance is already running"
+            # Wait for SSH just in case
+            INSTANCE_IP=$(get_instance_ip "$INSTANCE_ID")
+            echo "Instance IP: $INSTANCE_IP"
+        fi
+    else
+        # No existing instance, launch a new one
+        # Find the right AMI for Graviton in the region
+        echo "No existing instance found. Launching new one..."
+        echo "Finding Amazon Linux 2023 ARM64 AMI..."
+        AMI_ID=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters "Name=name,Values=al2023-ami-2023*-arm64" "Name=state,Values=available" \
+            --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+            --output text \
+            --region "$REGION")
+        echo "Using AMI: $AMI_ID"
+
+        echo "Launching new Graviton instance..."
+        INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "$INSTANCE_TYPE" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SG_ID" \
+            --associate-public-ip-address \
+            --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":50,"VolumeType":"gp3"}}]' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=graviton-benchmark}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text \
+            --region "$REGION")
+        echo "Launched instance: $INSTANCE_ID"
+        wait_for_instance "$INSTANCE_ID"
+    fi
 fi
 
 INSTANCE_IP=$(get_instance_ip "$INSTANCE_ID")
@@ -208,29 +242,49 @@ SCP_CMD="scp -o StrictHostKeyChecking=no -i $KEY_FILE"
 echo ""
 echo "Step 4: Setting up environment on instance..."
 
+# Install system dependencies first
+$SSH_CMD << 'SETUP_DEPS'
+set -e
+echo "=== Installing system dependencies ==="
+sudo dnf install -y python3-pip gcc-c++ cmake python3-devel ninja-build || \
+sudo yum install -y python3-pip gcc-c++ cmake python3-devel ninja-build
+echo "=== System dependencies installed ==="
+SETUP_DEPS
+
+# Copy local repo to instance via SCP (avoids git auth issues)
+echo "Copying local repository to instance..."
+REMOTE_REPO="ec2-user@$INSTANCE_IP:~/matmulMM"
+
+# Create a tarball excluding large/unnecessary files
+TARBALL="/tmp/matmulMM_upload.tar.gz"
+echo "Creating tarball of local repo..."
+tar -czf "$TARBALL" -C "$LOCAL_REPO_DIR" \
+    --exclude='.git' \
+    --exclude='*.pyc' \
+    --exclude='__pycache__' \
+    --exclude='venv' \
+    --exclude='*.egg-info' \
+    --exclude='.pytest_cache' \
+    --exclude='build' \
+    --exclude='dist' \
+    --exclude='*.so' \
+    .
+
+echo "Uploading to instance..."
+$SCP_CMD "$TARBALL" "ec2-user@$INSTANCE_IP:/tmp/"
+
+# Extract and setup on remote
 $SSH_CMD << 'SETUP_SCRIPT'
 set -e
 echo "=== Setting up Graviton benchmark environment ==="
 
-# Install system dependencies
-echo "Installing system packages..."
-sudo dnf install -y git python3-pip gcc-c++ cmake python3-devel || \
-sudo yum install -y git python3-pip gcc-c++ cmake python3-devel
-
-# Clone or update repo
 REPO_DIR="$HOME/matmulMM"
-if [ -d "$REPO_DIR" ]; then
-    echo "Repository exists, pulling latest..."
-    cd "$REPO_DIR"
-    git fetch origin
-    git checkout cpu-dev
-    git pull origin cpu-dev
-else
-    echo "Cloning repository..."
-    git clone https://github.com/tonymindbeam/matmulMM.git "$REPO_DIR"
-    cd "$REPO_DIR"
-    git checkout cpu-dev
-fi
+
+# Remove old repo if exists, extract fresh copy
+rm -rf "$REPO_DIR"
+mkdir -p "$REPO_DIR"
+tar -xzf /tmp/matmulMM_upload.tar.gz -C "$REPO_DIR"
+rm /tmp/matmulMM_upload.tar.gz
 
 # Create virtual environment if needed
 if [ ! -d "$REPO_DIR/venv" ]; then
@@ -246,6 +300,9 @@ pip install torch transformers safetensors datasets huggingface_hub numpy matplo
 
 echo "=== Setup complete ==="
 SETUP_SCRIPT
+
+# Clean up local tarball
+rm -f "$TARBALL"
 
 # Step 5: Run benchmarks
 echo ""

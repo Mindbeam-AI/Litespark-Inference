@@ -722,11 +722,17 @@ def profile_vnni_kernel(model, tokenizer):
     y = torch.zeros(M, proj.out_features, dtype=torch.float32)
     bias = torch.Tensor()
 
+    # Select correct kernel function based on platform
+    if kernel_type == 'graviton':
+        kernel_fn = kernel.matmul_free_graviton_v3
+    else:
+        kernel_fn = kernel.matmul_free_vnni_v3
+
     times_kernel = []
     for _ in range(10):
         y.zero_()
         start = time.perf_counter()
-        kernel.matmul_free_vnni_v3(
+        kernel_fn(
             x_int8, x_scale,
             proj.w_int8, proj.w_sum,
             y, bias,
@@ -779,7 +785,7 @@ def profile_vnni_kernel(model, tokenizer):
     for _ in range(10):
         y.zero_()
         start = time.perf_counter()
-        kernel.matmul_free_vnni_v3(
+        kernel_fn(
             x_int8, x_scale,
             proj.w_int8, proj.w_sum,
             y, bias,
@@ -831,14 +837,14 @@ def profile_vnni_kernel(model, tokenizer):
         y = torch.zeros(M, N)
         bias = torch.Tensor()
 
-        # Time VNNI kernel
+        # Time kernel (platform-aware)
         for _ in range(3):
-            kernel.matmul_free_vnni_v3(x_int8, x_scale, w_test, w_sum_test, y, bias, M, N, K, 16)
+            kernel_fn(x_int8, x_scale, w_test, w_sum_test, y, bias, M, N, K, 16)
         times_vnni = []
         for _ in range(10):
             y.zero_()
             start = time.perf_counter()
-            kernel.matmul_free_vnni_v3(x_int8, x_scale, w_test, w_sum_test, y, bias, M, N, K, 16)
+            kernel_fn(x_int8, x_scale, w_test, w_sum_test, y, bias, M, N, K, 16)
             times_vnni.append((time.perf_counter() - start) * 1000)
         vnni_time = sum(times_vnni) / len(times_vnni)
 
