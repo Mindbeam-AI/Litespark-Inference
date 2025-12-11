@@ -18,11 +18,23 @@ import sys
 import gc
 import platform
 import resource
+import json
 from pathlib import Path
-from typing import Dict, List
+from datetime import datetime
+from typing import Dict, List, Any
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Try to import matplotlib for graphs
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("Warning: matplotlib not available, skipping graphs")
 
 from inference.ternary_models import (
     BitNet, BitNetConfig, load_ternary_model, get_arch_info,
@@ -33,6 +45,340 @@ from inference.benchmark_comparison_short import (
     PyTorchBitNet, HuggingFaceModelWrapper,
     get_memory_mb, get_peak_memory_mb
 )
+
+
+# ============================================================================
+# Results Saving and Graph Generation
+# ============================================================================
+
+def save_results(results: Dict[str, Any], output_dir: Path):
+    """Save benchmark results to JSON and text files."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save JSON
+    json_path = output_dir / 'benchmark_long_results.json'
+    with open(json_path, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\nResults saved to: {json_path}")
+
+    # Save text summary
+    txt_path = output_dir / 'benchmark_long_summary.txt'
+    with open(txt_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("BitNet Scaling Benchmark Results\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Date: {results.get('timestamp', 'N/A')}\n")
+        f.write(f"Platform: {results.get('platform', {}).get('machine', 'N/A')}\n")
+        f.write(f"Kernel: {results.get('platform', {}).get('kernel_type', 'N/A')}\n")
+        f.write(f"Threads: {results.get('platform', {}).get('threads', 'N/A')}\n")
+        f.write("\n")
+
+        # Prefill scaling summary
+        if 'prefill_scaling' in results:
+            f.write("-" * 80 + "\n")
+            f.write("PREFILL SCALING (Time in ms)\n")
+            f.write("-" * 80 + "\n")
+            prefill = results['prefill_scaling']
+            models = list(prefill.keys())
+            if models:
+                lengths = list(prefill[models[0]].keys())
+                f.write(f"{'Model':<25}")
+                for length in lengths:
+                    f.write(f"{length:>12}")
+                f.write("\n")
+                for model in models:
+                    f.write(f"{model:<25}")
+                    for length in lengths:
+                        val = prefill[model].get(length, {})
+                        if val:
+                            f.write(f"{val.get('mean_ms', 'N/A'):>12.1f}")
+                        else:
+                            f.write(f"{'N/A':>12}")
+                    f.write("\n")
+            f.write("\n")
+
+        # Batch scaling summary
+        if 'batch_scaling' in results:
+            f.write("-" * 80 + "\n")
+            f.write("BATCH SCALING (Throughput in tokens/sec)\n")
+            f.write("-" * 80 + "\n")
+            batch = results['batch_scaling']
+            models = list(batch.keys())
+            if models:
+                batch_sizes = list(batch[models[0]].keys())
+                f.write(f"{'Model':<25}")
+                for bs in batch_sizes:
+                    f.write(f"{'B='+str(bs):>12}")
+                f.write("\n")
+                for model in models:
+                    f.write(f"{model:<25}")
+                    for bs in batch_sizes:
+                        val = batch[model].get(bs, {})
+                        if val:
+                            f.write(f"{val.get('tokens_per_sec', 'N/A'):>12.0f}")
+                        else:
+                            f.write(f"{'N/A':>12}")
+                    f.write("\n")
+            f.write("\n")
+
+        # Generation scaling summary
+        if 'generation_scaling' in results:
+            f.write("-" * 80 + "\n")
+            f.write("GENERATION SCALING (Throughput in tokens/sec)\n")
+            f.write("-" * 80 + "\n")
+            gen = results['generation_scaling']
+            models = list(gen.keys())
+            if models:
+                gen_lengths = list(gen[models[0]].keys())
+                f.write(f"{'Model':<25}")
+                for gl in gen_lengths:
+                    f.write(f"{'Gen '+str(gl):>12}")
+                f.write("\n")
+                for model in models:
+                    f.write(f"{model:<25}")
+                    for gl in gen_lengths:
+                        val = gen[model].get(gl, {})
+                        if val:
+                            f.write(f"{val.get('tokens_per_sec', 'N/A'):>12.1f}")
+                        else:
+                            f.write(f"{'N/A':>12}")
+                    f.write("\n")
+            f.write("\n")
+
+        # Speedups summary
+        if 'speedups' in results:
+            f.write("-" * 80 + "\n")
+            f.write("SPEEDUPS (VNNI vs PyTorch)\n")
+            f.write("-" * 80 + "\n")
+            for key, value in results['speedups'].items():
+                f.write(f"  {key}: {value:.2f}x\n")
+
+    print(f"Summary saved to: {txt_path}")
+
+
+def create_scaling_graphs(results: Dict[str, Any], output_dir: Path):
+    """Create graphs for scaling benchmark results."""
+    if not HAS_MATPLOTLIB:
+        print("Skipping graphs (matplotlib not available)")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Color scheme
+    colors = {
+        'VNNI Kernels': '#2ecc71',
+        'PyTorch (ternary)': '#3498db',
+        'HuggingFace (BitNet)': '#e74c3c',
+    }
+
+    # Graph 1: Prefill Scaling (Time vs Prompt Length)
+    if 'prefill_scaling' in results:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        prefill = results['prefill_scaling']
+        models = list(prefill.keys())
+
+        if models and prefill[models[0]]:
+            lengths = sorted([int(k) for k in prefill[models[0]].keys()])
+
+            # Left: Absolute times
+            for model in models:
+                times = [prefill[model].get(str(l), {}).get('mean_ms', None) for l in lengths]
+                if any(t is not None for t in times):
+                    valid_lengths = [l for l, t in zip(lengths, times) if t is not None]
+                    valid_times = [t for t in times if t is not None]
+                    ax1.plot(valid_lengths, valid_times, 'o-', label=model,
+                            color=colors.get(model, '#95a5a6'), linewidth=2, markersize=8)
+
+            ax1.set_xlabel('Prompt Length (tokens)', fontsize=12)
+            ax1.set_ylabel('Prefill Time (ms)', fontsize=12)
+            ax1.set_title('Prefill Time vs Prompt Length', fontsize=14)
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xscale('log', base=2)
+
+            # Right: Speedup vs PyTorch
+            if 'VNNI Kernels' in prefill and 'PyTorch (ternary)' in prefill:
+                speedups = []
+                valid_lengths = []
+                for l in lengths:
+                    vnni = prefill['VNNI Kernels'].get(str(l), {}).get('mean_ms')
+                    pytorch = prefill['PyTorch (ternary)'].get(str(l), {}).get('mean_ms')
+                    if vnni and pytorch:
+                        speedups.append(pytorch / vnni)
+                        valid_lengths.append(l)
+
+                if speedups:
+                    bars = ax2.bar(range(len(valid_lengths)), speedups, color='#2ecc71')
+                    ax2.set_xticks(range(len(valid_lengths)))
+                    ax2.set_xticklabels([str(l) for l in valid_lengths])
+                    ax2.set_xlabel('Prompt Length (tokens)', fontsize=12)
+                    ax2.set_ylabel('Speedup (x)', fontsize=12)
+                    ax2.set_title('VNNI Speedup vs PyTorch', fontsize=14)
+                    ax2.axhline(y=1, color='red', linestyle='--', alpha=0.5, label='Baseline')
+                    ax2.grid(True, alpha=0.3, axis='y')
+
+                    for bar, speedup in zip(bars, speedups):
+                        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                                f'{speedup:.2f}x', ha='center', va='bottom', fontsize=10)
+
+        plt.tight_layout()
+        plt.savefig(output_dir / 'prefill_scaling.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir / 'prefill_scaling.png'}")
+
+    # Graph 2: Batch Scaling (Throughput vs Batch Size)
+    if 'batch_scaling' in results:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        batch = results['batch_scaling']
+        models = list(batch.keys())
+
+        if models and batch[models[0]]:
+            batch_sizes = sorted([int(k) for k in batch[models[0]].keys()])
+
+            # Left: Absolute throughput
+            for model in models:
+                throughputs = [batch[model].get(str(bs), {}).get('tokens_per_sec', None) for bs in batch_sizes]
+                if any(t is not None for t in throughputs):
+                    valid_bs = [bs for bs, t in zip(batch_sizes, throughputs) if t is not None]
+                    valid_tp = [t for t in throughputs if t is not None]
+                    ax1.plot(valid_bs, valid_tp, 'o-', label=model,
+                            color=colors.get(model, '#95a5a6'), linewidth=2, markersize=8)
+
+            ax1.set_xlabel('Batch Size', fontsize=12)
+            ax1.set_ylabel('Throughput (tokens/sec)', fontsize=12)
+            ax1.set_title('Throughput vs Batch Size', fontsize=14)
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xscale('log', base=2)
+
+            # Right: Speedup vs PyTorch
+            if 'VNNI Kernels' in batch and 'PyTorch (ternary)' in batch:
+                speedups = []
+                valid_bs = []
+                for bs in batch_sizes:
+                    vnni = batch['VNNI Kernels'].get(str(bs), {}).get('tokens_per_sec')
+                    pytorch = batch['PyTorch (ternary)'].get(str(bs), {}).get('tokens_per_sec')
+                    if vnni and pytorch:
+                        speedups.append(vnni / pytorch)
+                        valid_bs.append(bs)
+
+                if speedups:
+                    bars = ax2.bar(range(len(valid_bs)), speedups, color='#2ecc71')
+                    ax2.set_xticks(range(len(valid_bs)))
+                    ax2.set_xticklabels([str(bs) for bs in valid_bs])
+                    ax2.set_xlabel('Batch Size', fontsize=12)
+                    ax2.set_ylabel('Speedup (x)', fontsize=12)
+                    ax2.set_title('VNNI Throughput Speedup vs PyTorch', fontsize=14)
+                    ax2.axhline(y=1, color='red', linestyle='--', alpha=0.5)
+                    ax2.grid(True, alpha=0.3, axis='y')
+
+                    for bar, speedup in zip(bars, speedups):
+                        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                                f'{speedup:.2f}x', ha='center', va='bottom', fontsize=10)
+
+        plt.tight_layout()
+        plt.savefig(output_dir / 'batch_scaling.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir / 'batch_scaling.png'}")
+
+    # Graph 3: Generation Scaling
+    if 'generation_scaling' in results:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        gen = results['generation_scaling']
+        models = list(gen.keys())
+
+        if models and gen[models[0]]:
+            gen_lengths = sorted([int(k) for k in gen[models[0]].keys()])
+
+            # Left: Absolute throughput
+            for model in models:
+                throughputs = [gen[model].get(str(gl), {}).get('tokens_per_sec', None) for gl in gen_lengths]
+                if any(t is not None for t in throughputs):
+                    valid_gl = [gl for gl, t in zip(gen_lengths, throughputs) if t is not None]
+                    valid_tp = [t for t in throughputs if t is not None]
+                    ax1.plot(valid_gl, valid_tp, 'o-', label=model,
+                            color=colors.get(model, '#95a5a6'), linewidth=2, markersize=8)
+
+            ax1.set_xlabel('Generation Length (tokens)', fontsize=12)
+            ax1.set_ylabel('Throughput (tokens/sec)', fontsize=12)
+            ax1.set_title('Generation Throughput vs Length', fontsize=14)
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+
+            # Right: Speedup vs PyTorch
+            if 'VNNI Kernels' in gen and 'PyTorch (ternary)' in gen:
+                speedups = []
+                valid_gl = []
+                for gl in gen_lengths:
+                    vnni = gen['VNNI Kernels'].get(str(gl), {}).get('tokens_per_sec')
+                    pytorch = gen['PyTorch (ternary)'].get(str(gl), {}).get('tokens_per_sec')
+                    if vnni and pytorch:
+                        speedups.append(vnni / pytorch)
+                        valid_gl.append(gl)
+
+                if speedups:
+                    bars = ax2.bar(range(len(valid_gl)), speedups, color='#2ecc71')
+                    ax2.set_xticks(range(len(valid_gl)))
+                    ax2.set_xticklabels([str(gl) for gl in valid_gl])
+                    ax2.set_xlabel('Generation Length (tokens)', fontsize=12)
+                    ax2.set_ylabel('Speedup (x)', fontsize=12)
+                    ax2.set_title('VNNI Generation Speedup vs PyTorch', fontsize=14)
+                    ax2.axhline(y=1, color='red', linestyle='--', alpha=0.5)
+                    ax2.grid(True, alpha=0.3, axis='y')
+
+                    for bar, speedup in zip(bars, speedups):
+                        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                                f'{speedup:.2f}x', ha='center', va='bottom', fontsize=10)
+
+        plt.tight_layout()
+        plt.savefig(output_dir / 'generation_scaling.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir / 'generation_scaling.png'}")
+
+    # Graph 4: Combined Summary
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    speedups = results.get('speedups', {})
+
+    # Prefill speedup
+    if 'prefill_512_tokens' in speedups:
+        axes[0].bar(['Prefill\n(512 tokens)'], [speedups['prefill_512_tokens']], color='#2ecc71', width=0.5)
+        axes[0].set_ylabel('Speedup (x)', fontsize=12)
+        axes[0].set_title('Prefill Speedup', fontsize=14)
+        axes[0].axhline(y=1, color='red', linestyle='--', alpha=0.5)
+        axes[0].text(0, speedups['prefill_512_tokens'] + 0.1, f"{speedups['prefill_512_tokens']:.2f}x",
+                    ha='center', fontsize=12, fontweight='bold')
+
+    # Batch throughput speedup
+    if 'batch_16_throughput' in speedups:
+        axes[1].bar(['Batch 16\nThroughput'], [speedups['batch_16_throughput']], color='#3498db', width=0.5)
+        axes[1].set_ylabel('Speedup (x)', fontsize=12)
+        axes[1].set_title('Batch Throughput Speedup', fontsize=14)
+        axes[1].axhline(y=1, color='red', linestyle='--', alpha=0.5)
+        axes[1].text(0, speedups['batch_16_throughput'] + 0.1, f"{speedups['batch_16_throughput']:.2f}x",
+                    ha='center', fontsize=12, fontweight='bold')
+
+    # Generation speedup
+    if 'generation_50_tokens' in speedups:
+        axes[2].bar(['Generation\n(50 tokens)'], [speedups['generation_50_tokens']], color='#e74c3c', width=0.5)
+        axes[2].set_ylabel('Speedup (x)', fontsize=12)
+        axes[2].set_title('Generation Speedup', fontsize=14)
+        axes[2].axhline(y=1, color='red', linestyle='--', alpha=0.5)
+        axes[2].text(0, speedups['generation_50_tokens'] + 0.1, f"{speedups['generation_50_tokens']:.2f}x",
+                    ha='center', fontsize=12, fontweight='bold')
+
+    for ax in axes:
+        ax.set_ylim(0, max([speedups.get(k, 1) for k in speedups.keys()] + [1.5]) * 1.2)
+        ax.grid(True, alpha=0.3, axis='y')
+
+    plt.suptitle('VNNI Kernel Speedups vs PyTorch (Higher is Better)', fontsize=16, y=1.02)
+    plt.tight_layout()
+    plt.savefig(output_dir / 'speedup_summary_long.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir / 'speedup_summary_long.png'}")
 
 
 # ============================================================================
@@ -321,6 +667,11 @@ def main():
     print(f"Threads: {torch.get_num_threads()}")
     print()
 
+    # Create output directory
+    output_dir = Path(__file__).parent / 'benchmark_results'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Results will be saved to: {output_dir}")
+
     MODEL_NAME = 'microsoft/bitnet-b1.58-2B-4T-bf16'
     HF_BITNET_MODEL = 'microsoft/bitnet-b1.58-2B-4T'
 
@@ -366,12 +717,8 @@ def main():
     # 3. Generation scaling
     gen_results = test_generation_scaling(models, tokenizer, GEN_LENGTHS, prompt_length=32)
 
-    # Final summary
-    print("\n" + "=" * 80)
-    print("FINAL SUMMARY")
-    print("=" * 80)
-
-    print("\nKey findings:")
+    # Compute speedups
+    speedups = {}
 
     # Prefill speedup at longest prompt
     if 'VNNI Kernels' in prefill_results and 'PyTorch (ternary)' in prefill_results:
@@ -379,8 +726,7 @@ def main():
         vnni = prefill_results['VNNI Kernels'].get(longest)
         pytorch = prefill_results['PyTorch (ternary)'].get(longest)
         if vnni and pytorch:
-            speedup = pytorch['mean_ms'] / vnni['mean_ms']
-            print(f"  - Prefill @ {longest} tokens: {speedup:.2f}x faster than PyTorch")
+            speedups[f'prefill_{longest}_tokens'] = pytorch['mean_ms'] / vnni['mean_ms']
 
     # Batch throughput at largest batch
     if 'VNNI Kernels' in batch_results and 'PyTorch (ternary)' in batch_results:
@@ -388,8 +734,7 @@ def main():
         vnni = batch_results['VNNI Kernels'].get(largest_bs)
         pytorch = batch_results['PyTorch (ternary)'].get(largest_bs)
         if vnni and pytorch:
-            speedup = vnni['tokens_per_sec'] / pytorch['tokens_per_sec']
-            print(f"  - Batch={largest_bs} throughput: {speedup:.2f}x faster than PyTorch")
+            speedups[f'batch_{largest_bs}_throughput'] = vnni['tokens_per_sec'] / pytorch['tokens_per_sec']
 
     # Generation throughput
     if 'VNNI Kernels' in gen_results and 'PyTorch (ternary)' in gen_results:
@@ -397,11 +742,52 @@ def main():
         vnni = gen_results['VNNI Kernels'].get(gen_len)
         pytorch = gen_results['PyTorch (ternary)'].get(gen_len)
         if vnni and pytorch:
-            speedup = vnni['tokens_per_sec'] / pytorch['tokens_per_sec']
-            print(f"  - Generation @ {gen_len} tokens: {speedup:.2f}x faster than PyTorch")
+            speedups[f'generation_{gen_len}_tokens'] = vnni['tokens_per_sec'] / pytorch['tokens_per_sec']
+
+    # Final summary
+    print("\n" + "=" * 80)
+    print("FINAL SUMMARY")
+    print("=" * 80)
+
+    print("\nKey findings:")
+    for key, value in speedups.items():
+        print(f"  - {key}: {value:.2f}x faster than PyTorch")
+
+    # Convert results to JSON-serializable format (use string keys)
+    def convert_keys_to_str(d):
+        """Convert dict keys to strings for JSON serialization."""
+        if not isinstance(d, dict):
+            return d
+        return {str(k): convert_keys_to_str(v) for k, v in d.items()}
+
+    # Collect all results
+    all_results = {
+        'timestamp': datetime.now().isoformat(),
+        'platform': {
+            'machine': arch['machine'],
+            'kernel_type': arch['kernel_type'],
+            'threads': torch.get_num_threads(),
+        },
+        'config': {
+            'prompt_lengths': PROMPT_LENGTHS,
+            'batch_sizes': BATCH_SIZES,
+            'gen_lengths': GEN_LENGTHS,
+            'warmup_iters': WARMUP_ITERS,
+            'bench_iters': BENCH_ITERS,
+        },
+        'prefill_scaling': convert_keys_to_str(prefill_results),
+        'batch_scaling': convert_keys_to_str(batch_results),
+        'generation_scaling': convert_keys_to_str(gen_results),
+        'speedups': speedups,
+    }
+
+    # Save results and create graphs
+    save_results(all_results, output_dir)
+    create_scaling_graphs(all_results, output_dir)
 
     print("\n" + "=" * 80)
     print("Benchmark complete!")
+    print(f"Results saved to: {output_dir}")
     print("=" * 80)
 
 

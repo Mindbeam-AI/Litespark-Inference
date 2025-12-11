@@ -335,24 +335,55 @@ Architecture: $(uname -m)
 CPU Info: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null || echo "ARM Neoverse")
 Threads: $(nproc)
 
-Results saved to:
+Console output logs:
 - benchmark_short_results.txt
 - benchmark_long_results.txt
+
+Structured results and graphs (in benchmark_results/):
+- benchmark_results.json (short benchmark)
+- benchmark_summary.txt (short benchmark)
+- benchmark_long_results.json (long benchmark)
+- benchmark_long_summary.txt (long benchmark)
+- model_comparison.png
+- kernel_speedup.png
+- speedup_summary.png
+- prefill_scaling.png
+- batch_scaling.png
+- generation_scaling.png
+- speedup_summary_long.png
 EOF
 
 cat ~/benchmark_summary.txt
+
+# List generated files
+echo ""
+echo "Generated files in benchmark_results/:"
+ls -la ~/matmulMM/inference/benchmark_results/ 2>/dev/null || echo "(directory not found)"
 BENCHMARK_SCRIPT
 
 # Step 6: Download results
 echo ""
 echo "Step 6: Downloading results..."
 
-$SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_short_results.txt" "$RESULTS_DIR/"
-$SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_long_results.txt" "$RESULTS_DIR/"
-$SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_summary.txt" "$RESULTS_DIR/"
+# Download console output logs
+$SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_short_results.txt" "$RESULTS_DIR/" || true
+$SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_long_results.txt" "$RESULTS_DIR/" || true
+$SCP_CMD "ec2-user@$INSTANCE_IP:~/benchmark_summary.txt" "$RESULTS_DIR/" || true
 
+# Download structured results (JSON, text summaries, graphs)
+# These are saved to ~/matmulMM/inference/benchmark_results/
+echo "Downloading structured results and graphs..."
+$SCP_CMD -r "ec2-user@$INSTANCE_IP:~/matmulMM/inference/benchmark_results/" "$RESULTS_DIR/benchmark_results/" || true
+
+# List all downloaded files
+echo ""
 echo "Results downloaded to: $RESULTS_DIR"
-ls -la "$RESULTS_DIR"
+echo ""
+echo "Console output logs:"
+ls -la "$RESULTS_DIR"/*.txt 2>/dev/null || echo "  (none)"
+echo ""
+echo "Structured results and graphs:"
+ls -la "$RESULTS_DIR/benchmark_results/" 2>/dev/null || echo "  (none)"
 
 # Step 7: Optionally terminate
 if [ "$TERMINATE_AFTER" = true ]; then

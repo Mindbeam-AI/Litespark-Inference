@@ -22,11 +22,23 @@ import sys
 import gc
 import platform
 import resource
+import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from datetime import datetime
+from typing import Optional, Dict, List, Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Try to import matplotlib for graphs
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("Warning: matplotlib not available, skipping graphs")
 
 from inference.ternary_models import (
     BitNet, BitNetConfig, load_ternary_model, get_arch_info,
@@ -830,6 +842,14 @@ def profile_vnni_kernel(model, tokenizer):
     w_sum_test = w_test.sum(dim=1, dtype=torch.int32)
     w_float = w_test[:, :K].float()
 
+    # Collect kernel benchmark results
+    kernel_results = {
+        'batch_sizes': [],
+        'vnni_times': [],
+        'pytorch_times': [],
+        'speedups': [],
+    }
+
     for M in [1, 6, 16, 64, 128, 256]:
         x_int8 = torch.randint(-127, 127, (M, K_pad), dtype=torch.int8)
         x_scale = torch.ones(M)
@@ -861,6 +881,197 @@ def profile_vnni_kernel(model, tokenizer):
         speedup = pt_time / vnni_time
         print(f"{M:<6} {vnni_time:<12.3f} {pt_time:<14.3f} {speedup:<10.2f}x")
 
+        kernel_results['batch_sizes'].append(M)
+        kernel_results['vnni_times'].append(vnni_time)
+        kernel_results['pytorch_times'].append(pt_time)
+        kernel_results['speedups'].append(speedup)
+
+    return kernel_results
+
+
+def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_dir: Path):
+    """Create and save benchmark comparison graphs."""
+    if not HAS_MATPLOTLIB:
+        print("Skipping graphs - matplotlib not available")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Graph 1: Model comparison (TTFT, Throughput, Memory)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    model_names = [r['name'].replace(' (ternary)', '') for r in results]
+    colors = ['#2ecc71', '#e74c3c', '#3498db'][:len(results)]
+
+    # TTFT
+    ttfts = [r['mean_ttft_ms'] for r in results]
+    bars1 = axes[0].bar(model_names, ttfts, color=colors, alpha=0.8, edgecolor='black')
+    axes[0].set_ylabel('Time (ms)', fontsize=12)
+    axes[0].set_title('Time to First Token (TTFT)', fontsize=14)
+    axes[0].tick_params(axis='x', rotation=15)
+    for bar, val in zip(bars1, ttfts):
+        axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.0f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Throughput
+    toks = [r['tokens_per_sec'] for r in results]
+    bars2 = axes[1].bar(model_names, toks, color=colors, alpha=0.8, edgecolor='black')
+    axes[1].set_ylabel('Tokens/sec', fontsize=12)
+    axes[1].set_title('Generation Throughput', fontsize=14)
+    axes[1].tick_params(axis='x', rotation=15)
+    for bar, val in zip(bars2, toks):
+        axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.2f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Memory
+    mems = [r['memory_mb'] for r in results]
+    bars3 = axes[2].bar(model_names, mems, color=colors, alpha=0.8, edgecolor='black')
+    axes[2].set_ylabel('Memory (MB)', fontsize=12)
+    axes[2].set_title('Memory Usage', fontsize=14)
+    axes[2].tick_params(axis='x', rotation=15)
+    for bar, val in zip(bars3, mems):
+        axes[2].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.0f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'model_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir / 'model_comparison.png'}")
+
+    # Graph 2: Kernel speedup vs batch size
+    if kernel_results:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        batch_sizes = kernel_results['batch_sizes']
+        vnni_times = kernel_results['vnni_times']
+        pytorch_times = kernel_results['pytorch_times']
+        speedups = kernel_results['speedups']
+
+        # Left: Execution time
+        ax1.plot(batch_sizes, vnni_times, 'b-o', label='Graviton Kernel', linewidth=2, markersize=8)
+        ax1.plot(batch_sizes, pytorch_times, 'r-s', label='PyTorch F.linear', linewidth=2, markersize=8)
+        ax1.set_xlabel('Batch Size (M)', fontsize=12)
+        ax1.set_ylabel('Execution Time (ms)', fontsize=12)
+        ax1.set_title('Kernel Execution Time vs Batch Size', fontsize=14)
+        ax1.legend(fontsize=11)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xscale('log', base=2)
+
+        # Right: Speedup
+        colors_bar = ['green' if s >= 1 else 'red' for s in speedups]
+        bars = ax2.bar(range(len(batch_sizes)), speedups, color=colors_bar, alpha=0.7, edgecolor='black')
+        ax2.axhline(y=1, color='black', linestyle='--', linewidth=1)
+        ax2.set_xlabel('Batch Size (M)', fontsize=12)
+        ax2.set_ylabel('Speedup (x)', fontsize=12)
+        ax2.set_title('Graviton Kernel Speedup vs PyTorch', fontsize=14)
+        ax2.set_xticks(range(len(batch_sizes)))
+        ax2.set_xticklabels([str(b) for b in batch_sizes])
+        ax2.grid(True, alpha=0.3, axis='y')
+
+        for i, (bar, speedup) in enumerate(zip(bars, speedups)):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                    f'{speedup:.2f}x', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+        plt.tight_layout()
+        plt.savefig(output_dir / 'kernel_speedup.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir / 'kernel_speedup.png'}")
+
+    # Graph 3: Speedup summary
+    if len(results) >= 2:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        pytorch_idx = next((i for i, r in enumerate(results) if 'PyTorch' in r['name']), 1)
+        vnni_idx = 0
+
+        speedup_ttft = results[pytorch_idx]['mean_ttft_ms'] / results[vnni_idx]['mean_ttft_ms']
+        speedup_throughput = results[vnni_idx]['tokens_per_sec'] / results[pytorch_idx]['tokens_per_sec']
+        memory_reduction = results[pytorch_idx]['memory_mb'] / results[vnni_idx]['memory_mb']
+
+        metrics = ['TTFT\nSpeedup', 'Throughput\nSpeedup', 'Memory\nReduction']
+        values = [speedup_ttft, speedup_throughput, memory_reduction]
+        colors_summary = ['#3498db', '#2ecc71', '#9b59b6']
+
+        bars = ax.bar(metrics, values, color=colors_summary, alpha=0.8, edgecolor='black')
+        ax.axhline(y=1, color='black', linestyle='--', linewidth=1, label='Parity')
+        ax.set_ylabel('Factor (x)', fontsize=12)
+        ax.set_title('Graviton Kernel vs PyTorch Summary', fontsize=14)
+        ax.grid(True, alpha=0.3, axis='y')
+
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                   f'{val:.2f}x', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+        plt.tight_layout()
+        plt.savefig(output_dir / 'speedup_summary.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir / 'speedup_summary.png'}")
+
+
+def save_results(results: List[Dict], kernel_results: Dict, accuracy: Dict,
+                 arch_info: Dict, output_dir: Path):
+    """Save benchmark results to JSON file."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_results = {
+        'timestamp': datetime.now().isoformat(),
+        'system_info': {
+            'platform': arch_info['machine'],
+            'kernel_type': arch_info['kernel_type'],
+            'num_threads': torch.get_num_threads(),
+            'torch_version': torch.__version__,
+        },
+        'model_benchmarks': results,
+        'kernel_benchmarks': kernel_results,
+        'numerical_accuracy': accuracy,
+    }
+
+    results_file = output_dir / 'benchmark_results.json'
+    with open(results_file, 'w') as f:
+        json.dump(all_results, f, indent=2, default=str)
+    print(f"Saved: {results_file}")
+
+    # Also save a human-readable summary
+    summary_file = output_dir / 'benchmark_summary.txt'
+    with open(summary_file, 'w') as f:
+        f.write("=" * 70 + "\n")
+        f.write("GRAVITON BENCHMARK SUMMARY\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"Date: {all_results['timestamp']}\n")
+        f.write(f"Platform: {arch_info['machine']}\n")
+        f.write(f"Kernel: {arch_info['kernel_type']}\n")
+        f.write(f"Threads: {torch.get_num_threads()}\n\n")
+
+        f.write("-" * 70 + "\n")
+        f.write("MODEL PERFORMANCE\n")
+        f.write("-" * 70 + "\n\n")
+        f.write(f"{'Model':<25} {'TTFT (ms)':<12} {'Tok/s':<10} {'Memory (MB)':<14}\n")
+        f.write("-" * 70 + "\n")
+        for r in results:
+            f.write(f"{r['name']:<25} {r['mean_ttft_ms']:<12.1f} {r['tokens_per_sec']:<10.2f} {r['memory_mb']:<14.1f}\n")
+
+        if len(results) >= 2:
+            f.write("\n")
+            pytorch_idx = next((i for i, r in enumerate(results) if 'PyTorch' in r['name']), 1)
+            vnni_idx = 0
+            f.write(f"Speedup vs PyTorch:\n")
+            f.write(f"  TTFT: {results[pytorch_idx]['mean_ttft_ms'] / results[vnni_idx]['mean_ttft_ms']:.2f}x\n")
+            f.write(f"  Throughput: {results[vnni_idx]['tokens_per_sec'] / results[pytorch_idx]['tokens_per_sec']:.2f}x\n")
+            f.write(f"  Memory: {results[pytorch_idx]['memory_mb'] / results[vnni_idx]['memory_mb']:.2f}x reduction\n")
+
+        if kernel_results:
+            f.write("\n" + "-" * 70 + "\n")
+            f.write("KERNEL PERFORMANCE (vs PyTorch F.linear)\n")
+            f.write("-" * 70 + "\n\n")
+            f.write(f"{'Batch (M)':<12} {'Kernel (ms)':<14} {'PyTorch (ms)':<14} {'Speedup':<10}\n")
+            f.write("-" * 50 + "\n")
+            for i, bs in enumerate(kernel_results['batch_sizes']):
+                f.write(f"{bs:<12} {kernel_results['vnni_times'][i]:<14.3f} {kernel_results['pytorch_times'][i]:<14.3f} {kernel_results['speedups'][i]:<10.2f}x\n")
+
+        f.write("\n" + "=" * 70 + "\n")
+
+    print(f"Saved: {summary_file}")
+
 
 def main():
     print("=" * 70)
@@ -873,6 +1084,11 @@ def main():
     print(f"Threads: {torch.get_num_threads()}")
     print()
 
+    # Create output directory for results
+    output_dir = Path(__file__).parent.parent / 'benchmark_results'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Results will be saved to: {output_dir}")
+
     MODEL_NAME = 'microsoft/bitnet-b1.58-2B-4T-bf16'
 
     # Load tokenizer
@@ -881,6 +1097,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     results = []
+    kernel_results = {}
 
     # 1. VNNI/Graviton kernels (ternary)
     print("\n" + "=" * 70)
@@ -890,8 +1107,8 @@ def main():
     vnni_model.eval()
     results.append(benchmark_model(vnni_model, tokenizer, "VNNI Kernels (ternary)"))
 
-    # Profile VNNI kernel
-    profile_vnni_kernel(vnni_model, tokenizer)
+    # Profile VNNI kernel and collect kernel benchmark results
+    kernel_results = profile_vnni_kernel(vnni_model, tokenizer)
 
     # 2. PyTorch baseline (ternary)
     print("\n" + "=" * 70)
@@ -1021,8 +1238,27 @@ def main():
         print(f"\n{r['name']}:")
         print(f"  {r['sample_output']}")
 
+    # ========================================================================
+    # Save Results and Generate Graphs
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("Saving Results and Generating Graphs")
+    print("=" * 70)
+
+    # Save results to JSON and text summary
+    save_results(results, kernel_results, accuracy, arch, output_dir)
+
+    # Create graphs
+    create_comparison_graphs(results, kernel_results, output_dir)
+
+    # List all generated files
+    print("\nGenerated files:")
+    for f in sorted(output_dir.iterdir()):
+        print(f"  {f}")
+
     print("\n" + "=" * 70)
     print("Benchmark complete!")
+    print("=" * 70)
 
 
 if __name__ == '__main__':
