@@ -730,7 +730,7 @@ def compare_all_methods(
         output_dir = Path(__file__).parent / 'benchmark_ptq_results'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq']
+    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2']
 
     print("=" * 70)
     print("PTQ Method Comparison")
@@ -825,7 +825,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0',
                         help='HuggingFace model to benchmark')
     parser.add_argument('--method', type=str, default='absmean',
-                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq'],
+                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2'],
                         help='Quantization method')
     parser.add_argument('--compare-all', action='store_true',
                         help='Compare all quantization methods')
