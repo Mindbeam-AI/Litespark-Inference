@@ -716,13 +716,119 @@ def run_ptq_benchmark(
     return all_results
 
 
+def compare_all_methods(
+    model_name: str = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
+    output_dir: Optional[Path] = None,
+    config: BenchmarkConfig = None
+):
+    """Compare all quantization methods on the same model."""
+
+    if config is None:
+        config = BenchmarkConfig()
+
+    if output_dir is None:
+        output_dir = Path(__file__).parent / 'benchmark_ptq_results'
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq']
+
+    print("=" * 70)
+    print("PTQ Method Comparison")
+    print("=" * 70)
+    print(f"Model: {model_name}")
+    print(f"Methods: {', '.join(methods)}")
+    print()
+
+    # First load FP16 baseline (only once)
+    print("Loading FP16 baseline...")
+    fp16_model, tokenizer = load_fp16_model(model_name)
+
+    print("\nEvaluating FP16 perplexity...")
+    fp16_ppl, _ = evaluate_perplexity(fp16_model, tokenizer, max_samples=config.ppl_max_samples)
+    print(f"  FP16 Perplexity: {fp16_ppl:.2f}")
+
+    del fp16_model
+    gc.collect()
+
+    # Test each quantization method
+    results = {
+        'model': model_name,
+        'fp16_perplexity': fp16_ppl,
+        'methods': {}
+    }
+
+    for method in methods:
+        print(f"\n{'='*70}")
+        print(f"Testing method: {method.upper()}")
+        print("=" * 70)
+
+        try:
+            ptq_model, tokenizer = load_ptq_model(model_name, method=method)
+
+            print("\n  Evaluating perplexity...")
+            ppl, ppl_stats = evaluate_perplexity(ptq_model, tokenizer, max_samples=config.ppl_max_samples)
+
+            print(f"\n  Evaluating performance...")
+            short_result = benchmark_model_short(ptq_model, tokenizer, method, config)
+
+            results['methods'][method] = {
+                'perplexity': ppl,
+                'ppl_stats': ppl_stats,
+                'ttft_ms': short_result['mean_ttft_ms'],
+                'tokens_per_sec': short_result['tokens_per_sec'],
+                'memory_mb': short_result['memory_mb'],
+                'sample_output': short_result['sample_output'][:100],
+            }
+
+            print(f"\n  Results for {method}:")
+            print(f"    Perplexity: {ppl:.2f} (FP16: {fp16_ppl:.2f}, degradation: +{ppl - fp16_ppl:.2f})")
+            print(f"    TTFT: {short_result['mean_ttft_ms']:.1f}ms")
+            print(f"    Throughput: {short_result['tokens_per_sec']:.2f} tok/s")
+
+            del ptq_model
+            gc.collect()
+
+        except Exception as e:
+            print(f"  [ERROR] Method {method} failed: {e}")
+            results['methods'][method] = {'error': str(e)}
+
+    # Summary table
+    print("\n" + "=" * 70)
+    print("COMPARISON SUMMARY")
+    print("=" * 70)
+
+    print(f"\nBaseline: FP16 Perplexity = {fp16_ppl:.2f}")
+    print()
+    print(f"{'Method':<15} {'Perplexity':<12} {'Degradation':<12} {'TTFT (ms)':<12} {'Tok/s':<10}")
+    print("-" * 70)
+
+    for method in methods:
+        if method in results['methods'] and 'perplexity' in results['methods'][method]:
+            r = results['methods'][method]
+            ppl = r['perplexity']
+            deg = ppl - fp16_ppl
+            print(f"{method:<15} {ppl:<12.2f} +{deg:<11.2f} {r['ttft_ms']:<12.1f} {r['tokens_per_sec']:<10.2f}")
+        else:
+            print(f"{method:<15} {'ERROR':<12}")
+
+    # Save results
+    results_file = output_dir / 'method_comparison_results.json'
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\nResults saved to: {results_file}")
+
+    return results
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PTQ Comprehensive Benchmark')
     parser.add_argument('--model', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0',
                         help='HuggingFace model to benchmark')
     parser.add_argument('--method', type=str, default='absmean',
-                        choices=['absmean', 'percentile', 'optimal'],
+                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq'],
                         help='Quantization method')
+    parser.add_argument('--compare-all', action='store_true',
+                        help='Compare all quantization methods')
     parser.add_argument('--include-bitnet', action='store_true',
                         help='Include BitNet comparison')
     parser.add_argument('--short-only', action='store_true',
@@ -733,10 +839,13 @@ if __name__ == '__main__':
 
     config = BenchmarkConfig(ppl_max_samples=args.ppl_samples)
 
-    run_ptq_benchmark(
-        model_name=args.model,
-        quant_method=args.method,
-        include_bitnet=args.include_bitnet,
-        run_long=not args.short_only,
-        config=config
-    )
+    if args.compare_all:
+        compare_all_methods(model_name=args.model, config=config)
+    else:
+        run_ptq_benchmark(
+            model_name=args.model,
+            quant_method=args.method,
+            include_bitnet=args.include_bitnet,
+            run_long=not args.short_only,
+            config=config
+        )

@@ -207,6 +207,260 @@ def quantize_to_ternary_optimal(
     return w_ternary, scale, stats
 
 
+def quantize_to_ternary_gptq(
+    weight: torch.Tensor,
+    H: Optional[torch.Tensor] = None,
+    blocksize: int = 128,
+    target_sparsity: float = 0.33
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    GPTQ-style ternary quantization with error compensation.
+
+    Uses Hessian information to quantize weights column-by-column,
+    updating remaining weights to compensate for quantization error.
+
+    This is a simplified version - full GPTQ uses calibration data
+    to compute the Hessian. Here we use weight magnitude as proxy.
+
+    Args:
+        weight: Float tensor to quantize [out_features, in_features]
+        H: Optional Hessian diagonal (if None, use weight magnitude)
+        blocksize: Process this many columns at a time
+        target_sparsity: Target fraction of zeros
+
+    Returns:
+        w_ternary: Ternary tensor {-1, 0, +1}
+        scale: Scaling factor
+        stats: Quantization statistics
+    """
+    N, K = weight.shape
+    w = weight.clone()
+
+    # Compute importance scores (Hessian diagonal approximation)
+    if H is None:
+        # Use squared weight magnitude as importance proxy
+        H = (w ** 2).sum(dim=0) + 1e-10
+
+    # Find threshold for target sparsity
+    abs_weight = w.abs()
+    threshold = torch.quantile(abs_weight.flatten(), target_sparsity).item()
+
+    # Compute optimal scale from weights that will be kept
+    mask = abs_weight > threshold
+    if mask.sum() == 0:
+        scale = 1.0
+    else:
+        scale = abs_weight[mask].mean().item()
+
+    # Initialize output
+    w_ternary = torch.zeros_like(w, dtype=torch.int8)
+
+    # Process in blocks for efficiency
+    for start in range(0, K, blocksize):
+        end = min(start + blocksize, K)
+
+        for j in range(start, end):
+            col = w[:, j]
+
+            # Quantize this column
+            q = torch.zeros(N, dtype=torch.int8)
+            q[col > threshold] = 1
+            q[col < -threshold] = -1
+
+            w_ternary[:, j] = q
+
+            # Compute quantization error
+            q_float = q.float() * scale
+            error = col - q_float
+
+            # Distribute error to remaining columns (simplified GPTQ update)
+            if j < K - 1:
+                # Weight the error distribution by inverse Hessian
+                remaining_H = H[j+1:end]
+                if remaining_H.sum() > 0:
+                    # Distribute error proportionally to remaining columns
+                    weights_dist = remaining_H / remaining_H.sum()
+                    for k, wd in enumerate(weights_dist):
+                        if j + 1 + k < end:
+                            w[:, j + 1 + k] += error * wd.item() * 0.1  # Damped update
+
+    # Compute statistics
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (w_ternary != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+
+    w_reconstructed = w_ternary.float() * scale
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=scale,
+        mse=mse
+    )
+
+    return w_ternary, scale, stats
+
+
+def quantize_to_ternary_smoothquant(
+    weight: torch.Tensor,
+    act_scales: Optional[torch.Tensor] = None,
+    alpha: float = 0.5,
+    target_sparsity: float = 0.33
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    SmoothQuant-style ternary quantization.
+
+    Migrates quantization difficulty from activations to weights by
+    scaling weights based on activation magnitude. This makes weight
+    distribution more uniform and easier to quantize.
+
+    Args:
+        weight: Float tensor to quantize [out_features, in_features]
+        act_scales: Per-input-channel activation scales (if None, use weight stats)
+        alpha: Smoothing factor (0=all on weights, 1=all on activations)
+        target_sparsity: Target fraction of zeros
+
+    Returns:
+        w_ternary: Ternary tensor {-1, 0, +1}
+        scale: Scaling factor
+        stats: Quantization statistics
+    """
+    N, K = weight.shape
+
+    # If no activation scales provided, estimate from weight magnitude
+    if act_scales is None:
+        # Use per-column weight magnitude as proxy for activation importance
+        act_scales = weight.abs().mean(dim=0) + 1e-10
+
+    # Compute weight scales (per-column max)
+    w_scales = weight.abs().max(dim=0).values + 1e-10
+
+    # Compute smoothing scales: s = act_scales^alpha / w_scales^(1-alpha)
+    smooth_scales = (act_scales ** alpha) / (w_scales ** (1 - alpha))
+
+    # Apply smoothing to weights (equivalent to dividing activations by smooth_scales)
+    w_smooth = weight * smooth_scales.unsqueeze(0)
+
+    # Now quantize the smoothed weights
+    abs_weight = w_smooth.abs()
+    threshold = torch.quantile(abs_weight.flatten(), target_sparsity).item()
+
+    # Compute scale from smoothed weights
+    mask = abs_weight > threshold
+    if mask.sum() == 0:
+        scale = 1.0
+    else:
+        scale = abs_weight[mask].mean().item()
+
+    # Quantize
+    w_ternary = torch.zeros_like(w_smooth, dtype=torch.int8)
+    w_ternary[w_smooth > threshold] = 1
+    w_ternary[w_smooth < -threshold] = -1
+
+    # Compute statistics (compare against original weight)
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (w_ternary != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+
+    # For MSE, account for the smoothing transform
+    # Reconstructed = w_ternary * scale / smooth_scales
+    w_reconstructed = (w_ternary.float() * scale) / smooth_scales.unsqueeze(0)
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=scale,
+        mse=mse
+    )
+
+    return w_ternary, scale, stats
+
+
+def quantize_to_ternary_awq(
+    weight: torch.Tensor,
+    act_scales: Optional[torch.Tensor] = None,
+    top_k_percent: float = 1.0,
+    target_sparsity: float = 0.33
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    AWQ-style (Activation-aware Weight Quantization) ternary quantization.
+
+    Preserves weights in channels with high activation magnitude by
+    using per-channel scaling that protects important channels.
+
+    Args:
+        weight: Float tensor to quantize [out_features, in_features]
+        act_scales: Per-input-channel activation scales (importance)
+        top_k_percent: Protect top k% of channels more carefully
+        target_sparsity: Target fraction of zeros
+
+    Returns:
+        w_ternary: Ternary tensor {-1, 0, +1}
+        scale: Scaling factor
+        stats: Quantization statistics
+    """
+    N, K = weight.shape
+
+    # If no activation scales, use weight magnitude as proxy
+    if act_scales is None:
+        act_scales = weight.abs().mean(dim=0)
+
+    # Find top-k important channels
+    k = max(1, int(K * top_k_percent / 100))
+    _, top_indices = torch.topk(act_scales, k)
+
+    # Create importance mask
+    importance = torch.ones(K)
+    importance[top_indices] = 2.0  # Double importance for top channels
+
+    # Compute per-channel thresholds (lower threshold for important channels)
+    abs_weight = weight.abs()
+
+    # Base threshold from target sparsity
+    base_threshold = torch.quantile(abs_weight.flatten(), target_sparsity).item()
+
+    # Adjust threshold per channel based on importance
+    # Important channels get lower threshold (keep more weights)
+    channel_thresholds = base_threshold / importance
+
+    # Quantize with per-channel thresholds
+    w_ternary = torch.zeros_like(weight, dtype=torch.int8)
+    for j in range(K):
+        col = weight[:, j]
+        thresh = channel_thresholds[j].item()
+        w_ternary[col > thresh, j] = 1
+        w_ternary[col < -thresh, j] = -1
+
+    # Compute scale from kept weights
+    mask = w_ternary != 0
+    if mask.sum() == 0:
+        scale = 1.0
+    else:
+        scale = weight.abs()[mask].mean().item()
+
+    # Statistics
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (w_ternary != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+
+    w_reconstructed = w_ternary.float() * scale
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=scale,
+        mse=mse
+    )
+
+    return w_ternary, scale, stats
+
+
 def prepare_ternary_weight_ptq(
     weight: torch.Tensor,
     method: str = 'absmean',
@@ -241,6 +495,12 @@ def prepare_ternary_weight_ptq(
         w_ternary, scale, stats = quantize_to_ternary_percentile(weight, **kwargs)
     elif method == 'optimal':
         w_ternary, scale, stats = quantize_to_ternary_optimal(weight, **kwargs)
+    elif method == 'gptq':
+        w_ternary, scale, stats = quantize_to_ternary_gptq(weight, **kwargs)
+    elif method == 'smoothquant':
+        w_ternary, scale, stats = quantize_to_ternary_smoothquant(weight, **kwargs)
+    elif method == 'awq':
+        w_ternary, scale, stats = quantize_to_ternary_awq(weight, **kwargs)
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 
