@@ -1,0 +1,178 @@
+======================================================================
+BitNet Benchmark: VNNI/Graviton Kernels vs PyTorch
+======================================================================
+Platform: aarch64
+Kernel: graviton
+Threads: 16
+
+Results will be saved to: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton
+Loading tokenizer...
+
+======================================================================
+1. Loading VNNI/Graviton kernel model (ternary)...
+======================================================================
+Loading model: bitnet-2b (microsoft/bitnet-b1.58-2B-4T-bf16)
+Loading microsoft/bitnet-b1.58-2B-4T-bf16...
+`torch_dtype` is deprecated! Use `dtype` instead!
+Downloading model weights...
+Converting weights to ternary format...
+Loading tokenizer...
+  Warming up VNNI Kernels (ternary)...
+
+======================================================================
+VNNI Kernel Profiling
+======================================================================
+
+Manual timing breakdown (single forward pass):
+  Embedding: 0.12 ms
+  Layers (avg): 4.67 ms x 30 = 139.98 ms
+  Layer breakdown:
+    First 3: 4.86, 4.66, 4.63 ms
+    Last 3: 4.56, 4.59, 4.56 ms
+  Norm + LM Head: 15.12 ms
+  Total: 155.22 ms
+
+Detailed layer 0 breakdown:
+  Input norm: 0.14 ms
+  Attention: 2.08 ms
+  Post-attn norm: 0.07 ms
+  MLP: 2.59 ms
+
+Detailed attention breakdown:
+  Q proj: 0.43 ms
+  K proj: 0.34 ms
+  V proj: 0.32 ms
+  O proj: 0.38 ms
+  Total projections: 1.47 ms
+
+Detailed MLP breakdown:
+  Gate proj: 0.77 ms
+  Up proj: 0.81 ms
+  Down proj: 0.74 ms
+  Total projections: 2.32 ms
+
+======================================================================
+Quantization vs Kernel Breakdown
+======================================================================
+
+Q projection (2560 -> 2560) breakdown:
+  Full forward:     0.371 ms
+  - Quantization:   0.110 ms (29.5%)
+  - Kernel:         0.069 ms (18.7%)
+  - Scale multiply: 0.007 ms (1.8%)
+  - Other overhead: 0.186 ms
+
+Gate projection (2560 -> 6912) breakdown:
+  Full forward:     0.643 ms
+  - Quantization:   0.099 ms (15.5%)
+  - Kernel:         0.286 ms (44.6%)
+  - Other overhead: 0.257 ms
+
+Comparison with PyTorch F.linear:
+  PyTorch F.linear: 0.942 ms
+  Our kernel only:  0.286 ms
+  Kernel speedup:   3.29x
+
+======================================================================
+Kernel Performance vs Batch Size (M)
+======================================================================
+
+Gate projection shape: K=2560 -> N=6912
+M      VNNI (ms)    PyTorch (ms)   Speedup   
+---------------------------------------------
+1      0.051        0.347          6.80      x
+6      0.307        0.929          3.03      x
+16     1.737        9.080          5.23      x
+64     6.426        10.841         1.69      x
+128    12.321       14.031         1.14      x
+256    22.562       20.355         0.90      x
+
+======================================================================
+2. Loading PyTorch baseline model (ternary)...
+======================================================================
+  Warming up PyTorch (ternary)...
+
+======================================================================
+3. Loading HuggingFace official BitNet model...
+======================================================================
+  Loading HuggingFace model: microsoft/bitnet-b1.58-2B-4T
+  Model type: bitnet
+  Loading BitNet with bfloat16 (HF recommended)
+  [!] Failed to load HuggingFace model: Loading a BitNet quantized model requires accelerate (`pip install accelerate`)
+  [!] You may need: pip install transformers>=4.48.0
+
+======================================================================
+4. Numerical Accuracy Comparison
+======================================================================
+
+  Comparing VNNI Kernels vs PyTorch baseline:
+    Max absolute difference: 2.143418
+    Mean absolute difference: 0.198202
+    Token agreement: 3/5 (60.0%)
+
+======================================================================
+5. Perplexity Evaluation (WikiText-2)
+======================================================================
+
+  VNNI Kernels:
+  Loading WikiText-2 test set...
+  Evaluating on 50 samples...
+    Perplexity: 30.08
+
+  PyTorch baseline:
+  Loading WikiText-2 test set...
+  Evaluating on 50 samples...
+    Perplexity: 30.13
+
+======================================================================
+RESULTS SUMMARY
+======================================================================
+
+Model                     TTFT (ms)    Tok/s      Memory (MB)    Perplexity  
+---------------------------------------------------------------------------
+VNNI Kernels (ternary)    193.8        1.27       9636.9         30.08       
+PyTorch (ternary)         158.3        1.05       19327.2        30.13       
+
+---------------------------------------------------------------------------
+
+Speedup vs PyTorch (ternary):
+  TTFT: 0.82x
+  Throughput: 1.21x
+
+Memory Usage:
+  VNNI Kernels: 9636.9 MB
+  PyTorch: 19327.2 MB
+
+Numerical Accuracy:
+  Max logit difference: 2.143418
+  Top-1 token agreement: 60.0%
+
+======================================================================
+Sample Outputs (quality check)
+======================================================================
+
+VNNI Kernels (ternary):
+  The future of AI is bright, and it is expected that AI will continue to evolve and improve over time. This is because
+
+PyTorch (ternary):
+  The future of AI is not just about creating machines that can think and learn, but also about creating machines that can understand and
+
+======================================================================
+Saving Results and Generating Graphs
+======================================================================
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/benchmark_results.json
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/benchmark_summary.txt
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/model_comparison.png
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/kernel_speedup.png
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/speedup_summary.png
+
+Generated files:
+  /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/benchmark_results.json
+  /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/benchmark_summary.txt
+  /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/kernel_speedup.png
+  /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/model_comparison.png
+  /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/speedup_summary.png
+
+======================================================================
+Benchmark complete!
+======================================================================

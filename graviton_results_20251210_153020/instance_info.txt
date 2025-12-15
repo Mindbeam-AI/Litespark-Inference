@@ -1,0 +1,11 @@
+Instance ID: i-070531f96e0f06105
+Instance IP: 18.234.94.119
+Instance Type: c7g.4xlarge
+Region: us-east-1
+Key File: /Users/mauriziomorri/.ssh/graviton-benchmark-key.pem
+
+SSH Command:
+ssh -i /Users/mauriziomorri/.ssh/graviton-benchmark-key.pem ec2-user@18.234.94.119
+
+Terminate Command:
+aws ec2 terminate-instances --instance-ids i-070531f96e0f06105 --region us-east-1

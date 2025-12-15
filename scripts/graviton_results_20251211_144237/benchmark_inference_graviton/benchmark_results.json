@@ -1,0 +1,73 @@
+{
+  "timestamp": "2025-12-11T22:49:33.720933",
+  "system_info": {
+    "platform": "aarch64",
+    "kernel_type": "graviton",
+    "num_threads": 16,
+    "torch_version": "2.8.0+cpu"
+  },
+  "model_benchmarks": [
+    {
+      "name": "VNNI Kernels (ternary)",
+      "mean_ttft_ms": 193.83000739990166,
+      "mean_gen_time_ms": 15741.686387799928,
+      "tokens_per_sec": 1.2705119075107696,
+      "sample_output": "The future of AI is bright, and it is expected that AI will continue to evolve and improve over time. This is because",
+      "memory_mb": 9636.8671875,
+      "peak_memory_mb": 9636.8671875,
+      "perplexity": 30.08489418029785
+    },
+    {
+      "name": "PyTorch (ternary)",
+      "mean_ttft_ms": 158.29618060024586,
+      "mean_gen_time_ms": 19073.17750860002,
+      "tokens_per_sec": 1.0485929778078185,
+      "sample_output": "The future of AI is not just about creating machines that can think and learn, but also about creating machines that can understand and",
+      "memory_mb": 19327.15234375,
+      "peak_memory_mb": 19327.15234375,
+      "perplexity": 30.130224227905273
+    }
+  ],
+  "kernel_benchmarks": {
+    "batch_sizes": [
+      1,
+      6,
+      16,
+      64,
+      128,
+      256
+    ],
+    "vnni_times": [
+      0.05109800022182753,
+      0.3065366998271202,
+      1.737190499989083,
+      6.4263125001161825,
+      12.320761800128821,
+      22.561789600149496
+    ],
+    "pytorch_times": [
+      0.34734809978544945,
+      0.9289781000916264,
+      9.080066300066392,
+      10.841012499986391,
+      14.03050369981429,
+      20.354623799903493
+    ],
+    "speedups": [
+      6.797684807184935,
+      3.0305607798855707,
+      5.226868498373352,
+      1.6869725055839402,
+      1.1387691708858125,
+      0.9021723968106068
+    ]
+  },
+  "numerical_accuracy": {
+    "max_abs_diff": 2.143418312072754,
+    "mean_abs_diff": 0.1982024133205414,
+    "matches_within_tolerance": 0,
+    "total_comparisons": 5,
+    "token_agreement": 3,
+    "total_tokens": 5
+  }
+}

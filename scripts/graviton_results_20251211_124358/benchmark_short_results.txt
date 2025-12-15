@@ -1,0 +1,181 @@
+======================================================================
+BitNet Benchmark: VNNI/Graviton Kernels vs PyTorch
+======================================================================
+Platform: aarch64
+Kernel: graviton
+Threads: 16
+
+Results will be saved to: /home/ec2-user/matmulMM/benchmark_results
+Loading tokenizer...
+
+======================================================================
+1. Loading VNNI/Graviton kernel model (ternary)...
+======================================================================
+Loading model: bitnet-2b (microsoft/bitnet-b1.58-2B-4T-bf16)
+Loading microsoft/bitnet-b1.58-2B-4T-bf16...
+`torch_dtype` is deprecated! Use `dtype` instead!
+Downloading model weights...
+Converting weights to ternary format...
+Loading tokenizer...
+  Warming up VNNI Kernels (ternary)...
+
+======================================================================
+VNNI Kernel Profiling
+======================================================================
+
+Manual timing breakdown (single forward pass):
+  Embedding: 0.13 ms
+  Layers (avg): 6.18 ms x 30 = 185.38 ms
+  Layer breakdown:
+    First 3: 4.85, 4.60, 4.60 ms
+    Last 3: 4.51, 4.58, 4.63 ms
+  Norm + LM Head: 15.20 ms
+  Total: 200.70 ms
+
+Detailed layer 0 breakdown:
+  Input norm: 0.15 ms
+  Attention: 2.10 ms
+  Post-attn norm: 0.08 ms
+  MLP: 2.53 ms
+
+Detailed attention breakdown:
+  Q proj: 0.41 ms
+  K proj: 0.33 ms
+  V proj: 0.32 ms
+  O proj: 0.38 ms
+  Total projections: 1.45 ms
+
+Detailed MLP breakdown:
+  Gate proj: 0.80 ms
+  Up proj: 0.83 ms
+  Down proj: 0.72 ms
+  Total projections: 2.35 ms
+
+======================================================================
+Quantization vs Kernel Breakdown
+======================================================================
+
+Q projection (2560 -> 2560) breakdown:
+  Full forward:     0.364 ms
+  - Quantization:   0.098 ms (27.0%)
+  - Kernel:         0.071 ms (19.6%)
+  - Scale multiply: 0.007 ms (1.8%)
+  - Other overhead: 0.187 ms
+
+Gate projection (2560 -> 6912) breakdown:
+  Full forward:     0.645 ms
+  - Quantization:   0.101 ms (15.7%)
+  - Kernel:         0.293 ms (45.5%)
+  - Other overhead: 0.250 ms
+
+Comparison with PyTorch F.linear:
+  PyTorch F.linear: 0.936 ms
+  Our kernel only:  0.293 ms
+  Kernel speedup:   3.19x
+
+======================================================================
+Kernel Performance vs Batch Size (M)
+======================================================================
+
+Gate projection shape: K=2560 -> N=6912
+M      VNNI (ms)    PyTorch (ms)   Speedup   
+---------------------------------------------
+1      0.050        0.330          6.58      x
+6      0.313        0.927          2.96      x
+16     1.711        8.409          4.91      x
+64     6.359        10.718         1.69      x
+128    10.946       13.578         1.24      x
+256    21.464       19.842         0.92      x
+
+======================================================================
+2. Loading PyTorch baseline model (ternary)...
+======================================================================
+  Warming up PyTorch (ternary)...
+
+======================================================================
+3. Loading HuggingFace official BitNet model...
+======================================================================
+  Loading HuggingFace model: microsoft/bitnet-b1.58-2B-4T
+  Model type: bitnet
+  Loading BitNet with bfloat16 (HF recommended)
+  [!] Failed to load HuggingFace model: Loading a BitNet quantized model requires accelerate (`pip install accelerate`)
+  [!] You may need: pip install transformers>=4.48.0
+
+======================================================================
+4. Numerical Accuracy Comparison
+======================================================================
+
+  Comparing VNNI Kernels vs PyTorch baseline:
+    Max absolute difference: 2.143418
+    Mean absolute difference: 0.198202
+    Token agreement: 3/5 (60.0%)
+
+======================================================================
+5. Perplexity Evaluation (WikiText-2)
+======================================================================
+
+  VNNI Kernels:
+  Loading WikiText-2 test set...
+Generating test split:   0%|          | 0/4358 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 4358/4358 [00:00<00:00, 828518.58 examples/s]
+Generating train split:   0%|          | 0/36718 [00:00<?, ? examples/s]Generating train split: 100%|██████████| 36718/36718 [00:00<00:00, 1547756.89 examples/s]
+Generating validation split:   0%|          | 0/3760 [00:00<?, ? examples/s]Generating validation split: 100%|██████████| 3760/3760 [00:00<00:00, 1094799.24 examples/s]
+  Evaluating on 50 samples...
+    Perplexity: 30.08
+
+  PyTorch baseline:
+  Loading WikiText-2 test set...
+  Evaluating on 50 samples...
+    Perplexity: 30.13
+
+======================================================================
+RESULTS SUMMARY
+======================================================================
+
+Model                     TTFT (ms)    Tok/s      Memory (MB)    Perplexity  
+---------------------------------------------------------------------------
+VNNI Kernels (ternary)    318.8        1.25       10185.5        30.08       
+PyTorch (ternary)         158.5        1.08       19874.7        30.13       
+
+---------------------------------------------------------------------------
+
+Speedup vs PyTorch (ternary):
+  TTFT: 0.50x
+  Throughput: 1.15x
+
+Memory Usage:
+  VNNI Kernels: 10185.5 MB
+  PyTorch: 19874.7 MB
+
+Numerical Accuracy:
+  Max logit difference: 2.143418
+  Top-1 token agreement: 60.0%
+
+======================================================================
+Sample Outputs (quality check)
+======================================================================
+
+VNNI Kernels (ternary):
+  The future of AI is bright, and it is expected that AI will continue to evolve and improve over time. This is because
+
+PyTorch (ternary):
+  The future of AI is not just about creating machines that can think and learn, but also about creating machines that can understand and
+
+======================================================================
+Saving Results and Generating Graphs
+======================================================================
+Saved: /home/ec2-user/matmulMM/benchmark_results/benchmark_results.json
+Saved: /home/ec2-user/matmulMM/benchmark_results/benchmark_summary.txt
+Saved: /home/ec2-user/matmulMM/benchmark_results/model_comparison.png
+Saved: /home/ec2-user/matmulMM/benchmark_results/kernel_speedup.png
+Saved: /home/ec2-user/matmulMM/benchmark_results/speedup_summary.png
+
+Generated files:
+  /home/ec2-user/matmulMM/benchmark_results/benchmark_results.json
+  /home/ec2-user/matmulMM/benchmark_results/benchmark_summary.txt
+  /home/ec2-user/matmulMM/benchmark_results/kernel_speedup.png
+  /home/ec2-user/matmulMM/benchmark_results/model_comparison.png
+  /home/ec2-user/matmulMM/benchmark_results/speedup_summary.png
+
+======================================================================
+Benchmark complete!
+======================================================================

@@ -1,0 +1,138 @@
+================================================================================
+BitNet Scaling Benchmark: Longer Prompts & Batch Sizes
+================================================================================
+Platform: aarch64
+Kernel: graviton
+Threads: 16
+
+Results will be saved to: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton
+Loading tokenizer...
+
+Loading VNNI kernel model...
+Loading model: bitnet-2b (microsoft/bitnet-b1.58-2B-4T-bf16)
+Loading microsoft/bitnet-b1.58-2B-4T-bf16...
+`torch_dtype` is deprecated! Use `dtype` instead!
+Downloading model weights...
+Converting weights to ternary format...
+Loading tokenizer...
+Loading PyTorch baseline model...
+Loading HuggingFace BitNet model...
+  Loading HuggingFace model: microsoft/bitnet-b1.58-2B-4T
+  Model type: bitnet
+  Loading BitNet with bfloat16 (HF recommended)
+  [!] Failed to load HuggingFace model: Loading a BitNet quantized model requires accelerate (`pip install accelerate`)
+
+================================================================================
+RUNNING SCALING TESTS
+================================================================================
+
+================================================================================
+PREFILL SCALING TEST (Time vs Prompt Length)
+================================================================================
+
+  Prompt length: 32 tokens
+    VNNI Kernels             :   1360.2 ms
+    PyTorch (ternary)        :   1186.6 ms
+
+  Prompt length: 128 tokens
+    VNNI Kernels             :   2509.1 ms
+    PyTorch (ternary)        :   1806.1 ms
+
+  Prompt length: 256 tokens
+    VNNI Kernels             :   3994.8 ms
+    PyTorch (ternary)        :   2654.5 ms
+
+  Prompt length: 512 tokens
+    VNNI Kernels             :   6987.9 ms
+    PyTorch (ternary)        :   4481.9 ms
+
+--------------------------------------------------------------------------------
+Summary: Prefill Time (ms)
+--------------------------------------------------------------------------------
+Model                            32 tok       128 tok       256 tok       512 tok
+--------------------------------------------------------------------------------
+VNNI Kernels                 1360.2      2509.1      3994.8      6987.9  
+PyTorch (ternary)            1186.6      1806.1      2654.5      4481.9  
+
+--------------------------------------------------------------------------------
+Speedup: VNNI vs PyTorch
+--------------------------------------------------------------------------------
+Prompt Length               32 tok       128 tok       256 tok       512 tok
+Speedup                   0.87x       0.72x       0.66x       0.64x 
+
+================================================================================
+BATCH SCALING TEST (Throughput vs Batch Size, prompt=128 tokens)
+================================================================================
+
+  Batch size: 1
+    VNNI Kernels             :   2510.6 ms,       51 tok/s
+    PyTorch (ternary)        :   1807.4 ms,       71 tok/s
+
+  Batch size: 2
+    VNNI Kernels             :   4026.2 ms,       64 tok/s
+    PyTorch (ternary)        :   2689.1 ms,       95 tok/s
+
+  Batch size: 4
+    VNNI Kernels             :   6820.6 ms,       75 tok/s
+    PyTorch (ternary)        :   4368.7 ms,      117 tok/s
+
+  Batch size: 8
+    VNNI Kernels             :  12952.5 ms,       79 tok/s
+    PyTorch (ternary)        :   8340.8 ms,      123 tok/s
+
+  Batch size: 16
+    VNNI Kernels             :  26390.8 ms,       78 tok/s
+    PyTorch (ternary)        :  16640.1 ms,      123 tok/s
+
+--------------------------------------------------------------------------------
+Summary: Prefill Throughput (tokens/sec)
+--------------------------------------------------------------------------------
+Model                             B=1         B=2         B=4         B=8        B=16
+--------------------------------------------------------------------------------
+VNNI Kernels                       51          64          75          79          78
+PyTorch (ternary)                  71          95         117         123         123
+
+================================================================================
+GENERATION SCALING TEST (prompt=32 tokens)
+================================================================================
+
+  Generate 20 tokens:
+    VNNI Kernels             :  27475.2 ms,    0.7 tok/s
+    PyTorch (ternary)        :  25181.5 ms,    0.8 tok/s
+
+  Generate 50 tokens:
+    VNNI Kernels             :  79110.6 ms,    0.6 tok/s
+    PyTorch (ternary)        :  67483.8 ms,    0.7 tok/s
+
+  Generate 100 tokens:
+    VNNI Kernels             : 191578.6 ms,    0.5 tok/s
+    PyTorch (ternary)        : 152640.9 ms,    0.7 tok/s
+
+--------------------------------------------------------------------------------
+Summary: Generation Throughput (tokens/sec)
+--------------------------------------------------------------------------------
+Model                          Gen 20      Gen 50     Gen 100
+--------------------------------------------------------------------------------
+VNNI Kernels                      0.7         0.6         0.5
+PyTorch (ternary)                 0.8         0.7         0.7
+
+================================================================================
+FINAL SUMMARY
+================================================================================
+
+Key findings:
+  - prefill_512_tokens: 0.64x faster than PyTorch
+  - batch_16_throughput: 0.63x faster than PyTorch
+  - generation_50_tokens: 0.85x faster than PyTorch
+
+Results saved to: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/benchmark_long_results.json
+Summary saved to: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/benchmark_long_summary.txt
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/prefill_scaling.png
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/batch_scaling.png
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/generation_scaling.png
+Saved: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton/speedup_summary_long.png
+
+================================================================================
+Benchmark complete!
+Results saved to: /home/ec2-user/matmulMM/inference/benchmark_inference_graviton
+================================================================================

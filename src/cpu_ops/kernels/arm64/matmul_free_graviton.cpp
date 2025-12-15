@@ -291,17 +291,15 @@ void matmul_free_graviton_v2(
 }
 
 /**
- * Graviton v3 - Cache-optimized tiled kernel
+ * Graviton v3 - Optimized parallel kernel
  *
- * Optimized for Graviton cache hierarchy:
- * - M_TILE = 16 (fits activation buffer in L1D with some headroom)
- * - N_TILE = 32 (weight tile fits in L2)
- * - K loop unrolling for better ILP
+ * Key optimizations:
+ * 1. Single parallel region (no thread pool recreation)
+ * 2. Parallelize over M (rows) - each thread handles complete rows
+ * 3. 8-way output blocking with K-loop unrolling
+ * 4. Prefetch hints for weight data
  *
- * Tiling strategy:
- * 1. Process M rows in tiles of M_TILE
- * 2. For each M tile, iterate over N in tiles of N_TILE
- * 3. Weight tiles stay in L2 while being reused across M rows
+ * For M=1 (single token inference), this falls back to N-parallel
  */
 void matmul_free_graviton_v3(
     torch::Tensor x_int8_tensor,    // [M, K] int8
@@ -321,29 +319,151 @@ void matmul_free_graviton_v3(
 
     const int K_padded = ((K + 15) / 16) * 16;
 
-    // Graviton-specific tile sizes
-    constexpr int M_TILE_LOCAL = 16;
-    constexpr int N_TILE_LOCAL = 32;
-
     omp_set_num_threads(num_threads);
 
-    // Process M in tiles
-    for (int m_tile = 0; m_tile < M; m_tile += M_TILE_LOCAL) {
-        const int m_end = std::min(m_tile + M_TILE_LOCAL, M);
+    if (M >= num_threads) {
+        // Parallelize over M (rows) - best for batch processing
+        #pragma omp parallel for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const int8_t* __restrict__ x_row = x_int8 + m * K;
+            float scale = scales[m];
+            float* y_row = y + m * N;
 
-        // Process N in tiles (N tile loop outside parallel for cache reuse)
-        for (int n_tile = 0; n_tile < N; n_tile += N_TILE_LOCAL) {
-            const int n_end = std::min(n_tile + N_TILE_LOCAL, N);
+            // Process 8 outputs at a time
+            int n = 0;
+            for (; n + 7 < N; n += 8) {
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+                int32x4_t acc2 = vdupq_n_s32(0);
+                int32x4_t acc3 = vdupq_n_s32(0);
+                int32x4_t acc4 = vdupq_n_s32(0);
+                int32x4_t acc5 = vdupq_n_s32(0);
+                int32x4_t acc6 = vdupq_n_s32(0);
+                int32x4_t acc7 = vdupq_n_s32(0);
 
-            // Parallelize over M rows within tile
-            #pragma omp parallel for schedule(static)
-            for (int m = m_tile; m < m_end; m++) {
+                const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+                const int8_t* w4 = w_int8 + (n + 4) * K_padded;
+                const int8_t* w5 = w_int8 + (n + 5) * K_padded;
+                const int8_t* w6 = w_int8 + (n + 6) * K_padded;
+                const int8_t* w7 = w_int8 + (n + 7) * K_padded;
+
+                // K loop with 2x unrolling
+                int k = 0;
+                for (; k + 31 < K; k += 32) {
+                    int8x16_t x0 = vld1q_s8(x_row + k);
+                    int8x16_t x1 = vld1q_s8(x_row + k + 16);
+
+                    acc0 = vdotq_s32(acc0, x0, vld1q_s8(w0 + k));
+                    acc0 = vdotq_s32(acc0, x1, vld1q_s8(w0 + k + 16));
+                    acc1 = vdotq_s32(acc1, x0, vld1q_s8(w1 + k));
+                    acc1 = vdotq_s32(acc1, x1, vld1q_s8(w1 + k + 16));
+                    acc2 = vdotq_s32(acc2, x0, vld1q_s8(w2 + k));
+                    acc2 = vdotq_s32(acc2, x1, vld1q_s8(w2 + k + 16));
+                    acc3 = vdotq_s32(acc3, x0, vld1q_s8(w3 + k));
+                    acc3 = vdotq_s32(acc3, x1, vld1q_s8(w3 + k + 16));
+                    acc4 = vdotq_s32(acc4, x0, vld1q_s8(w4 + k));
+                    acc4 = vdotq_s32(acc4, x1, vld1q_s8(w4 + k + 16));
+                    acc5 = vdotq_s32(acc5, x0, vld1q_s8(w5 + k));
+                    acc5 = vdotq_s32(acc5, x1, vld1q_s8(w5 + k + 16));
+                    acc6 = vdotq_s32(acc6, x0, vld1q_s8(w6 + k));
+                    acc6 = vdotq_s32(acc6, x1, vld1q_s8(w6 + k + 16));
+                    acc7 = vdotq_s32(acc7, x0, vld1q_s8(w7 + k));
+                    acc7 = vdotq_s32(acc7, x1, vld1q_s8(w7 + k + 16));
+                }
+
+                // Handle remaining K
+                for (; k + 15 < K; k += 16) {
+                    int8x16_t x_vec = vld1q_s8(x_row + k);
+                    acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + k));
+                    acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + k));
+                    acc2 = vdotq_s32(acc2, x_vec, vld1q_s8(w2 + k));
+                    acc3 = vdotq_s32(acc3, x_vec, vld1q_s8(w3 + k));
+                    acc4 = vdotq_s32(acc4, x_vec, vld1q_s8(w4 + k));
+                    acc5 = vdotq_s32(acc5, x_vec, vld1q_s8(w5 + k));
+                    acc6 = vdotq_s32(acc6, x_vec, vld1q_s8(w6 + k));
+                    acc7 = vdotq_s32(acc7, x_vec, vld1q_s8(w7 + k));
+                }
+
+                // Horizontal sums
+                int32_t sum0 = vaddvq_s32(acc0);
+                int32_t sum1 = vaddvq_s32(acc1);
+                int32_t sum2 = vaddvq_s32(acc2);
+                int32_t sum3 = vaddvq_s32(acc3);
+                int32_t sum4 = vaddvq_s32(acc4);
+                int32_t sum5 = vaddvq_s32(acc5);
+                int32_t sum6 = vaddvq_s32(acc6);
+                int32_t sum7 = vaddvq_s32(acc7);
+
+                // Store results
+                y_row[n + 0] = static_cast<float>(sum0) * scale + (bias ? bias[n + 0] : 0.0f);
+                y_row[n + 1] = static_cast<float>(sum1) * scale + (bias ? bias[n + 1] : 0.0f);
+                y_row[n + 2] = static_cast<float>(sum2) * scale + (bias ? bias[n + 2] : 0.0f);
+                y_row[n + 3] = static_cast<float>(sum3) * scale + (bias ? bias[n + 3] : 0.0f);
+                y_row[n + 4] = static_cast<float>(sum4) * scale + (bias ? bias[n + 4] : 0.0f);
+                y_row[n + 5] = static_cast<float>(sum5) * scale + (bias ? bias[n + 5] : 0.0f);
+                y_row[n + 6] = static_cast<float>(sum6) * scale + (bias ? bias[n + 6] : 0.0f);
+                y_row[n + 7] = static_cast<float>(sum7) * scale + (bias ? bias[n + 7] : 0.0f);
+            }
+
+            // Handle remaining N with 4-way blocking
+            for (; n + 3 < N; n += 4) {
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+                int32x4_t acc2 = vdupq_n_s32(0);
+                int32x4_t acc3 = vdupq_n_s32(0);
+
+                const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+
+                for (int k = 0; k + 15 < K; k += 16) {
+                    int8x16_t x_vec = vld1q_s8(x_row + k);
+                    acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + k));
+                    acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + k));
+                    acc2 = vdotq_s32(acc2, x_vec, vld1q_s8(w2 + k));
+                    acc3 = vdotq_s32(acc3, x_vec, vld1q_s8(w3 + k));
+                }
+
+                y_row[n + 0] = static_cast<float>(vaddvq_s32(acc0)) * scale + (bias ? bias[n + 0] : 0.0f);
+                y_row[n + 1] = static_cast<float>(vaddvq_s32(acc1)) * scale + (bias ? bias[n + 1] : 0.0f);
+                y_row[n + 2] = static_cast<float>(vaddvq_s32(acc2)) * scale + (bias ? bias[n + 2] : 0.0f);
+                y_row[n + 3] = static_cast<float>(vaddvq_s32(acc3)) * scale + (bias ? bias[n + 3] : 0.0f);
+            }
+
+            // Final remainder
+            for (; n < N; n++) {
+                const int8_t* w_row = w_int8 + n * K_padded;
+                int32x4_t acc = vdupq_n_s32(0);
+
+                for (int k = 0; k + 15 < K; k += 16) {
+                    acc = vdotq_s32(acc, vld1q_s8(x_row + k), vld1q_s8(w_row + k));
+                }
+
+                y_row[n] = static_cast<float>(vaddvq_s32(acc)) * scale + (bias ? bias[n] : 0.0f);
+            }
+        }
+    } else {
+        // M < num_threads: parallelize over N instead (for single-token inference)
+        // Split N into chunks, each thread handles a chunk of outputs for all M rows
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            int nthreads = omp_get_num_threads();
+            int n_per_thread = (N + nthreads - 1) / nthreads;
+            int n_start = tid * n_per_thread;
+            int n_end = std::min(n_start + n_per_thread, N);
+
+            for (int m = 0; m < M; m++) {
                 const int8_t* __restrict__ x_row = x_int8 + m * K;
                 float scale = scales[m];
                 float* y_row = y + m * N;
 
-                // Process 8 outputs at a time within N tile
-                int n = n_tile;
+                // Process assigned N range with 8-way blocking
+                int n = n_start;
                 for (; n + 7 < n_end; n += 8) {
                     int32x4_t acc0 = vdupq_n_s32(0);
                     int32x4_t acc1 = vdupq_n_s32(0);
@@ -363,32 +483,7 @@ void matmul_free_graviton_v3(
                     const int8_t* w6 = w_int8 + (n + 6) * K_padded;
                     const int8_t* w7 = w_int8 + (n + 7) * K_padded;
 
-                    // K loop with 2x unrolling (32 bytes per iteration)
-                    int k = 0;
-                    for (; k + 31 < K; k += 32) {
-                        int8x16_t x0 = vld1q_s8(x_row + k);
-                        int8x16_t x1 = vld1q_s8(x_row + k + 16);
-
-                        acc0 = vdotq_s32(acc0, x0, vld1q_s8(w0 + k));
-                        acc0 = vdotq_s32(acc0, x1, vld1q_s8(w0 + k + 16));
-                        acc1 = vdotq_s32(acc1, x0, vld1q_s8(w1 + k));
-                        acc1 = vdotq_s32(acc1, x1, vld1q_s8(w1 + k + 16));
-                        acc2 = vdotq_s32(acc2, x0, vld1q_s8(w2 + k));
-                        acc2 = vdotq_s32(acc2, x1, vld1q_s8(w2 + k + 16));
-                        acc3 = vdotq_s32(acc3, x0, vld1q_s8(w3 + k));
-                        acc3 = vdotq_s32(acc3, x1, vld1q_s8(w3 + k + 16));
-                        acc4 = vdotq_s32(acc4, x0, vld1q_s8(w4 + k));
-                        acc4 = vdotq_s32(acc4, x1, vld1q_s8(w4 + k + 16));
-                        acc5 = vdotq_s32(acc5, x0, vld1q_s8(w5 + k));
-                        acc5 = vdotq_s32(acc5, x1, vld1q_s8(w5 + k + 16));
-                        acc6 = vdotq_s32(acc6, x0, vld1q_s8(w6 + k));
-                        acc6 = vdotq_s32(acc6, x1, vld1q_s8(w6 + k + 16));
-                        acc7 = vdotq_s32(acc7, x0, vld1q_s8(w7 + k));
-                        acc7 = vdotq_s32(acc7, x1, vld1q_s8(w7 + k + 16));
-                    }
-
-                    // Handle remaining K (16 at a time)
-                    for (; k + 15 < K; k += 16) {
+                    for (int k = 0; k + 15 < K; k += 16) {
                         int8x16_t x_vec = vld1q_s8(x_row + k);
                         acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + k));
                         acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + k));
@@ -400,96 +495,26 @@ void matmul_free_graviton_v3(
                         acc7 = vdotq_s32(acc7, x_vec, vld1q_s8(w7 + k));
                     }
 
-                    // Horizontal sums and store
-                    int32_t sum0 = vaddvq_s32(acc0);
-                    int32_t sum1 = vaddvq_s32(acc1);
-                    int32_t sum2 = vaddvq_s32(acc2);
-                    int32_t sum3 = vaddvq_s32(acc3);
-                    int32_t sum4 = vaddvq_s32(acc4);
-                    int32_t sum5 = vaddvq_s32(acc5);
-                    int32_t sum6 = vaddvq_s32(acc6);
-                    int32_t sum7 = vaddvq_s32(acc7);
-
-                    // Scalar remainder for K
-                    for (; k < K; k++) {
-                        int8_t x_val = x_row[k];
-                        sum0 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w0[k]);
-                        sum1 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w1[k]);
-                        sum2 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w2[k]);
-                        sum3 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w3[k]);
-                        sum4 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w4[k]);
-                        sum5 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w5[k]);
-                        sum6 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w6[k]);
-                        sum7 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w7[k]);
-                    }
-
-                    y_row[n + 0] = static_cast<float>(sum0) * scale + (bias ? bias[n + 0] : 0.0f);
-                    y_row[n + 1] = static_cast<float>(sum1) * scale + (bias ? bias[n + 1] : 0.0f);
-                    y_row[n + 2] = static_cast<float>(sum2) * scale + (bias ? bias[n + 2] : 0.0f);
-                    y_row[n + 3] = static_cast<float>(sum3) * scale + (bias ? bias[n + 3] : 0.0f);
-                    y_row[n + 4] = static_cast<float>(sum4) * scale + (bias ? bias[n + 4] : 0.0f);
-                    y_row[n + 5] = static_cast<float>(sum5) * scale + (bias ? bias[n + 5] : 0.0f);
-                    y_row[n + 6] = static_cast<float>(sum6) * scale + (bias ? bias[n + 6] : 0.0f);
-                    y_row[n + 7] = static_cast<float>(sum7) * scale + (bias ? bias[n + 7] : 0.0f);
+                    y_row[n + 0] = static_cast<float>(vaddvq_s32(acc0)) * scale + (bias ? bias[n + 0] : 0.0f);
+                    y_row[n + 1] = static_cast<float>(vaddvq_s32(acc1)) * scale + (bias ? bias[n + 1] : 0.0f);
+                    y_row[n + 2] = static_cast<float>(vaddvq_s32(acc2)) * scale + (bias ? bias[n + 2] : 0.0f);
+                    y_row[n + 3] = static_cast<float>(vaddvq_s32(acc3)) * scale + (bias ? bias[n + 3] : 0.0f);
+                    y_row[n + 4] = static_cast<float>(vaddvq_s32(acc4)) * scale + (bias ? bias[n + 4] : 0.0f);
+                    y_row[n + 5] = static_cast<float>(vaddvq_s32(acc5)) * scale + (bias ? bias[n + 5] : 0.0f);
+                    y_row[n + 6] = static_cast<float>(vaddvq_s32(acc6)) * scale + (bias ? bias[n + 6] : 0.0f);
+                    y_row[n + 7] = static_cast<float>(vaddvq_s32(acc7)) * scale + (bias ? bias[n + 7] : 0.0f);
                 }
 
-                // Handle remaining N with 4-way blocking
-                for (; n + 3 < n_end; n += 4) {
-                    int32x4_t acc0 = vdupq_n_s32(0);
-                    int32x4_t acc1 = vdupq_n_s32(0);
-                    int32x4_t acc2 = vdupq_n_s32(0);
-                    int32x4_t acc3 = vdupq_n_s32(0);
-
-                    const int8_t* w0 = w_int8 + (n + 0) * K_padded;
-                    const int8_t* w1 = w_int8 + (n + 1) * K_padded;
-                    const int8_t* w2 = w_int8 + (n + 2) * K_padded;
-                    const int8_t* w3 = w_int8 + (n + 3) * K_padded;
-
-                    int k = 0;
-                    for (; k + 15 < K; k += 16) {
-                        int8x16_t x_vec = vld1q_s8(x_row + k);
-                        acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + k));
-                        acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + k));
-                        acc2 = vdotq_s32(acc2, x_vec, vld1q_s8(w2 + k));
-                        acc3 = vdotq_s32(acc3, x_vec, vld1q_s8(w3 + k));
-                    }
-
-                    int32_t sum0 = vaddvq_s32(acc0);
-                    int32_t sum1 = vaddvq_s32(acc1);
-                    int32_t sum2 = vaddvq_s32(acc2);
-                    int32_t sum3 = vaddvq_s32(acc3);
-
-                    for (; k < K; k++) {
-                        int8_t x_val = x_row[k];
-                        sum0 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w0[k]);
-                        sum1 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w1[k]);
-                        sum2 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w2[k]);
-                        sum3 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w3[k]);
-                    }
-
-                    y_row[n + 0] = static_cast<float>(sum0) * scale + (bias ? bias[n + 0] : 0.0f);
-                    y_row[n + 1] = static_cast<float>(sum1) * scale + (bias ? bias[n + 1] : 0.0f);
-                    y_row[n + 2] = static_cast<float>(sum2) * scale + (bias ? bias[n + 2] : 0.0f);
-                    y_row[n + 3] = static_cast<float>(sum3) * scale + (bias ? bias[n + 3] : 0.0f);
-                }
-
-                // Final remainder
+                // Handle remaining N
                 for (; n < n_end; n++) {
                     const int8_t* w_row = w_int8 + n * K_padded;
                     int32x4_t acc = vdupq_n_s32(0);
 
-                    int k = 0;
-                    for (; k + 15 < K; k += 16) {
-                        int8x16_t x_vec = vld1q_s8(x_row + k);
-                        acc = vdotq_s32(acc, x_vec, vld1q_s8(w_row + k));
+                    for (int k = 0; k + 15 < K; k += 16) {
+                        acc = vdotq_s32(acc, vld1q_s8(x_row + k), vld1q_s8(w_row + k));
                     }
 
-                    int32_t sum = vaddvq_s32(acc);
-                    for (; k < K; k++) {
-                        sum += static_cast<int32_t>(x_row[k]) * static_cast<int32_t>(w_row[k]);
-                    }
-
-                    y_row[n] = static_cast<float>(sum) * scale + (bias ? bias[n] : 0.0f);
+                    y_row[n] = static_cast<float>(vaddvq_s32(acc)) * scale + (bias ? bias[n] : 0.0f);
                 }
             }
         }

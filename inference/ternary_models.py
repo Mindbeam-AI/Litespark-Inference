@@ -158,7 +158,10 @@ def get_k_padding() -> int:
 
 
 def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize float activation to int8 with per-row scaling."""
+    """Quantize float activation to int8 with per-row scaling.
+
+    Optimized version that minimizes intermediate tensor allocations.
+    """
     if x.dim() == 1:
         x = x.unsqueeze(0)
 
@@ -166,12 +169,23 @@ def quantize_activation(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     k_pad = get_k_padding()
     K_padded = ((K + k_pad - 1) // k_pad) * k_pad
 
+    # Compute scale: fused max and division
     max_abs = x.abs().max(dim=1, keepdim=True).values
     scale = max_abs / 127.0
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    # Avoid division by zero - use clamp instead of where (faster)
+    scale = scale.clamp(min=1e-10)
 
-    x_int8 = torch.zeros(M, K_padded, dtype=torch.int8)
-    x_int8[:, :K] = (x / scale).round().clamp(-127, 127).to(torch.int8)
+    # Fused quantization: multiply by inverse scale, round, clamp, convert
+    # Using multiplication instead of division is faster
+    inv_scale = 1.0 / scale
+
+    if K_padded == K:
+        # No padding needed - direct conversion
+        x_int8 = (x * inv_scale).round().clamp(-127, 127).to(torch.int8)
+    else:
+        # Need padding - use F.pad which is optimized
+        x_scaled = (x * inv_scale).round().clamp(-127, 127).to(torch.int8)
+        x_int8 = F.pad(x_scaled, (0, K_padded - K), value=0)
 
     return x_int8.contiguous(), scale.squeeze(1).contiguous()
 
