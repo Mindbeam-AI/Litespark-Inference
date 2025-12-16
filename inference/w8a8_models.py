@@ -449,7 +449,7 @@ def load_w8a8_ternary_model(
 
             # Set the ternary weights
             N, K = w_float.shape
-            K_padded = ptq_linear.K_padded
+            K_padded = ((K + 63) // 64) * 64  # Pad to multiple of 64
 
             ptq_linear.w_int8 = torch.zeros(N, K_padded, dtype=torch.int8)
             ptq_linear.w_int8[:, :K] = w_ternary
