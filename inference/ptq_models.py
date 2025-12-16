@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import platform
 from pathlib import Path
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple, Any, List
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
