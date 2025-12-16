@@ -191,28 +191,53 @@ class PTQTernaryLinear(nn.Module):
         # Get kernel
         kernel, kernel_type = get_kernel()
 
-        # For QuIP, the output of the kernel will have a different dimension
-        output_features = self.U.shape[0] if self.quip_info else self.out_features
+        # For QuIP: W' = W @ U.T was stored, so we need x' = x @ U first
+        # Then y = x' @ W'.T = (x @ U) @ (W @ U.T).T = x @ U @ U.T @ W.T = x @ W.T (since U is orthogonal)
+        # Actually: y = x' @ W'.T and we need y = x @ W.T
+        # W' = W @ U.T, so W'.T = U @ W.T
+        # x @ W'.T = x @ U @ W.T... that's not what we want
+        # We want: x @ W.T = x @ W'.T @ U.T.T = x @ W'.T @ U = (x @ W'.T) @ U
+        # So: transform output by U, not input
+        # But U is [K, K] and y is [M, N]... dimensions don't match for post-multiply
+        #
+        # Let's reconsider: W' = W @ U.T where W is [N, K], U is [K, K]
+        # So W' is [N, K] too
+        # y = x @ W.T where x is [M, K] and W is [N, K], so y is [M, N]
+        # With QuIP: y' = x @ W'.T = x @ (W @ U.T).T = x @ U @ W.T
+        # So y' = (x @ U) @ W.T, meaning we need to pre-transform x, not post-transform y
+        #
+        # To get correct y = x @ W.T from y' = x @ U @ W.T:
+        # We need to pre-transform: x_transformed = x @ U, then y = x_transformed @ W'.T... no wait
+        #
+        # Actually the math: W' = W @ U.T
+        # We store W' and want to compute y = x @ W.T
+        # y' = x @ W'.T = x @ (W @ U.T).T = x @ U @ W.T
+        # This is NOT equal to x @ W.T unless U = I
+        #
+        # The trick: we transform INPUT by U.T before kernel:
+        # x' = x @ U.T
+        # y = x' @ W'.T = (x @ U.T) @ (W @ U.T).T = x @ U.T @ U @ W.T = x @ W.T (since U.T @ U = I)
+        # YES! Pre-transform input by U.T
+
+        # Save original x for LoRC (before any transforms)
+        x_for_lorc = x if (self.lorc_L is not None) else None
+
+        if self.U is not None:
+            # QuIP: pre-transform input by U.T to undo the column transform
+            x = x @ self.U.T
 
         if kernel_type == 'fallback':
             # PyTorch fallback for macOS - use reconstructed float weights
             w_float = self.w_int8[:, :self.in_features].float() * self.scale
-            
-            # Reconstruct QuIP weights if needed
-            if self.quip_info and self.U is not None:
-                # Reconstruct original weight matrix W = W_transformed @ U
-                w_float = w_float @ self.U
-            
             y = F.linear(x, w_float, self.bias)
         else:
-            # Quantize activations
+            # Quantize activations (after QuIP transform if applicable)
             x_int8, x_scale = self._quantize_activation(x)
-            
-            # Allocate output
-            y = torch.zeros(M, output_features, dtype=torch.float32)
 
-            # Bias is handled differently with QuIP post-transform
-            bias = self.bias if self.bias is not None and not self.quip_info else torch.Tensor()
+            # Allocate output
+            y = torch.zeros(M, self.out_features, dtype=torch.float32)
+
+            bias = self.bias if self.bias is not None else torch.Tensor()
 
             # Call kernel
             if kernel_type == 'vnni':
@@ -220,31 +245,24 @@ class PTQTernaryLinear(nn.Module):
                     x_int8, x_scale,
                     self.w_int8, self.w_sum,
                     y, bias,
-                    M, output_features, self.w_int8.shape[1], self.num_threads
+                    M, self.out_features, self.w_int8.shape[1], self.num_threads
                 )
             else:  # graviton
                 kernel.matmul_free_graviton_v3(
                     x_int8, x_scale,
                     self.w_int8, self.w_sum,
                     y, bias,
-                    M, output_features, self.w_int8.shape[1], self.num_threads
+                    M, self.out_features, self.w_int8.shape[1], self.num_threads
                 )
 
             # Apply weight scale
             y = y * self.scale
-        
-        # Apply QuIP post-transform to output if needed
-        if self.quip_info and self.U is not None:
-            y = y @ self.U
-            # Add bias after transform
-            if self.bias is not None:
-                y += self.bias
 
         # Apply LoRC (Low-Rank Compensation) if available
         # y_corrected = y + (x @ L) @ R
+        # Use original x (before QuIP transform) for LoRC
         if self.lorc_L is not None and self.lorc_R is not None:
-            x_orig = x.view(-1, self.in_features)  # Use original (non-quantized) input
-            lorc_correction = (x_orig @ self.lorc_L) @ self.lorc_R
+            lorc_correction = (x_for_lorc @ self.lorc_L) @ self.lorc_R
             y = y + lorc_correction
 
         # Reshape output
