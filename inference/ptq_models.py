@@ -142,6 +142,9 @@ class PTQTernaryLinear(nn.Module):
         self.register_buffer('lorc_L', None)
         self.register_buffer('lorc_R', None)
 
+        # Per-channel weight scales (for perchannel quantization methods)
+        self.register_buffer('scale_w', None)  # [N] tensor or None
+
 
     def quantize_from_linear(
         self,
@@ -178,6 +181,8 @@ class PTQTernaryLinear(nn.Module):
             if 'lorc_L' in extra_info:  # LoRC compensation
                 self.lorc_L = extra_info['lorc_L'].to(weight.device)
                 self.lorc_R = extra_info['lorc_R'].to(weight.device)
+            if 'scale_w' in extra_info:  # Per-channel weight scales
+                self.scale_w = extra_info['scale_w'].to(weight.device)
 
 
         # Copy bias if present
@@ -232,7 +237,11 @@ class PTQTernaryLinear(nn.Module):
             # PyTorch fallback for macOS OR FP16 activations mode
             # Use reconstructed float weights with FP16/FP32 activations
             # This avoids activation quantization error while still using ternary weights
-            w_float = self.w_int8[:, :self.in_features].float() * self.scale
+            if self.scale_w is not None:
+                # Per-channel scaling: w_float[n, k] = w_int8[n, k] * scale_w[n]
+                w_float = self.w_int8[:, :self.in_features].float() * self.scale_w.unsqueeze(1)
+            else:
+                w_float = self.w_int8[:, :self.in_features].float() * self.scale
             y = F.linear(x, w_float, self.bias)
         else:
             # Quantize activations (after QuIP transform if applicable)
@@ -259,8 +268,12 @@ class PTQTernaryLinear(nn.Module):
                     M, self.out_features, self.w_int8.shape[1], self.num_threads
                 )
 
-            # Apply weight scale
-            y = y * self.scale
+            # Apply weight scale (per-channel or scalar)
+            if self.scale_w is not None:
+                # Per-channel: y[m, n] = y[m, n] * scale_w[n]
+                y = y * self.scale_w.unsqueeze(0)
+            else:
+                y = y * self.scale
 
         # Apply LoRC (Low-Rank Compensation) if available
         # y_corrected = y + (x @ L) @ R

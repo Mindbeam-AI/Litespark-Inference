@@ -760,6 +760,9 @@ def compare_all_methods(
         'absmean_fp16act',  # Ternary weights + FP16 activations
         'pt2_lorc32',  # PT2 with high-rank LoRC
         'pt2_lorc64',  # PT2 with very high-rank LoRC
+        # Per-channel scaling methods (KEY for PTQ quality!)
+        'perchannel',  # Per-channel (per-row) weight scaling
+        'perchannel_hessian',  # Per-channel + Hessian-weighted rounding
         # Mixed precision
         'mixed_attention',  # Keep attention layers in higher precision
         # Auto methods with different LoRC ranks

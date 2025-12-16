@@ -86,6 +86,175 @@ def quantize_to_ternary_absmean(
     return w_ternary, scale, stats
 
 
+def quantize_to_ternary_perchannel(
+    weight: torch.Tensor,
+    threshold_ratio: float = 0.5
+) -> Tuple[torch.Tensor, torch.Tensor, QuantizationStats]:
+    """
+    Quantize weight tensor to ternary {-1, 0, +1} with PER-CHANNEL (per-row) scaling.
+
+    This is the key method for PTQ - each output channel gets its own scale factor,
+    which dramatically improves quantization quality compared to per-tensor scaling.
+
+    For weight matrix W[N, K] (out_features, in_features):
+    - scale[n] = mean(|W[n, :]|) for each row n
+    - W_ternary[n, k] = round(W[n,k] / scale[n]).clamp(-1, 1)
+
+    Args:
+        weight: [N, K] Float tensor to quantize
+        threshold_ratio: Values within this ratio of scale become 0 (default 0.5)
+
+    Returns:
+        w_ternary: [N, K] Ternary tensor {-1, 0, +1} as int8
+        scale_w: [N] Per-channel scaling factors
+        stats: Quantization statistics (uses mean scale for summary)
+    """
+    N, K = weight.shape
+
+    # Compute per-channel (per-row) scale
+    # scale[n] = mean(|W[n, :]|)
+    abs_row_mean = weight.abs().mean(dim=1)  # [N]
+
+    # Handle zero rows
+    abs_row_mean = torch.clamp(abs_row_mean, min=1e-10)
+    scale_w = abs_row_mean  # [N]
+
+    # Normalize each row by its scale
+    # W_normalized[n, k] = W[n, k] / scale[n]
+    w_normalized = weight / scale_w.unsqueeze(1)  # [N, K]
+
+    # Apply threshold for zeros
+    threshold = threshold_ratio
+    w_ternary = torch.zeros_like(weight, dtype=torch.int8)
+    w_ternary[w_normalized > threshold] = 1
+    w_ternary[w_normalized < -threshold] = -1
+
+    # Compute statistics
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (w_ternary != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+
+    # MSE for reconstruction quality (using per-channel scales)
+    w_reconstructed = w_ternary.float() * scale_w.unsqueeze(1)
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+
+    # Use mean scale for stats summary
+    mean_scale = scale_w.mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=mean_scale,
+        mse=mse
+    )
+
+    return w_ternary, scale_w, stats
+
+
+def quantize_to_ternary_perchannel_hessian(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    threshold_ratio: float = 0.5,
+    damping: float = 0.01
+) -> Tuple[torch.Tensor, torch.Tensor, QuantizationStats]:
+    """
+    Per-channel ternary quantization with Hessian-weighted rounding.
+
+    Uses calibration data to compute importance of each column:
+    H_diag[k] = sum over samples of X[:, k]^2
+
+    When rounding, we weight the decision by column importance.
+
+    Args:
+        weight: [N, K] Float tensor to quantize
+        calibration_activations: List of [batch, K] activation tensors
+        threshold_ratio: Values within this ratio of scale become 0
+        damping: Regularization for Hessian diagonal
+
+    Returns:
+        w_ternary: [N, K] Ternary tensor {-1, 0, +1} as int8
+        scale_w: [N] Per-channel scaling factors
+        stats: Quantization statistics
+    """
+    N, K = weight.shape
+
+    # Compute Hessian diagonal from calibration data
+    if calibration_activations is not None and len(calibration_activations) > 0:
+        H_diag = torch.zeros(K, dtype=torch.float32, device=weight.device)
+        n_samples = 0
+        for X in calibration_activations:
+            if X.dim() == 3:  # [batch, seq, K]
+                X = X.reshape(-1, K)
+            H_diag += (X ** 2).sum(dim=0)
+            n_samples += X.shape[0]
+        H_diag = H_diag / max(n_samples, 1)
+        H_diag = H_diag + damping * H_diag.mean()  # Damping
+    else:
+        # No calibration data - use uniform importance
+        H_diag = torch.ones(K, dtype=torch.float32, device=weight.device)
+
+    # Normalize importance weights
+    H_diag = H_diag / H_diag.max()
+
+    # Compute per-channel scale using importance-weighted mean
+    # More important columns contribute more to the scale
+    weighted_abs = weight.abs() * H_diag.unsqueeze(0)  # [N, K]
+    scale_w = weighted_abs.sum(dim=1) / H_diag.sum()  # [N]
+    scale_w = torch.clamp(scale_w, min=1e-10)
+
+    # Normalize
+    w_normalized = weight / scale_w.unsqueeze(1)  # [N, K]
+
+    # Hessian-weighted rounding
+    # For values near threshold, use Hessian to decide
+    threshold = threshold_ratio
+    w_ternary = torch.zeros_like(weight, dtype=torch.int8)
+
+    # Clear positive/negative
+    w_ternary[w_normalized > threshold] = 1
+    w_ternary[w_normalized < -threshold] = -1
+
+    # For borderline values, use Hessian-weighted decision
+    # If rounding to 1/-1 would cause large error on important columns, round to 0
+    borderline_pos = (w_normalized > 0) & (w_normalized <= threshold)
+    borderline_neg = (w_normalized < 0) & (w_normalized >= -threshold)
+
+    # Error if we round to 1 vs 0: |w_norm - 1|^2 * H vs |w_norm - 0|^2 * H
+    # Round to 1 if: |w_norm - 1| < |w_norm| (i.e., w_norm > 0.5)
+    # With Hessian: weight this decision by importance
+
+    # For positive borderline: round to 1 if w_normalized > 0.5 and high importance
+    err_to_1 = ((w_normalized - 1.0) ** 2) * H_diag.unsqueeze(0)
+    err_to_0 = (w_normalized ** 2) * H_diag.unsqueeze(0)
+
+    should_round_up = err_to_1 < err_to_0
+    w_ternary[borderline_pos & should_round_up] = 1
+
+    err_to_neg1 = ((w_normalized + 1.0) ** 2) * H_diag.unsqueeze(0)
+    should_round_down = err_to_neg1 < err_to_0
+    w_ternary[borderline_neg & should_round_down] = -1
+
+    # Statistics
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (w_ternary != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+
+    w_reconstructed = w_ternary.float() * scale_w.unsqueeze(1)
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+    mean_scale = scale_w.mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=mean_scale,
+        mse=mse
+    )
+
+    return w_ternary, scale_w, stats
+
+
 def quantize_to_ternary_percentile(
     weight: torch.Tensor,
     zero_percentile: float = 33.0
@@ -1484,6 +1653,16 @@ def prepare_ternary_weight_ptq(
         w_ternary, scale, stats = quantize_to_2bit(weight, **kwargs)
     elif method == 'gptq_calibrated':
         w_ternary, scale, stats = quantize_to_ternary_gptq_calibrated(weight, **kwargs)
+    elif method == 'perchannel':
+        # Per-channel scaling - scale is a tensor [N] not a float
+        w_ternary, scale, stats = quantize_to_ternary_perchannel(weight, **kwargs)
+        extra_info['scale_w'] = scale  # Store per-channel scales
+        scale = scale.mean().item()  # Use mean for backward compat
+    elif method == 'perchannel_hessian':
+        # Per-channel with Hessian-weighted rounding
+        w_ternary, scale, stats = quantize_to_ternary_perchannel_hessian(weight, **kwargs)
+        extra_info['scale_w'] = scale  # Store per-channel scales
+        scale = scale.mean().item()  # Use mean for backward compat
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 
