@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from ptq_quantize import prepare_ternary_weight_ptq, QuantizationStats, collect_calibration_data
+import hashlib
+import os
 
 
 # ============================================================================
@@ -115,7 +117,7 @@ class PTQTernaryLinear(nn.Module):
         self.out_features = out_features
         self.num_threads = num_threads or torch.get_num_threads()
 
-        # Ternary weight storage (will be set by quantize_from_linear)
+        # Ternary weight storage
         self.register_buffer('w_int8', None)
         self.register_buffer('w_sum', None)
         self.scale = 1.0
@@ -129,6 +131,16 @@ class PTQTernaryLinear(nn.Module):
         # Quantization stats
         self.quant_stats: Optional[QuantizationStats] = None
 
+        # Extra info for special quantization methods
+        self.ssr_info: Optional[Dict] = None
+        self.quip_info: Optional[Dict] = None
+        self.register_buffer('U', None)  # For one-sided QuIP transform
+
+        # LoRC (Low-Rank Compensation) matrices
+        self.register_buffer('lorc_L', None)
+        self.register_buffer('lorc_R', None)
+
+
     def quantize_from_linear(
         self,
         linear: nn.Linear,
@@ -140,13 +152,13 @@ class PTQTernaryLinear(nn.Module):
 
         Args:
             linear: Source nn.Linear layer
-            method: Quantization method ('absmean', 'percentile', 'optimal')
+            method: Quantization method
             **kwargs: Method-specific arguments
         """
         weight = linear.weight.data.float()
 
         # Quantize
-        w_int8, w_sum, scale, stats = prepare_ternary_weight_ptq(
+        w_int8, w_sum, scale, stats, extra_info = prepare_ternary_weight_ptq(
             weight, method=method, **kwargs
         )
 
@@ -154,6 +166,17 @@ class PTQTernaryLinear(nn.Module):
         self.w_sum = w_sum
         self.scale = scale
         self.quant_stats = stats
+
+        if extra_info:
+            if 'salient_indices' in extra_info:
+                self.ssr_info = extra_info
+            if 'U' in extra_info:  # Simplified one-sided transform
+                self.quip_info = extra_info
+                self.U = extra_info['U'].to(weight.device)
+            if 'lorc_L' in extra_info:  # LoRC compensation
+                self.lorc_L = extra_info['lorc_L'].to(weight.device)
+                self.lorc_R = extra_info['lorc_R'].to(weight.device)
+
 
         # Copy bias if present
         if linear.bias is not None:
@@ -168,18 +191,28 @@ class PTQTernaryLinear(nn.Module):
         # Get kernel
         kernel, kernel_type = get_kernel()
 
+        # For QuIP, the output of the kernel will have a different dimension
+        output_features = self.U.shape[0] if self.quip_info else self.out_features
+
         if kernel_type == 'fallback':
             # PyTorch fallback for macOS - use reconstructed float weights
             w_float = self.w_int8[:, :self.in_features].float() * self.scale
+            
+            # Reconstruct QuIP weights if needed
+            if self.quip_info and self.U is not None:
+                # Reconstruct original weight matrix W = W_transformed @ U
+                w_float = w_float @ self.U
+            
             y = F.linear(x, w_float, self.bias)
         else:
             # Quantize activations
             x_int8, x_scale = self._quantize_activation(x)
-
+            
             # Allocate output
-            y = torch.zeros(M, self.out_features, dtype=torch.float32)
+            y = torch.zeros(M, output_features, dtype=torch.float32)
 
-            bias = self.bias if self.bias is not None else torch.Tensor()
+            # Bias is handled differently with QuIP post-transform
+            bias = self.bias if self.bias is not None and not self.quip_info else torch.Tensor()
 
             # Call kernel
             if kernel_type == 'vnni':
@@ -187,18 +220,32 @@ class PTQTernaryLinear(nn.Module):
                     x_int8, x_scale,
                     self.w_int8, self.w_sum,
                     y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
+                    M, output_features, self.w_int8.shape[1], self.num_threads
                 )
             else:  # graviton
                 kernel.matmul_free_graviton_v3(
                     x_int8, x_scale,
                     self.w_int8, self.w_sum,
                     y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
+                    M, output_features, self.w_int8.shape[1], self.num_threads
                 )
 
             # Apply weight scale
             y = y * self.scale
+        
+        # Apply QuIP post-transform to output if needed
+        if self.quip_info and self.U is not None:
+            y = y @ self.U
+            # Add bias after transform
+            if self.bias is not None:
+                y += self.bias
+
+        # Apply LoRC (Low-Rank Compensation) if available
+        # y_corrected = y + (x @ L) @ R
+        if self.lorc_L is not None and self.lorc_R is not None:
+            x_orig = x.view(-1, self.in_features)  # Use original (non-quantized) input
+            lorc_correction = (x_orig @ self.lorc_L) @ self.lorc_R
+            y = y + lorc_correction
 
         # Reshape output
         output_shape = original_shape[:-1] + (self.out_features,)
@@ -226,6 +273,7 @@ class PTQTernaryLinear(nn.Module):
         return x_int8.contiguous(), scale.squeeze(1).contiguous()
 
 
+
 # ============================================================================
 # Model Quantization
 # ============================================================================
@@ -246,7 +294,7 @@ def quantize_linear_layers(
         method: Quantization method
         num_threads: Number of threads for kernels
         skip_layers: List of layer name patterns to skip (e.g., ['lm_head', 'embed'])
-        calibration_data: Dict mapping layer names to activation tensors (for pt2_calibrated)
+        calibration_data: Dict mapping layer names to activation tensors
         **kwargs: Method-specific arguments
 
     Returns:
@@ -267,7 +315,7 @@ def quantize_linear_layers(
             num_threads=num_threads
         )
 
-        # Add calibration activations for pt2_calibrated method
+        # Add calibration activations for calibrated methods
         quant_kwargs = kwargs.copy()
         if calibration_data is not None and full_name in calibration_data:
             quant_kwargs['calibration_activations'] = calibration_data[full_name]
@@ -364,6 +412,114 @@ class PTQModel(nn.Module):
 
 
 # ============================================================================
+# Caching Functions
+# ============================================================================
+
+def get_cache_path(model_name: str, method: str, cache_dir: Optional[str] = None) -> Path:
+    """Get the cache file path for a quantized model."""
+    if cache_dir is None:
+        cache_dir = Path(__file__).parent / 'ptq_cache'
+    else:
+        cache_dir = Path(cache_dir)
+
+    # Create a safe filename from model name and method
+    safe_name = model_name.replace('/', '_').replace('\\', '_')
+    cache_file = cache_dir / f"{safe_name}_{method}.pt"
+    return cache_file
+
+
+def save_quantized_model(model: nn.Module, cache_path: Path, quant_stats: Dict):
+    """Save quantized model weights to cache."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Collect all PTQTernaryLinear state
+    ptq_state = {}
+    for name, module in model.named_modules():
+        if isinstance(module, PTQTernaryLinear):
+            ptq_state[name] = {
+                'w_int8': module.w_int8,
+                'w_sum': module.w_sum,
+                'scale': module.scale,
+                'bias': module.bias,
+                'in_features': module.in_features,
+                'out_features': module.out_features,
+                'U': module.U,
+                'lorc_L': module.lorc_L,
+                'lorc_R': module.lorc_R,
+            }
+
+    torch.save({
+        'ptq_state': ptq_state,
+        'quant_stats': quant_stats,
+    }, cache_path)
+    print(f"  Saved quantized model to: {cache_path}")
+
+
+def load_quantized_model(
+    hf_model: nn.Module,
+    cache_path: Path,
+    num_threads: int = None,
+    skip_layers: list = None
+) -> Tuple[Dict[str, QuantizationStats], bool]:
+    """
+    Load quantized weights from cache and replace linear layers.
+
+    Returns:
+        (quant_stats, success) - stats dict and whether loading succeeded
+    """
+    if not cache_path.exists():
+        return {}, False
+
+    try:
+        print(f"  Loading cached quantized model from: {cache_path}")
+        cached = torch.load(cache_path, weights_only=False)
+        ptq_state = cached['ptq_state']
+        quant_stats = cached['quant_stats']
+
+        skip_layers = skip_layers or []
+
+        def should_skip(name: str) -> bool:
+            return any(pattern in name for pattern in skip_layers)
+
+        # Replace linear layers with cached PTQTernaryLinear
+        for full_name, module in list(hf_model.named_modules()):
+            if isinstance(module, nn.Linear) and not should_skip(full_name) and full_name in ptq_state:
+                state = ptq_state[full_name]
+
+                # Get parent module
+                parts = full_name.rsplit('.', 1)
+                if len(parts) == 1:
+                    parent = hf_model
+                    attr_name = parts[0]
+                else:
+                    parent_name, attr_name = parts
+                    parent = hf_model.get_submodule(parent_name)
+
+                # Create PTQTernaryLinear with cached weights
+                ptq_linear = PTQTernaryLinear(
+                    state['in_features'],
+                    state['out_features'],
+                    bias=state['bias'] is not None,
+                    num_threads=num_threads
+                )
+                ptq_linear.w_int8 = state['w_int8']
+                ptq_linear.w_sum = state['w_sum']
+                ptq_linear.scale = state['scale']
+                ptq_linear.bias = state['bias']
+                ptq_linear.U = state['U']
+                ptq_linear.lorc_L = state['lorc_L']
+                ptq_linear.lorc_R = state['lorc_R']
+
+                setattr(parent, attr_name, ptq_linear)
+
+        return quant_stats, True
+
+    except Exception as e:
+        print(f"  [!] Failed to load cache: {e}")
+        return {}, False
+
+
+# ============================================================================
 # Main Loading Function
 # ============================================================================
 
@@ -374,6 +530,11 @@ def load_ptq_model(
     skip_lm_head: bool = True,
     skip_embeddings: bool = True,
     calibration_samples: int = 0,
+    use_lorc: bool = False,
+    lorc_rank: int = 4,
+    use_cache: bool = True,
+    cache_dir: Optional[str] = None,
+    force_requantize: bool = False,
     **quant_kwargs
 ) -> Tuple[PTQModel, Any]:
     """
@@ -381,11 +542,16 @@ def load_ptq_model(
 
     Args:
         model_name: HuggingFace model name (e.g., 'microsoft/phi-2')
-        method: Quantization method ('absmean', 'percentile', 'optimal', 'pt2', 'pt2_calibrated', 'pt2_ssr')
+        method: Quantization method
         num_threads: Number of threads for kernels
         skip_lm_head: Don't quantize the language model head (recommended)
         skip_embeddings: Don't quantize embedding layers (they're not Linear)
-        calibration_samples: Number of calibration samples for pt2_calibrated (0 = no calibration)
+        calibration_samples: Number of calibration samples for calibrated methods
+        use_lorc: Enable Low-Rank Compensation for reduced quantization error
+        lorc_rank: Rank for LoRC matrices (higher = better quality, more memory)
+        use_cache: Cache quantized weights to disk for faster subsequent loads
+        cache_dir: Directory for cache files (default: inference/ptq_cache/)
+        force_requantize: Ignore cache and re-quantize from scratch
         **quant_kwargs: Additional arguments for quantization method
 
     Returns:
@@ -417,39 +583,57 @@ def load_ptq_model(
     if skip_embeddings:
         skip_layers.extend(['embed', 'wte', 'wpe'])
 
-    # Collect calibration data if using calibrated methods
-    calibration_data = None
-    if method in ['pt2_calibrated', 'pt2_ssr'] and calibration_samples > 0:
-        print(f"\nCollecting calibration data ({calibration_samples} samples)...")
-        calibration_data = collect_calibration_data(
-            hf_model, tokenizer,
-            num_samples=calibration_samples,
-            max_length=512
-        )
-    elif method in ['pt2_calibrated', 'pt2_ssr']:
-        # Auto-enable calibration for these methods
-        print(f"\nMethod '{method}' works better with calibration. Collecting 32 samples...")
-        calibration_data = collect_calibration_data(
-            hf_model, tokenizer,
-            num_samples=32,
-            max_length=512
+    # Check cache
+    cache_path = get_cache_path(model_name, method, cache_dir)
+    loaded_from_cache = False
+
+    if use_cache and not force_requantize:
+        quant_stats, loaded_from_cache = load_quantized_model(
+            hf_model, cache_path, num_threads, skip_layers
         )
 
-    # Quantize
-    print(f"\nQuantizing with method='{method}'...")
-    print("  Loading kernel...")
-    _, kernel_type = get_kernel()  # Pre-load kernel
-    if kernel_type == 'fallback':
-        print("  [Note] Using PyTorch fallback (optimized kernels not available on this platform)")
+    if not loaded_from_cache:
+        # Collect calibration data if using calibrated methods
+        calibration_data = None
+        if method in ['pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant'] and calibration_samples > 0:
+            print(f"\nCollecting calibration data ({calibration_samples} samples)...")
+            calibration_data = collect_calibration_data(
+                hf_model, tokenizer,
+                num_samples=calibration_samples,
+                max_length=512
+            )
+        elif method in ['pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant']:
+            # Auto-enable calibration for these methods
+            print(f"\nMethod '{method}' works better with calibration. Collecting 32 samples...")
+            calibration_data = collect_calibration_data(
+                hf_model, tokenizer,
+                num_samples=32,
+                max_length=512
+            )
 
-    quant_stats = quantize_linear_layers(
-        hf_model,
-        method=method,
-        num_threads=num_threads,
-        skip_layers=skip_layers,
-        calibration_data=calibration_data,
-        **quant_kwargs
-    )
+        # Quantize
+        print(f"\nQuantizing with method='{method}'...")
+        print("  Loading kernel...")
+        _, kernel_type = get_kernel()  # Pre-load kernel
+        if kernel_type == 'fallback':
+            print("  [Note] Using PyTorch fallback (optimized kernels not available on this platform)")
+
+        # Add LoRC parameters to kwargs
+        quant_kwargs['use_lorc'] = use_lorc
+        quant_kwargs['lorc_rank'] = lorc_rank
+
+        quant_stats = quantize_linear_layers(
+            hf_model,
+            method=method,
+            num_threads=num_threads,
+            skip_layers=skip_layers,
+            calibration_data=calibration_data,
+            **quant_kwargs
+        )
+
+        # Save to cache
+        if use_cache:
+            save_quantized_model(hf_model, cache_path, quant_stats)
 
     # Wrap model
     model = PTQModel(hf_model, config)
@@ -465,8 +649,8 @@ def load_ptq_model(
     print(f"  Layers quantized: {total_layers}")
     print(f"  Average sparsity: {avg_sparsity:.1%}")
     print(f"  Average MSE: {avg_mse:.2e}")
-    if calibration_data:
-        print(f"  Calibration: {len(calibration_data)} layers with activation data")
+    if loaded_from_cache:
+        print(f"  [Loaded from cache: {cache_path}]")
 
     return model, tokenizer
 

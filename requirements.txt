@@ -54,6 +54,7 @@ isort>=5.10.0  # Import sorting
 # Visualization (for benchmarking results)
 matplotlib>=3.6.0
 seaborn>=0.12.0
+scipy>=1.10.0
 
 # Memory profiling
 memory-profiler>=0.60.0

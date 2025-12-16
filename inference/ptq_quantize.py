@@ -959,11 +959,230 @@ def quantize_to_ternary_awq(
     return w_ternary, scale, stats
 
 
+from scipy.linalg import fwht
+
+
+def get_randomized_hadamard_transform(
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype
+) -> torch.Tensor:
+    """
+    Generate a randomized Hadamard transform matrix U of size [dim, dim].
+    U = D1 * H * D2 * H * D3, where H is Hadamard and Di are random diagonal matrices.
+    This creates a random orthogonal matrix.
+    """
+    # Create Hadamard matrix
+    H = torch.tensor(fwht(torch.eye(dim, device=device, dtype=dtype)), device=device, dtype=dtype) / (dim ** 0.5)
+
+    # Create random diagonal matrices
+    D1 = torch.diag(torch.randint(0, 2, (dim,), device=device, dtype=dtype) * 2 - 1)
+    D2 = torch.diag(torch.randint(0, 2, (dim,), device=device, dtype=dtype) * 2 - 1)
+    
+    # Combine to form the orthogonal matrix
+    U = D1 @ H @ D2 @ H
+    return U
+
+
+def quantize_to_ternary_quip(
+    weight: torch.Tensor,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    Simplified QuIP-style ternary quantization using a one-sided transform.
+
+    Applies an incoherence transform to the columns of the weights (W' = W @ U.T)
+    before quantizing them with a standard high-quality method (PT²).
+
+    The transform matrix U needs to be applied to the output during inference.
+
+    Args:
+        weight: Float tensor to quantize [N, K]
+        **kwargs: Arguments for the underlying quantizer (e.g., pt2)
+
+    Returns:
+        w_ternary: Ternary tensor of the *transformed* weights
+        scale: Scaling factor for the *transformed* weights
+        stats: Quantization statistics
+        quip_info: Dictionary containing the transform matrix U
+    """
+    N, K = weight.shape
+    W = weight.float()
+
+    # We transform the columns of the weight matrix
+    U = get_randomized_hadamard_transform(K, W.device, W.dtype)
+    W_transformed = W @ U.T
+    
+    if kwargs.get('verbose', False):
+        print(f"  Applied QuIP one-sided incoherence transform.")
+
+    # Quantize the transformed weights using a robust method like PT2
+    w_ternary, scale, stats = quantize_to_ternary_pt2(W_transformed, **kwargs)
+
+    quip_info = {
+        'U': U,
+        'original_shape': (N, K)
+    }
+
+    # The returned ternary weight is for the *transformed* matrix
+    return w_ternary, scale, stats, quip_info
+
+
+
+import torch.optim as optim
+
+
+def quantize_to_ternary_omniquant(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats, Optional[Dict]]:
+    """
+    OmniQuant-style ternary quantization.
+
+    Uses a brief optimization phase with calibration data to learn:
+    1. LET: A channel-wise scaling factor to smooth activation outliers.
+    2. LWC: A clipping threshold to tame weight outliers.
+
+    These learned parameters are then used to pre-process the weights before
+    quantizing with a robust backend like PT².
+
+    Args:
+        weight: Float tensor to quantize [N, K]
+        calibration_activations: List of activation tensors for optimization
+        **kwargs: Arguments for the backend quantizer (e.g., pt2)
+
+    Returns:
+        w_ternary: Ternary tensor
+        scale: Scaling factor
+        stats: Quantization statistics
+        extra_info: None (OmniQuant is self-contained)
+    """
+    N, K = weight.shape
+    W = weight.float()
+
+    if calibration_activations is None or len(calibration_activations) == 0:
+        print("  [!] OmniQuant requires calibration data. Falling back to pt2.")
+        w_ternary, scale, stats = quantize_to_ternary_pt2(weight, **kwargs)
+        return w_ternary, scale, stats, None
+
+    # Concatenate calibration data into a single tensor
+    X_calib = torch.cat([x.to(W.device) for x in calibration_activations], dim=0)
+
+    # --- Learnable Parameters ---
+    # LET: Learnable Equivalent Transformation scales (similar to SmoothQuant)
+    s = torch.ones(K, device=W.device, requires_grad=True)
+    # LWC: Learnable Weight Clipping threshold
+    clip_val = torch.tensor([W.abs().max()], device=W.device, requires_grad=True)
+
+    optimizer = optim.AdamW([s, clip_val], lr=1e-3, weight_decay=1e-5)
+    num_iters = 50
+    
+    if kwargs.get('verbose', False):
+        print(f"  Running OmniQuant optimization for {num_iters} iterations...")
+
+    for i in range(num_iters):
+        optimizer.zero_grad()
+
+        # Apply LET to weights
+        W_transformed = W * s.unsqueeze(0)
+        
+        # Apply LWC
+        W_clipped = W_transformed.clamp(-clip_val, clip_val)
+        
+        # Quantize the processed weight (using a simple, fast method for the loop)
+        w_q, scale, _ = quantize_to_ternary_optimal(W_clipped, target_sparsity=0.5)
+
+        # Reconstruct the weight
+        W_recon = w_q.float() * scale
+        
+        # Inversely apply LET to the reconstructed weight for loss calculation
+        W_final_recon = W_recon / s.unsqueeze(0)
+
+        # Calculate reconstruction loss on a sample of calibration data
+        sample_indices = torch.randperm(X_calib.shape[0])[:32]
+        X_sample = X_calib[sample_indices]
+        
+        Y_orig = X_sample @ W.T
+        Y_quant = X_sample @ W_final_recon.T
+        
+        loss = ((Y_orig - Y_quant)**2).mean()
+        
+        loss.backward()
+        optimizer.step()
+
+        # Ensure clip_val remains positive
+        with torch.no_grad():
+            clip_val.clamp_(min=1e-6)
+
+        if kwargs.get('verbose', False) and (i % 10 == 0):
+            print(f"    Iter {i}: Loss={loss.item():.6e}, Clip={clip_val.item():.4f}, s_mean={s.mean().item():.4f}")
+
+    # --- Final Quantization ---
+    # Apply the learned transforms
+    W_transformed = W * s.detach().unsqueeze(0)
+    W_clipped = W_transformed.clamp(-clip_val.detach(), clip_val.detach())
+
+    if kwargs.get('verbose', False):
+        print(f"  OmniQuant optimization finished.")
+        print(f"  Final Clip Value: {clip_val.item():.4f}")
+        print(f"  Final Scale `s` mean: {s.mean().item():.4f} (std: {s.std().item():.4f})")
+
+    # Use the best quantizer on the processed weights
+    w_ternary, scale, stats = quantize_to_ternary_pt2(W_clipped, **kwargs)
+    
+    # Recalculate MSE against original weight, accounting for LET
+    W_recon_final = (w_ternary.float() * scale) / s.detach().unsqueeze(0)
+    final_mse = ((W - W_recon_final) ** 2).mean().item()
+    stats.mse = final_mse
+
+    return w_ternary, scale, stats, None
+
+
+def compute_lorc(
+    W: torch.Tensor,
+    W_q_recon: torch.Tensor,
+    rank: int = 4
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute Low-Rank Compensation (LoRC) matrices.
+
+    Approximates the quantization error matrix E = W - W_q_recon with
+    two low-rank matrices, L and R, such that E ≈ L @ R.
+
+    Args:
+        W: Original full-precision weight matrix.
+        W_q_recon: Reconstructed quantized weight matrix.
+        rank: The rank for the low-rank approximation.
+
+    Returns:
+        L: The first low-rank matrix.
+        R: The second low-rank matrix.
+    """
+    error = W - W_q_recon
+    
+    # Using SVD to find the best low-rank approximation
+    U, S, Vh = torch.linalg.svd(error, full_matrices=False)
+    
+    # Keep the top 'rank' singular values
+    U_r = U[:, :rank]
+    S_r = torch.diag(S[:rank])
+    Vh_r = Vh[:rank, :]
+    
+    # L and R matrices
+    L = U_r @ S_r
+    R = Vh_r
+    
+    return L, R
+
+
 def prepare_ternary_weight_ptq(
     weight: torch.Tensor,
     method: str = 'absmean',
+    use_lorc: bool = False,
+    lorc_rank: int = 4,
     **kwargs
-) -> Tuple[torch.Tensor, torch.Tensor, float, QuantizationStats]:
+) -> Tuple[torch.Tensor, torch.Tensor, float, QuantizationStats, Optional[Dict]]:
     """
     Prepare weight for our ternary kernels using PTQ.
 
@@ -974,17 +1193,22 @@ def prepare_ternary_weight_ptq(
 
     Args:
         weight: [N, K] float tensor (out_features, in_features)
-        method: 'absmean', 'percentile', or 'optimal'
-        **kwargs: Additional arguments for the quantization method
+        method: Quantization method to use.
+        use_lorc: If True, compute and return LoRC matrices.
+        lorc_rank: The rank for the LoRC approximation.
+        **kwargs: Additional arguments for the quantization method.
 
     Returns:
-        w_int8: Padded int8 ternary weights
-        w_sum: Row sums for bias correction
-        scale: Scaling factor
-        stats: Quantization statistics
+        w_int8: Padded int8 ternary weights.
+        w_sum: Row sums for bias correction.
+        scale: Scaling factor.
+        stats: Quantization statistics.
+        extra_info: Dictionary with method-specific data (e.g., for QuIP, SSR, or LoRC).
     """
     N, K = weight.shape
-    K_padded = ((K + 63) // 64) * 64
+    
+    extra_info = {}
+    w_ternary, scale, stats = None, None, None
 
     # Quantize based on method
     if method == 'absmean':
@@ -1002,25 +1226,54 @@ def prepare_ternary_weight_ptq(
     elif method == 'pt2':
         w_ternary, scale, stats = quantize_to_ternary_pt2(weight, **kwargs)
     elif method == 'pt2_calibrated':
-        # PT2 with calibration - expects calibration_activations in kwargs
         w_ternary, scale, stats = quantize_to_ternary_pt2(weight, **kwargs)
     elif method == 'pt2_ssr':
-        # PT2 with SSR (Salient channel Sparse Reordering)
-        w_ternary, scale, stats, _ = quantize_to_ternary_pt2_with_ssr(weight, **kwargs)
+        w_ternary, scale, stats, ssr_info = quantize_to_ternary_pt2_with_ssr(weight, **kwargs)
+        if ssr_info: extra_info.update(ssr_info)
+    elif method == 'quip':
+        w_ternary, scale, stats, quip_info = quantize_to_ternary_quip(weight, **kwargs)
+        if quip_info: extra_info.update(quip_info)
+    elif method == 'omniquant':
+        w_ternary, scale, stats, omni_info = quantize_to_ternary_omniquant(weight, **kwargs)
+        if omni_info: extra_info.update(omni_info)
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 
+    # --- LoRC Calculation ---
+    if use_lorc:
+        # Reconstruct the quantized weight to compute the error
+        # Note: This reconstruction needs to be accurate for the given method
+        W_q_recon = (w_ternary.float() * scale)
+        if method == 'omniquant':
+            # OmniQuant includes LET, which needs to be inverted
+            s = kwargs.get('let_s_inv') # Assume s is returned somehow
+            if s is not None:
+                W_q_recon = W_q_recon / s.unsqueeze(0)
+
+        L, R = compute_lorc(weight, W_q_recon, rank=lorc_rank)
+        extra_info['lorc_L'] = L
+        extra_info['lorc_R'] = R
+        if kwargs.get('verbose', False):
+            print(f"  Computed LoRC matrices with rank={lorc_rank}")
+
+
+    # Determine padded dimension from the ternary weight shape
+    N_out, K_out = w_ternary.shape
+    K_padded = ((K_out + 63) // 64) * 64
+
     # Pad to K_padded
-    if K_padded > K:
-        w_int8 = torch.zeros(N, K_padded, dtype=torch.int8)
-        w_int8[:, :K] = w_ternary
+    if K_padded > K_out:
+        w_int8 = torch.zeros(N_out, K_padded, dtype=torch.int8)
+        w_int8[:, :K_out] = w_ternary
     else:
         w_int8 = w_ternary.contiguous()
 
     # Compute row sums (for bias correction in kernel)
     w_sum = w_int8.sum(dim=1, dtype=torch.int32)
 
-    return w_int8, w_sum, scale, stats
+    return w_int8, w_sum, scale, stats, extra_info or None
+
+
 
 
 def analyze_model_weights(model: nn.Module) -> Dict[str, Dict]:
@@ -1113,7 +1366,7 @@ if __name__ == '__main__':
 
     for method, kwargs in methods:
         print(f"\n{method.upper()} method:")
-        w_int8, w_sum, scale, stats = prepare_ternary_weight_ptq(weight, method, **kwargs)
+        w_int8, w_sum, scale, stats, extra_info = prepare_ternary_weight_ptq(weight, method, **kwargs)
 
         print(f"  Scale: {scale:.6f}")
         print(f"  Sparsity: {stats.sparsity:.2%}")

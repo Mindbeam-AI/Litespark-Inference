@@ -719,7 +719,9 @@ def run_ptq_benchmark(
 def compare_all_methods(
     model_name: str = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
     output_dir: Optional[Path] = None,
-    config: BenchmarkConfig = None
+    config: BenchmarkConfig = None,
+    use_cache: bool = True,
+    force_requantize: bool = False
 ):
     """Compare all quantization methods on the same model."""
 
@@ -730,7 +732,7 @@ def compare_all_methods(
         output_dir = Path(__file__).parent / 'benchmark_ptq_results'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr']
+    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant']
 
     print("=" * 70)
     print("PTQ Method Comparison")
@@ -763,7 +765,10 @@ def compare_all_methods(
         print("=" * 70)
 
         try:
-            ptq_model, tokenizer = load_ptq_model(model_name, method=method)
+            ptq_model, tokenizer = load_ptq_model(
+                model_name, method=method,
+                use_cache=use_cache, force_requantize=force_requantize
+            )
 
             print("\n  Evaluating perplexity...")
             ppl, ppl_stats = evaluate_perplexity(ptq_model, tokenizer, max_samples=config.ppl_max_samples)
@@ -825,7 +830,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0',
                         help='HuggingFace model to benchmark')
     parser.add_argument('--method', type=str, default='absmean',
-                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr'],
+                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant'],
                         help='Quantization method')
     parser.add_argument('--compare-all', action='store_true',
                         help='Compare all quantization methods')
@@ -835,12 +840,20 @@ if __name__ == '__main__':
                         help='Skip long scaling benchmarks')
     parser.add_argument('--ppl-samples', type=int, default=100,
                         help='Number of WikiText-2 samples for perplexity')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='Disable caching of quantized models')
+    parser.add_argument('--force-requantize', action='store_true',
+                        help='Force re-quantization even if cache exists')
     args = parser.parse_args()
 
     config = BenchmarkConfig(ppl_max_samples=args.ppl_samples)
 
     if args.compare_all:
-        compare_all_methods(model_name=args.model, config=config)
+        compare_all_methods(
+            model_name=args.model, config=config,
+            use_cache=not args.no_cache,
+            force_requantize=args.force_requantize
+        )
     else:
         run_ptq_benchmark(
             model_name=args.model,
