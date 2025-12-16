@@ -748,7 +748,26 @@ def compare_all_methods(
         output_dir = Path(__file__).parent / 'benchmark_ptq_results'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant', 'auto_accuracy', 'auto_balanced', 'w8a8', 'w8a8_ternary']
+    methods = [
+        # Basic ternary methods
+        'absmean', 'percentile', 'optimal',
+        # Advanced ternary methods
+        'gptq', 'gptq_calibrated', 'smoothquant', 'awq',
+        'pt2', 'pt2_calibrated', 'pt2_ssr',
+        'quip', 'omniquant',
+        # New methods
+        '2bit',  # 2-bit quantization with 4 levels
+        'absmean_fp16act',  # Ternary weights + FP16 activations
+        'pt2_lorc32',  # PT2 with high-rank LoRC
+        'pt2_lorc64',  # PT2 with very high-rank LoRC
+        # Mixed precision
+        'mixed_attention',  # Keep attention layers in higher precision
+        # Auto methods with different LoRC ranks
+        'auto_accuracy', 'auto_balanced',
+        'auto_lorc32', 'auto_lorc64',
+        # W8A8 methods
+        'w8a8', 'w8a8_ternary',
+    ]
 
     print("=" * 70)
     print("PTQ Method Comparison")
@@ -787,9 +806,47 @@ def compare_all_methods(
             elif method == 'w8a8_ternary':
                 ptq_model, tokenizer = load_w8a8_ternary_model(model_name)
             elif method.startswith('auto_'):
-                strategy = method.replace('auto_', '')  # 'accuracy' or 'balanced'
-                ptq_model, tokenizer, _ = load_auto_quantized_model(
-                    model_name, strategy=strategy,
+                # Parse auto method: auto_accuracy, auto_balanced, auto_lorc32, auto_lorc64
+                if method == 'auto_lorc32':
+                    ptq_model, tokenizer, _ = load_auto_quantized_model(
+                        model_name, strategy='balanced', lorc_rank=32,
+                        use_cache=use_cache, force_requantize=force_requantize
+                    )
+                elif method == 'auto_lorc64':
+                    ptq_model, tokenizer, _ = load_auto_quantized_model(
+                        model_name, strategy='balanced', lorc_rank=64,
+                        use_cache=use_cache, force_requantize=force_requantize
+                    )
+                else:
+                    strategy = method.replace('auto_', '')  # 'accuracy' or 'balanced'
+                    ptq_model, tokenizer, _ = load_auto_quantized_model(
+                        model_name, strategy=strategy,
+                        use_cache=use_cache, force_requantize=force_requantize
+                    )
+            elif method == 'absmean_fp16act':
+                # Ternary weights with FP16 activations (no activation quantization)
+                ptq_model, tokenizer = load_ptq_model(
+                    model_name, method='absmean',
+                    use_fp16_activations=True,
+                    use_cache=use_cache, force_requantize=force_requantize
+                )
+            elif method == 'pt2_lorc32':
+                ptq_model, tokenizer = load_ptq_model(
+                    model_name, method='pt2_calibrated',
+                    use_lorc=True, lorc_rank=32,
+                    use_cache=use_cache, force_requantize=force_requantize
+                )
+            elif method == 'pt2_lorc64':
+                ptq_model, tokenizer = load_ptq_model(
+                    model_name, method='pt2_calibrated',
+                    use_lorc=True, lorc_rank=64,
+                    use_cache=use_cache, force_requantize=force_requantize
+                )
+            elif method == 'mixed_attention':
+                # Keep attention layers in FP16, only quantize FFN
+                ptq_model, tokenizer = load_ptq_model(
+                    model_name, method='pt2_calibrated',
+                    skip_patterns=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
                     use_cache=use_cache, force_requantize=force_requantize
                 )
             else:

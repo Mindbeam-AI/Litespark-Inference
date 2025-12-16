@@ -1166,6 +1166,207 @@ def quantize_to_ternary_omniquant(
     return w_ternary, scale, stats, None
 
 
+# ============================================================================
+# New Advanced Quantization Methods
+# ============================================================================
+
+def quantize_to_2bit(
+    weight: torch.Tensor,
+    levels: Tuple[float, float, float, float] = (-1.5, -0.5, 0.5, 1.5),
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    Quantize weight tensor to 2-bit with 4 levels.
+
+    Default levels are {-1.5, -0.5, +0.5, +1.5} which gives better granularity
+    than ternary {-1, 0, +1}.
+
+    The quantized weights are stored as int8 with values {-2, -1, +1, +2}
+    (we avoid 0 to distinguish from ternary).
+
+    Args:
+        weight: Float tensor to quantize
+        levels: The 4 quantization levels (should be symmetric around 0)
+
+    Returns:
+        w_2bit: 2-bit quantized tensor as int8 {-2, -1, +1, +2}
+        scale: Scaling factor
+        stats: Quantization statistics
+    """
+    # Compute scale based on weight magnitude
+    abs_mean = weight.abs().mean()
+    if abs_mean < 1e-10:
+        return torch.zeros_like(weight, dtype=torch.int8), 1.0, QuantizationStats(
+            original_nonzero=0, quantized_nonzero=0, sparsity=1.0, scale=1.0, mse=0.0
+        )
+
+    # Scale to map weight distribution to quantization levels
+    # We use the 75th percentile to set the scale
+    p75 = torch.quantile(weight.abs().flatten(), 0.75).item()
+    scale = p75 / 1.0  # Map 75th percentile to middle levels (±0.5, ±1.5)
+    if scale < 1e-10:
+        scale = abs_mean.item()
+
+    # Normalize weights
+    w_normalized = weight / scale
+
+    # Quantize to 4 levels: -1.5, -0.5, +0.5, +1.5 -> stored as -2, -1, +1, +2
+    w_2bit = torch.zeros_like(weight, dtype=torch.int8)
+
+    # Thresholds at -1.0, 0.0, +1.0
+    w_2bit[w_normalized <= -1.0] = -2  # maps to -1.5
+    w_2bit[(w_normalized > -1.0) & (w_normalized <= 0.0)] = -1  # maps to -0.5
+    w_2bit[(w_normalized > 0.0) & (w_normalized < 1.0)] = 1  # maps to +0.5
+    w_2bit[w_normalized >= 1.0] = 2  # maps to +1.5
+
+    # For reconstruction: -2 -> -1.5, -1 -> -0.5, +1 -> +0.5, +2 -> +1.5
+    # w_reconstructed = (w_2bit.float() - 0.5 * sign(w_2bit)) * scale
+    # Simpler: w_2bit * 0.5 * (1 + 0.5/abs(w_2bit)) but that's complex
+    # Just use: (-2 -> -1.5, -1 -> -0.5, 1 -> 0.5, 2 -> 1.5)
+    level_map = {-2: -1.5, -1: -0.5, 1: 0.5, 2: 1.5, 0: 0.0}
+    w_reconstructed = torch.zeros_like(weight, dtype=torch.float32)
+    for k, v in level_map.items():
+        w_reconstructed[w_2bit == k] = v * scale
+
+    # Statistics
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (w_2bit != 0).sum().item()  # All are nonzero for 2-bit
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=scale,
+        mse=mse
+    )
+
+    return w_2bit, scale, stats
+
+
+def quantize_to_ternary_gptq_calibrated(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    blocksize: int = 128,
+    target_sparsity: float = 0.33,
+    damping: float = 0.01,
+    verbose: bool = False
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    GPTQ-style ternary quantization with REAL Hessian from calibration data.
+
+    This is the proper GPTQ algorithm that uses X.T @ X from calibration
+    data as the Hessian, not just weight magnitude.
+
+    Args:
+        weight: Float tensor to quantize [N, K]
+        calibration_activations: List of activation tensors for Hessian
+        blocksize: Process this many columns at a time
+        target_sparsity: Target fraction of zeros
+        damping: Damping factor for Hessian inverse
+        verbose: Print debug info
+
+    Returns:
+        w_ternary: Ternary tensor {-1, 0, +1}
+        scale: Scaling factor
+        stats: Quantization statistics
+    """
+    N, K = weight.shape
+    w = weight.clone().float()
+
+    # Compute Hessian from calibration data: H = X.T @ X
+    if calibration_activations is not None and len(calibration_activations) > 0:
+        H = torch.zeros(K, K, dtype=torch.float32, device=weight.device)
+        nsamples = 0
+        for X in calibration_activations:
+            if X.dim() == 3:
+                X = X.view(-1, X.shape[-1])
+            X = X.float()
+            H += X.T @ X
+            nsamples += X.shape[0]
+        H /= nsamples
+
+        # Add damping for numerical stability
+        damp = damping * torch.diag(H).mean()
+        H += damp * torch.eye(K, device=H.device)
+
+        if verbose:
+            print(f"  GPTQ: Computed Hessian from {len(calibration_activations)} samples")
+    else:
+        # Fallback: use diagonal approximation from weight magnitude
+        H = torch.diag((w ** 2).sum(dim=0) + 1e-10)
+        if verbose:
+            print(f"  GPTQ: No calibration data, using weight magnitude proxy")
+
+    # Find threshold and scale
+    abs_weight = w.abs()
+    threshold = torch.quantile(abs_weight.flatten(), target_sparsity).item()
+    mask = abs_weight > threshold
+    scale = abs_weight[mask].mean().item() if mask.sum() > 0 else 1.0
+
+    # Initialize output
+    w_ternary = torch.zeros_like(w, dtype=torch.int8)
+
+    # Process column by column with Hessian-based error compensation
+    for start in range(0, K, blocksize):
+        end = min(start + blocksize, K)
+
+        # Get block of Hessian
+        H_block = H[start:end, start:end]
+
+        # Cholesky decomposition for stable inverse
+        try:
+            L = torch.linalg.cholesky(H_block)
+            H_inv_block = torch.cholesky_inverse(L)
+        except:
+            # Fallback to pseudo-inverse
+            H_inv_block = torch.linalg.pinv(H_block)
+
+        for j in range(start, end):
+            col = w[:, j]
+
+            # Quantize this column
+            q = torch.zeros(N, dtype=torch.int8, device=weight.device)
+            q[col > threshold] = 1
+            q[col < -threshold] = -1
+            w_ternary[:, j] = q
+
+            # Compute quantization error
+            q_float = q.float() * scale
+            error = col - q_float
+
+            # GPTQ update: distribute error to remaining columns
+            # w[:, j+1:end] += error.unsqueeze(1) @ H_inv[j, j+1:end].unsqueeze(0) / H_inv[j, j]
+            if j < end - 1:
+                j_local = j - start
+                h_inv_jj = H_inv_block[j_local, j_local]
+                if h_inv_jj > 1e-10:
+                    h_inv_row = H_inv_block[j_local, j_local+1:]
+                    update = error.unsqueeze(1) @ h_inv_row.unsqueeze(0) / h_inv_jj
+                    w[:, j+1:end] -= update
+
+    # Compute final statistics
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (w_ternary != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+
+    w_reconstructed = w_ternary.float() * scale
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=scale,
+        mse=mse
+    )
+
+    if verbose:
+        print(f"  GPTQ calibrated: MSE={mse:.2e}, sparsity={sparsity:.1%}")
+
+    return w_ternary, scale, stats
+
+
 def compute_lorc(
     W: torch.Tensor,
     W_q_recon: torch.Tensor,
@@ -1279,6 +1480,10 @@ def prepare_ternary_weight_ptq(
     elif method == 'omniquant':
         w_ternary, scale, stats, omni_info = quantize_to_ternary_omniquant(weight, **kwargs)
         if omni_info: extra_info.update(omni_info)
+    elif method == '2bit':
+        w_ternary, scale, stats = quantize_to_2bit(weight, **kwargs)
+    elif method == 'gptq_calibrated':
+        w_ternary, scale, stats = quantize_to_ternary_gptq_calibrated(weight, **kwargs)
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 

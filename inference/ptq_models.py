@@ -110,12 +110,14 @@ class PTQTernaryLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        num_threads: int = None
+        num_threads: int = None,
+        use_fp16_activations: bool = False
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.num_threads = num_threads or torch.get_num_threads()
+        self.use_fp16_activations = use_fp16_activations
 
         # Ternary weight storage
         self.register_buffer('w_int8', None)
@@ -226,8 +228,10 @@ class PTQTernaryLinear(nn.Module):
             # QuIP: pre-transform input by U.T to undo the column transform
             x = x @ self.U.T
 
-        if kernel_type == 'fallback':
-            # PyTorch fallback for macOS - use reconstructed float weights
+        if kernel_type == 'fallback' or self.use_fp16_activations:
+            # PyTorch fallback for macOS OR FP16 activations mode
+            # Use reconstructed float weights with FP16/FP32 activations
+            # This avoids activation quantization error while still using ternary weights
             w_float = self.w_int8[:, :self.in_features].float() * self.scale
             y = F.linear(x, w_float, self.bias)
         else:
@@ -302,6 +306,7 @@ def quantize_linear_layers(
     num_threads: int = None,
     skip_layers: Optional[list] = None,
     calibration_data: Optional[Dict[str, list]] = None,
+    use_fp16_activations: bool = False,
     **kwargs
 ) -> Dict[str, QuantizationStats]:
     """
@@ -313,6 +318,7 @@ def quantize_linear_layers(
         num_threads: Number of threads for kernels
         skip_layers: List of layer name patterns to skip (e.g., ['lm_head', 'embed'])
         calibration_data: Dict mapping layer names to activation tensors
+        use_fp16_activations: Use FP16 activations instead of INT8 (more accurate but slower)
         **kwargs: Method-specific arguments
 
     Returns:
@@ -330,7 +336,8 @@ def quantize_linear_layers(
             linear.in_features,
             linear.out_features,
             bias=linear.bias is not None,
-            num_threads=num_threads
+            num_threads=num_threads,
+            use_fp16_activations=use_fp16_activations
         )
 
         # Add calibration activations for calibrated methods
@@ -547,9 +554,11 @@ def load_ptq_model(
     num_threads: int = None,
     skip_lm_head: bool = True,
     skip_embeddings: bool = True,
+    skip_patterns: Optional[List[str]] = None,
     calibration_samples: int = 0,
     use_lorc: bool = False,
     lorc_rank: int = 4,
+    use_fp16_activations: bool = False,
     use_cache: bool = True,
     cache_dir: Optional[str] = None,
     force_requantize: bool = False,
@@ -564,9 +573,11 @@ def load_ptq_model(
         num_threads: Number of threads for kernels
         skip_lm_head: Don't quantize the language model head (recommended)
         skip_embeddings: Don't quantize embedding layers (they're not Linear)
+        skip_patterns: Additional layer name patterns to skip (e.g., ['q_proj', 'k_proj'])
         calibration_samples: Number of calibration samples for calibrated methods
         use_lorc: Enable Low-Rank Compensation for reduced quantization error
         lorc_rank: Rank for LoRC matrices (higher = better quality, more memory)
+        use_fp16_activations: Use FP16 activations instead of INT8 (slower but more accurate)
         use_cache: Cache quantized weights to disk for faster subsequent loads
         cache_dir: Directory for cache files (default: inference/ptq_cache/)
         force_requantize: Ignore cache and re-quantize from scratch
@@ -600,6 +611,8 @@ def load_ptq_model(
         skip_layers.extend(['lm_head', 'output'])
     if skip_embeddings:
         skip_layers.extend(['embed', 'wte', 'wpe'])
+    if skip_patterns:
+        skip_layers.extend(skip_patterns)
 
     # Check cache
     cache_path = get_cache_path(model_name, method, cache_dir)
@@ -646,6 +659,7 @@ def load_ptq_model(
             num_threads=num_threads,
             skip_layers=skip_layers,
             calibration_data=calibration_data,
+            use_fp16_activations=use_fp16_activations,
             **quant_kwargs
         )
 
