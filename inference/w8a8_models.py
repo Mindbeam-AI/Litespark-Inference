@@ -370,6 +370,135 @@ def load_w8a8_model(
 
 
 # ============================================================================
+# W8A8 -> Ternary Conversion
+# ============================================================================
+
+def load_w8a8_ternary_model(
+    model_name: str,
+    num_threads: int = None,
+    skip_lm_head: bool = True,
+    skip_embeddings: bool = True,
+) -> Tuple[Any, Any]:
+    """
+    Load W8A8 model and further quantize INT8 weights to ternary {-1, 0, +1}.
+
+    This tests the hypothesis: FP16 -> INT8 -> Ternary vs FP16 -> Ternary directly.
+
+    The INT8 weights (range -127 to +127) are quantized to ternary using
+    the absmean threshold method.
+
+    Args:
+        model_name: HuggingFace model name
+        num_threads: Number of threads for kernels
+        skip_lm_head: Don't quantize language model head
+        skip_embeddings: Don't quantize embeddings
+
+    Returns:
+        (model, tokenizer) tuple - model uses ternary kernels
+    """
+    from ptq_models import PTQTernaryLinear, PTQModel, get_kernel
+
+    print(f"Loading W8A8 model for ternary conversion: {model_name}")
+
+    # First load the W8A8 model
+    w8a8_model, tokenizer = load_w8a8_model(
+        model_name,
+        num_threads=num_threads,
+        skip_lm_head=skip_lm_head,
+        skip_embeddings=skip_embeddings,
+    )
+
+    print("\nConverting W8A8 (INT8) weights to Ternary...")
+
+    # Now convert each W8A8Linear to PTQTernaryLinear
+    converted_count = 0
+    for name, module in list(w8a8_model.model.named_modules()):
+        if isinstance(module, W8A8Linear):
+            # Get the INT8 weights and scale
+            w_int8 = module.w_int8  # [N, K_padded] int8
+            scale_w = module.scale_w  # [N] per-row scale
+
+            # Reconstruct float weights from INT8
+            # w_float[n, k] = w_int8[n, k] * scale_w[n]
+            w_float = w_int8[:, :module.in_features].float() * scale_w.unsqueeze(1)
+
+            # Now quantize to ternary using absmean threshold
+            # threshold = mean(|w|)
+            abs_mean = w_float.abs().mean()
+            threshold = abs_mean.item()
+
+            # Ternary quantization: w_ternary = sign(w) * (|w| > threshold)
+            w_ternary = torch.zeros_like(w_float, dtype=torch.int8)
+            w_ternary[w_float > threshold] = 1
+            w_ternary[w_float < -threshold] = -1
+
+            # Compute ternary scale: scale = mean(|w|) for non-zero positions
+            non_zero_mask = w_ternary != 0
+            if non_zero_mask.any():
+                ternary_scale = w_float[non_zero_mask].abs().mean().item()
+            else:
+                ternary_scale = abs_mean.item()
+
+            # Create PTQTernaryLinear
+            ptq_linear = PTQTernaryLinear(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+                num_threads=num_threads,
+            )
+
+            # Set the ternary weights
+            N, K = w_float.shape
+            K_padded = ptq_linear.K_padded
+
+            ptq_linear.w_int8 = torch.zeros(N, K_padded, dtype=torch.int8)
+            ptq_linear.w_int8[:, :K] = w_ternary
+            ptq_linear.w_sum = ptq_linear.w_int8.sum(dim=1, dtype=torch.int32)
+            ptq_linear.scale = ternary_scale
+
+            # Copy bias
+            if module.bias is not None:
+                ptq_linear.bias = module.bias.clone()
+
+            # Calculate stats
+            w_reconstructed = ptq_linear.w_int8[:, :K].float() * ternary_scale
+            mse = ((w_float - w_reconstructed) ** 2).mean().item()
+            sparsity = (w_ternary == 0).float().mean().item()
+
+            from ptq_quantize import QuantizationStats
+            ptq_linear.quant_stats = QuantizationStats(
+                method='w8a8_ternary',
+                scale=ternary_scale,
+                sparsity=sparsity,
+                mse=mse,
+            )
+
+            # Replace module in model
+            parts = name.rsplit('.', 1)
+            if len(parts) == 1:
+                parent = w8a8_model.model
+                attr_name = parts[0]
+            else:
+                parent_name, attr_name = parts
+                parent = w8a8_model.model.get_submodule(parent_name)
+
+            setattr(parent, attr_name, ptq_linear)
+            converted_count += 1
+
+            if converted_count <= 3:
+                print(f"  {name}: MSE={mse:.2e}, sparsity={sparsity:.1%}")
+
+    print(f"\nConverted {converted_count} layers from INT8 to Ternary")
+
+    # The model wrapper is still W8A8Model but now contains PTQTernaryLinear layers
+    # We should wrap it in PTQModel for consistency
+    ptq_model = PTQModel(w8a8_model.model, w8a8_model.config)
+    ptq_model.eval()
+
+    return ptq_model, tokenizer
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 

@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from ptq_models import load_ptq_model, load_fp16_model
 from auto_quantize import load_auto_quantized_model
-from w8a8_models import load_w8a8_model
+from w8a8_models import load_w8a8_model, load_w8a8_ternary_model
 
 # Try to import matplotlib
 try:
@@ -579,8 +579,22 @@ def run_ptq_benchmark(
     print("1. Loading PTQ Ternary Model...")
     print("=" * 70)
 
-    ptq_model, tokenizer = load_ptq_model(model_name, method=quant_method)
-    ptq_name = f"PTQ Ternary ({quant_method})"
+    # Handle special methods
+    if quant_method == 'w8a8':
+        ptq_model, tokenizer = load_w8a8_model(model_name)
+        ptq_name = "W8A8 (INT8)"
+    elif quant_method == 'w8a8_ternary':
+        ptq_model, tokenizer = load_w8a8_ternary_model(model_name)
+        ptq_name = "W8A8 -> Ternary"
+    elif quant_method == 'auto_accuracy':
+        ptq_model, tokenizer, _ = load_auto_quantized_model(model_name, strategy='accuracy')
+        ptq_name = "Auto (accuracy)"
+    elif quant_method == 'auto_balanced':
+        ptq_model, tokenizer, _ = load_auto_quantized_model(model_name, strategy='balanced')
+        ptq_name = "Auto (balanced)"
+    else:
+        ptq_model, tokenizer = load_ptq_model(model_name, method=quant_method)
+        ptq_name = f"PTQ Ternary ({quant_method})"
     models_to_test.append((ptq_model, tokenizer, ptq_name))
 
     # ========================================================================
@@ -734,7 +748,7 @@ def compare_all_methods(
         output_dir = Path(__file__).parent / 'benchmark_ptq_results'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant', 'auto_accuracy', 'auto_balanced', 'w8a8']
+    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant', 'auto_accuracy', 'auto_balanced', 'w8a8', 'w8a8_ternary']
 
     print("=" * 70)
     print("PTQ Method Comparison")
@@ -842,7 +856,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0',
                         help='HuggingFace model to benchmark')
     parser.add_argument('--method', type=str, default='absmean',
-                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant', 'auto_accuracy', 'auto_balanced', 'w8a8'],
+                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant', 'auto_accuracy', 'auto_balanced', 'w8a8', 'w8a8_ternary'],
                         help='Quantization method')
     parser.add_argument('--compare-all', action='store_true',
                         help='Compare all quantization methods')
