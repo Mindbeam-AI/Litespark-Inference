@@ -465,11 +465,16 @@ def load_w8a8_ternary_model(
             mse = ((w_float - w_reconstructed) ** 2).mean().item()
             sparsity = (w_ternary == 0).float().mean().item()
 
+            # Count non-zero elements
+            original_nonzero = (w_float != 0).sum().item()
+            quantized_nonzero = (w_ternary != 0).sum().item()
+
             from ptq_quantize import QuantizationStats
             ptq_linear.quant_stats = QuantizationStats(
-                method='w8a8_ternary',
-                scale=ternary_scale,
+                original_nonzero=int(original_nonzero),
+                quantized_nonzero=int(quantized_nonzero),
                 sparsity=sparsity,
+                scale=ternary_scale,
                 mse=mse,
             )
 
