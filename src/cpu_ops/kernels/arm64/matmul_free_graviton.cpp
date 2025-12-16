@@ -1119,6 +1119,367 @@ void matmul_free_graviton_v3_fused_swiglu(
     }
 }
 
+/**
+ * Graviton v4 - Float input fused kernel
+ *
+ * Takes float input directly, performs quantization and matmul in one kernel.
+ * Eliminates Python quantization overhead entirely.
+ *
+ * Key benefits:
+ * 1. No Python->C++ round trip for quantization
+ * 2. Quantization happens in-place in registers
+ * 3. Better cache utilization (input data read once)
+ */
+void matmul_free_graviton_v4_fused(
+    torch::Tensor x_float_tensor,   // [M, K] float32 input
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8
+    torch::Tensor w_sum_tensor,     // [N] int32 (unused)
+    torch::Tensor y_tensor,         // [M, N] float32 output
+    torch::Tensor bias_tensor,
+    float weight_scale,             // Scale to apply to output
+    int M, int N, int K,
+    int num_threads
+) {
+    const float* __restrict__ x_float = x_float_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_padded = ((K + 15) / 16) * 16;
+
+    omp_set_num_threads(num_threads);
+
+    // Allocate thread-local quantized input buffers
+    #pragma omp parallel
+    {
+        // Each thread gets its own quantization buffer
+        alignas(64) int8_t x_int8_local[K_padded];
+
+        #pragma omp for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const float* x_row = x_float + m * K;
+
+            // Step 1: Quantize this row (in registers/L1)
+            // Find max absolute value using NEON
+            float32x4_t max_vec = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 3 < K; k += 4) {
+                float32x4_t x_vec = vld1q_f32(x_row + k);
+                float32x4_t abs_vec = vabsq_f32(x_vec);
+                max_vec = vmaxq_f32(max_vec, abs_vec);
+            }
+            float max_abs = vmaxvq_f32(max_vec);
+            for (; k < K; k++) {
+                float abs_val = std::abs(x_row[k]);
+                if (abs_val > max_abs) max_abs = abs_val;
+            }
+
+            float scale = max_abs / 127.0f;
+            if (scale < 1e-10f) scale = 1e-10f;
+            float inv_scale = 1.0f / scale;
+
+            // Quantize using NEON
+            float32x4_t inv_scale_vec = vdupq_n_f32(inv_scale);
+            float32x4_t min_val = vdupq_n_f32(-127.0f);
+            float32x4_t max_val = vdupq_n_f32(127.0f);
+
+            k = 0;
+            for (; k + 3 < K; k += 4) {
+                float32x4_t x_vec = vld1q_f32(x_row + k);
+                float32x4_t scaled = vmulq_f32(x_vec, inv_scale_vec);
+                scaled = vmaxq_f32(min_val, vminq_f32(max_val, scaled));
+
+                int32x4_t rounded = vcvtnq_s32_f32(scaled);
+                int16x4_t narrow16 = vmovn_s32(rounded);
+                int8x8_t narrow8 = vmovn_s16(vcombine_s16(narrow16, narrow16));
+
+                x_int8_local[k + 0] = vget_lane_s8(narrow8, 0);
+                x_int8_local[k + 1] = vget_lane_s8(narrow8, 1);
+                x_int8_local[k + 2] = vget_lane_s8(narrow8, 2);
+                x_int8_local[k + 3] = vget_lane_s8(narrow8, 3);
+            }
+            for (; k < K; k++) {
+                float val = x_row[k] * inv_scale;
+                val = std::max(-127.0f, std::min(127.0f, val));
+                x_int8_local[k] = static_cast<int8_t>(std::round(val));
+            }
+            // Zero pad
+            for (k = K; k < K_padded; k++) {
+                x_int8_local[k] = 0;
+            }
+
+            // Step 2: Compute matmul with 8-way blocking
+            float* y_row = y + m * N;
+            const float combined_scale = scale * weight_scale;
+
+            int n = 0;
+            for (; n + 7 < N; n += 8) {
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+                int32x4_t acc2 = vdupq_n_s32(0);
+                int32x4_t acc3 = vdupq_n_s32(0);
+                int32x4_t acc4 = vdupq_n_s32(0);
+                int32x4_t acc5 = vdupq_n_s32(0);
+                int32x4_t acc6 = vdupq_n_s32(0);
+                int32x4_t acc7 = vdupq_n_s32(0);
+
+                const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+                const int8_t* w4 = w_int8 + (n + 4) * K_padded;
+                const int8_t* w5 = w_int8 + (n + 5) * K_padded;
+                const int8_t* w6 = w_int8 + (n + 6) * K_padded;
+                const int8_t* w7 = w_int8 + (n + 7) * K_padded;
+
+                // K loop with 2x unrolling
+                int kk = 0;
+                for (; kk + 31 < K; kk += 32) {
+                    int8x16_t x0 = vld1q_s8(x_int8_local + kk);
+                    int8x16_t x1 = vld1q_s8(x_int8_local + kk + 16);
+
+                    acc0 = vdotq_s32(acc0, x0, vld1q_s8(w0 + kk));
+                    acc0 = vdotq_s32(acc0, x1, vld1q_s8(w0 + kk + 16));
+                    acc1 = vdotq_s32(acc1, x0, vld1q_s8(w1 + kk));
+                    acc1 = vdotq_s32(acc1, x1, vld1q_s8(w1 + kk + 16));
+                    acc2 = vdotq_s32(acc2, x0, vld1q_s8(w2 + kk));
+                    acc2 = vdotq_s32(acc2, x1, vld1q_s8(w2 + kk + 16));
+                    acc3 = vdotq_s32(acc3, x0, vld1q_s8(w3 + kk));
+                    acc3 = vdotq_s32(acc3, x1, vld1q_s8(w3 + kk + 16));
+                    acc4 = vdotq_s32(acc4, x0, vld1q_s8(w4 + kk));
+                    acc4 = vdotq_s32(acc4, x1, vld1q_s8(w4 + kk + 16));
+                    acc5 = vdotq_s32(acc5, x0, vld1q_s8(w5 + kk));
+                    acc5 = vdotq_s32(acc5, x1, vld1q_s8(w5 + kk + 16));
+                    acc6 = vdotq_s32(acc6, x0, vld1q_s8(w6 + kk));
+                    acc6 = vdotq_s32(acc6, x1, vld1q_s8(w6 + kk + 16));
+                    acc7 = vdotq_s32(acc7, x0, vld1q_s8(w7 + kk));
+                    acc7 = vdotq_s32(acc7, x1, vld1q_s8(w7 + kk + 16));
+                }
+
+                // Handle remaining K
+                for (; kk + 15 < K; kk += 16) {
+                    int8x16_t x_vec = vld1q_s8(x_int8_local + kk);
+                    acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + kk));
+                    acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + kk));
+                    acc2 = vdotq_s32(acc2, x_vec, vld1q_s8(w2 + kk));
+                    acc3 = vdotq_s32(acc3, x_vec, vld1q_s8(w3 + kk));
+                    acc4 = vdotq_s32(acc4, x_vec, vld1q_s8(w4 + kk));
+                    acc5 = vdotq_s32(acc5, x_vec, vld1q_s8(w5 + kk));
+                    acc6 = vdotq_s32(acc6, x_vec, vld1q_s8(w6 + kk));
+                    acc7 = vdotq_s32(acc7, x_vec, vld1q_s8(w7 + kk));
+                }
+
+                // Store results
+                // Note: bias must be scaled by weight_scale to match the original v3 + Python flow:
+                // v3 outputs (sum * act_scale + bias), then Python multiplies by weight_scale
+                // So we need: sum * combined_scale + bias * weight_scale
+                y_row[n + 0] = static_cast<float>(vaddvq_s32(acc0)) * combined_scale + (bias ? bias[n + 0] * weight_scale : 0.0f);
+                y_row[n + 1] = static_cast<float>(vaddvq_s32(acc1)) * combined_scale + (bias ? bias[n + 1] * weight_scale : 0.0f);
+                y_row[n + 2] = static_cast<float>(vaddvq_s32(acc2)) * combined_scale + (bias ? bias[n + 2] * weight_scale : 0.0f);
+                y_row[n + 3] = static_cast<float>(vaddvq_s32(acc3)) * combined_scale + (bias ? bias[n + 3] * weight_scale : 0.0f);
+                y_row[n + 4] = static_cast<float>(vaddvq_s32(acc4)) * combined_scale + (bias ? bias[n + 4] * weight_scale : 0.0f);
+                y_row[n + 5] = static_cast<float>(vaddvq_s32(acc5)) * combined_scale + (bias ? bias[n + 5] * weight_scale : 0.0f);
+                y_row[n + 6] = static_cast<float>(vaddvq_s32(acc6)) * combined_scale + (bias ? bias[n + 6] * weight_scale : 0.0f);
+                y_row[n + 7] = static_cast<float>(vaddvq_s32(acc7)) * combined_scale + (bias ? bias[n + 7] * weight_scale : 0.0f);
+            }
+
+            // Handle remaining N with 4-way blocking
+            for (; n + 3 < N; n += 4) {
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+                int32x4_t acc2 = vdupq_n_s32(0);
+                int32x4_t acc3 = vdupq_n_s32(0);
+
+                const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+
+                for (int kk = 0; kk + 15 < K; kk += 16) {
+                    int8x16_t x_vec = vld1q_s8(x_int8_local + kk);
+                    acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + kk));
+                    acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + kk));
+                    acc2 = vdotq_s32(acc2, x_vec, vld1q_s8(w2 + kk));
+                    acc3 = vdotq_s32(acc3, x_vec, vld1q_s8(w3 + kk));
+                }
+
+                y_row[n + 0] = static_cast<float>(vaddvq_s32(acc0)) * combined_scale + (bias ? bias[n + 0] * weight_scale : 0.0f);
+                y_row[n + 1] = static_cast<float>(vaddvq_s32(acc1)) * combined_scale + (bias ? bias[n + 1] * weight_scale : 0.0f);
+                y_row[n + 2] = static_cast<float>(vaddvq_s32(acc2)) * combined_scale + (bias ? bias[n + 2] * weight_scale : 0.0f);
+                y_row[n + 3] = static_cast<float>(vaddvq_s32(acc3)) * combined_scale + (bias ? bias[n + 3] * weight_scale : 0.0f);
+            }
+
+            // Final remainder
+            for (; n < N; n++) {
+                const int8_t* w_row = w_int8 + n * K_padded;
+                int32x4_t acc = vdupq_n_s32(0);
+
+                for (int kk = 0; kk + 15 < K; kk += 16) {
+                    acc = vdotq_s32(acc, vld1q_s8(x_int8_local + kk), vld1q_s8(w_row + kk));
+                }
+
+                y_row[n] = static_cast<float>(vaddvq_s32(acc)) * combined_scale + (bias ? bias[n] * weight_scale : 0.0f);
+            }
+        }
+    }
+}
+
+
+/**
+ * Graviton v4 Batched - Multiple projections in one kernel call
+ *
+ * Computes multiple projections (e.g., Q, K, V, O) in a single kernel call
+ * to minimize Python->C++ overhead.
+ *
+ * Args:
+ *   x_float: [M, K] float32 input (shared for all projections)
+ *   w_list: List of [N_i, K_padded] int8 weight tensors
+ *   y_list: List of [M, N_i] float32 output tensors
+ *   scale_list: Weight scales for each projection
+ *   bias_list: Optional bias tensors
+ */
+void matmul_free_graviton_v4_batched(
+    torch::Tensor x_float_tensor,           // [M, K] float32 input
+    std::vector<torch::Tensor> w_list,      // List of weight tensors
+    std::vector<torch::Tensor> y_list,      // List of output tensors
+    std::vector<float> scale_list,          // Weight scales
+    std::vector<torch::Tensor> bias_list,   // Optional biases
+    int M, int K,
+    int num_threads
+) {
+    const float* __restrict__ x_float = x_float_tensor.data_ptr<float>();
+    const int K_padded = ((K + 15) / 16) * 16;
+    const int num_projections = w_list.size();
+
+    omp_set_num_threads(num_threads);
+
+    // Allocate thread-local quantized input buffer
+    #pragma omp parallel
+    {
+        alignas(64) int8_t x_int8_local[K_padded];
+        alignas(64) float x_scales[1];  // One scale per row
+
+        #pragma omp for schedule(static)
+        for (int m = 0; m < M; m++) {
+            const float* x_row = x_float + m * K;
+
+            // Step 1: Quantize this row once
+            float32x4_t max_vec = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 3 < K; k += 4) {
+                float32x4_t x_vec = vld1q_f32(x_row + k);
+                max_vec = vmaxq_f32(max_vec, vabsq_f32(x_vec));
+            }
+            float max_abs = vmaxvq_f32(max_vec);
+            for (; k < K; k++) {
+                float abs_val = std::abs(x_row[k]);
+                if (abs_val > max_abs) max_abs = abs_val;
+            }
+
+            float scale = max_abs / 127.0f;
+            if (scale < 1e-10f) scale = 1e-10f;
+            x_scales[0] = scale;
+            float inv_scale = 1.0f / scale;
+
+            float32x4_t inv_scale_vec = vdupq_n_f32(inv_scale);
+            float32x4_t min_val = vdupq_n_f32(-127.0f);
+            float32x4_t max_val = vdupq_n_f32(127.0f);
+
+            k = 0;
+            for (; k + 3 < K; k += 4) {
+                float32x4_t x_vec = vld1q_f32(x_row + k);
+                float32x4_t scaled = vmulq_f32(x_vec, inv_scale_vec);
+                scaled = vmaxq_f32(min_val, vminq_f32(max_val, scaled));
+
+                int32x4_t rounded = vcvtnq_s32_f32(scaled);
+                int16x4_t narrow16 = vmovn_s32(rounded);
+                int8x8_t narrow8 = vmovn_s16(vcombine_s16(narrow16, narrow16));
+
+                x_int8_local[k + 0] = vget_lane_s8(narrow8, 0);
+                x_int8_local[k + 1] = vget_lane_s8(narrow8, 1);
+                x_int8_local[k + 2] = vget_lane_s8(narrow8, 2);
+                x_int8_local[k + 3] = vget_lane_s8(narrow8, 3);
+            }
+            for (; k < K; k++) {
+                float val = x_row[k] * inv_scale;
+                val = std::max(-127.0f, std::min(127.0f, val));
+                x_int8_local[k] = static_cast<int8_t>(std::round(val));
+            }
+            for (k = K; k < K_padded; k++) {
+                x_int8_local[k] = 0;
+            }
+
+            // Step 2: Compute all projections with the same quantized input
+            for (int p = 0; p < num_projections; p++) {
+                const int8_t* __restrict__ w_int8 = w_list[p].data_ptr<int8_t>();
+                float* y_row = y_list[p].data_ptr<float>() + m * y_list[p].size(1);
+                const int N = y_list[p].size(1);
+                const float combined_scale = x_scales[0] * scale_list[p];
+                const float* bias = (bias_list.size() > p && bias_list[p].defined()) ? bias_list[p].data_ptr<float>() : nullptr;
+
+                // 8-way blocked matmul
+                int n = 0;
+                for (; n + 7 < N; n += 8) {
+                    int32x4_t acc0 = vdupq_n_s32(0);
+                    int32x4_t acc1 = vdupq_n_s32(0);
+                    int32x4_t acc2 = vdupq_n_s32(0);
+                    int32x4_t acc3 = vdupq_n_s32(0);
+                    int32x4_t acc4 = vdupq_n_s32(0);
+                    int32x4_t acc5 = vdupq_n_s32(0);
+                    int32x4_t acc6 = vdupq_n_s32(0);
+                    int32x4_t acc7 = vdupq_n_s32(0);
+
+                    const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                    const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                    const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                    const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+                    const int8_t* w4 = w_int8 + (n + 4) * K_padded;
+                    const int8_t* w5 = w_int8 + (n + 5) * K_padded;
+                    const int8_t* w6 = w_int8 + (n + 6) * K_padded;
+                    const int8_t* w7 = w_int8 + (n + 7) * K_padded;
+
+                    for (int kk = 0; kk + 15 < K; kk += 16) {
+                        int8x16_t x_vec = vld1q_s8(x_int8_local + kk);
+                        acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + kk));
+                        acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + kk));
+                        acc2 = vdotq_s32(acc2, x_vec, vld1q_s8(w2 + kk));
+                        acc3 = vdotq_s32(acc3, x_vec, vld1q_s8(w3 + kk));
+                        acc4 = vdotq_s32(acc4, x_vec, vld1q_s8(w4 + kk));
+                        acc5 = vdotq_s32(acc5, x_vec, vld1q_s8(w5 + kk));
+                        acc6 = vdotq_s32(acc6, x_vec, vld1q_s8(w6 + kk));
+                        acc7 = vdotq_s32(acc7, x_vec, vld1q_s8(w7 + kk));
+                    }
+
+                    // Note: bias scaled by weight_scale to match v3 + Python flow
+                    const float ws = scale_list[p];  // weight scale for this projection
+                    y_row[n + 0] = static_cast<float>(vaddvq_s32(acc0)) * combined_scale + (bias ? bias[n + 0] * ws : 0.0f);
+                    y_row[n + 1] = static_cast<float>(vaddvq_s32(acc1)) * combined_scale + (bias ? bias[n + 1] * ws : 0.0f);
+                    y_row[n + 2] = static_cast<float>(vaddvq_s32(acc2)) * combined_scale + (bias ? bias[n + 2] * ws : 0.0f);
+                    y_row[n + 3] = static_cast<float>(vaddvq_s32(acc3)) * combined_scale + (bias ? bias[n + 3] * ws : 0.0f);
+                    y_row[n + 4] = static_cast<float>(vaddvq_s32(acc4)) * combined_scale + (bias ? bias[n + 4] * ws : 0.0f);
+                    y_row[n + 5] = static_cast<float>(vaddvq_s32(acc5)) * combined_scale + (bias ? bias[n + 5] * ws : 0.0f);
+                    y_row[n + 6] = static_cast<float>(vaddvq_s32(acc6)) * combined_scale + (bias ? bias[n + 6] * ws : 0.0f);
+                    y_row[n + 7] = static_cast<float>(vaddvq_s32(acc7)) * combined_scale + (bias ? bias[n + 7] * ws : 0.0f);
+                }
+
+                // Remainder
+                const float ws_rem = scale_list[p];  // weight scale for this projection
+                for (; n < N; n++) {
+                    const int8_t* w_row = w_int8 + n * K_padded;
+                    int32x4_t acc = vdupq_n_s32(0);
+
+                    for (int kk = 0; kk + 15 < K; kk += 16) {
+                        acc = vdotq_s32(acc, vld1q_s8(x_int8_local + kk), vld1q_s8(w_row + kk));
+                    }
+
+                    y_row[n] = static_cast<float>(vaddvq_s32(acc)) * combined_scale + (bias ? bias[n] * ws_rem : 0.0f);
+                }
+            }
+        }
+    }
+}
+
+
 // PyBind11 module
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_activations_int8_graviton", &quantize_activations_int8_graviton,
@@ -1135,4 +1496,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Graviton v3 with fused quantize");
     m.def("matmul_free_graviton_v3_fused_swiglu", &matmul_free_graviton_v3_fused_swiglu,
           "Graviton v3 with fused SwiGLU");
+    m.def("matmul_free_graviton_v4_fused", &matmul_free_graviton_v4_fused,
+          "Graviton v4: float-input fused quantize+matmul");
+    m.def("matmul_free_graviton_v4_batched", &matmul_free_graviton_v4_batched,
+          "Graviton v4: batched projections (Q,K,V,O in one call)");
 }

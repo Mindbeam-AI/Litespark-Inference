@@ -30,7 +30,7 @@ from typing import Optional, Dict, Tuple, Any
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-from ptq_quantize import prepare_ternary_weight_ptq, QuantizationStats
+from ptq_quantize import prepare_ternary_weight_ptq, QuantizationStats, collect_calibration_data
 
 
 # ============================================================================
@@ -235,6 +235,7 @@ def quantize_linear_layers(
     method: str = 'absmean',
     num_threads: int = None,
     skip_layers: Optional[list] = None,
+    calibration_data: Optional[Dict[str, list]] = None,
     **kwargs
 ) -> Dict[str, QuantizationStats]:
     """
@@ -245,6 +246,7 @@ def quantize_linear_layers(
         method: Quantization method
         num_threads: Number of threads for kernels
         skip_layers: List of layer name patterns to skip (e.g., ['lm_head', 'embed'])
+        calibration_data: Dict mapping layer names to activation tensors (for pt2_calibrated)
         **kwargs: Method-specific arguments
 
     Returns:
@@ -256,7 +258,7 @@ def quantize_linear_layers(
     def should_skip(name: str) -> bool:
         return any(pattern in name for pattern in skip_layers)
 
-    def replace_linear(parent: nn.Module, name: str, linear: nn.Linear):
+    def replace_linear(parent: nn.Module, name: str, linear: nn.Linear, full_name: str):
         """Replace a single linear layer."""
         ptq_linear = PTQTernaryLinear(
             linear.in_features,
@@ -264,7 +266,13 @@ def quantize_linear_layers(
             bias=linear.bias is not None,
             num_threads=num_threads
         )
-        ptq_linear.quantize_from_linear(linear, method=method, **kwargs)
+
+        # Add calibration activations for pt2_calibrated method
+        quant_kwargs = kwargs.copy()
+        if calibration_data is not None and full_name in calibration_data:
+            quant_kwargs['calibration_activations'] = calibration_data[full_name]
+
+        ptq_linear.quantize_from_linear(linear, method=method, **quant_kwargs)
         setattr(parent, name, ptq_linear)
         return ptq_linear.quant_stats
 
@@ -281,7 +289,7 @@ def quantize_linear_layers(
                 parent = model.get_submodule(parent_name)
 
             # Replace
-            layer_stats = replace_linear(parent, attr_name, module)
+            layer_stats = replace_linear(parent, attr_name, module, full_name)
             stats[full_name] = layer_stats
             print(f"  Quantized {full_name}: sparsity={layer_stats.sparsity:.1%}, MSE={layer_stats.mse:.2e}")
 
@@ -365,6 +373,7 @@ def load_ptq_model(
     num_threads: int = None,
     skip_lm_head: bool = True,
     skip_embeddings: bool = True,
+    calibration_samples: int = 0,
     **quant_kwargs
 ) -> Tuple[PTQModel, Any]:
     """
@@ -372,10 +381,11 @@ def load_ptq_model(
 
     Args:
         model_name: HuggingFace model name (e.g., 'microsoft/phi-2')
-        method: Quantization method ('absmean', 'percentile', 'optimal')
+        method: Quantization method ('absmean', 'percentile', 'optimal', 'pt2', 'pt2_calibrated', 'pt2_ssr')
         num_threads: Number of threads for kernels
         skip_lm_head: Don't quantize the language model head (recommended)
         skip_embeddings: Don't quantize embedding layers (they're not Linear)
+        calibration_samples: Number of calibration samples for pt2_calibrated (0 = no calibration)
         **quant_kwargs: Additional arguments for quantization method
 
     Returns:
@@ -407,6 +417,24 @@ def load_ptq_model(
     if skip_embeddings:
         skip_layers.extend(['embed', 'wte', 'wpe'])
 
+    # Collect calibration data if using calibrated methods
+    calibration_data = None
+    if method in ['pt2_calibrated', 'pt2_ssr'] and calibration_samples > 0:
+        print(f"\nCollecting calibration data ({calibration_samples} samples)...")
+        calibration_data = collect_calibration_data(
+            hf_model, tokenizer,
+            num_samples=calibration_samples,
+            max_length=512
+        )
+    elif method in ['pt2_calibrated', 'pt2_ssr']:
+        # Auto-enable calibration for these methods
+        print(f"\nMethod '{method}' works better with calibration. Collecting 32 samples...")
+        calibration_data = collect_calibration_data(
+            hf_model, tokenizer,
+            num_samples=32,
+            max_length=512
+        )
+
     # Quantize
     print(f"\nQuantizing with method='{method}'...")
     print("  Loading kernel...")
@@ -419,6 +447,7 @@ def load_ptq_model(
         method=method,
         num_threads=num_threads,
         skip_layers=skip_layers,
+        calibration_data=calibration_data,
         **quant_kwargs
     )
 
@@ -436,6 +465,8 @@ def load_ptq_model(
     print(f"  Layers quantized: {total_layers}")
     print(f"  Average sparsity: {avg_sparsity:.1%}")
     print(f"  Average MSE: {avg_mse:.2e}")
+    if calibration_data:
+        print(f"  Calibration: {len(calibration_data)} layers with activation data")
 
     return model, tokenizer
 

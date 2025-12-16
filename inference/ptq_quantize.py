@@ -586,6 +586,298 @@ def quantize_to_ternary_pt2(
     return T, avg_scale, stats
 
 
+def salient_channel_reorder(
+    weight: torch.Tensor,
+    act_scales: Optional[torch.Tensor] = None,
+    salient_percentile: float = 1.0,
+    verbose: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Salient channel Sparse Reordering (SSR) from PT²-LLM paper.
+
+    Identifies salient (outlier) channels based on activation magnitude
+    and reorders them to allow separate handling during quantization.
+
+    Args:
+        weight: [N, K] weight matrix
+        act_scales: Per-channel activation scales (if None, use weight magnitude)
+        salient_percentile: Top percentile of channels to mark as salient
+        verbose: Print debug info
+
+    Returns:
+        reorder_indices: Indices to reorder columns (salient first)
+        inverse_indices: Indices to restore original order
+        salient_mask: Boolean mask marking salient channels
+    """
+    N, K = weight.shape
+
+    # Compute channel importance
+    if act_scales is not None:
+        importance = act_scales
+    else:
+        # Use column-wise weight magnitude as proxy
+        importance = weight.abs().mean(dim=0)
+
+    # Find threshold for salient channels
+    num_salient = max(1, int(K * salient_percentile / 100))
+    threshold = torch.topk(importance, num_salient).values[-1]
+
+    # Create salient mask
+    salient_mask = importance >= threshold
+
+    # Create reorder indices: salient channels first, then rest
+    salient_indices = torch.where(salient_mask)[0]
+    non_salient_indices = torch.where(~salient_mask)[0]
+    reorder_indices = torch.cat([salient_indices, non_salient_indices])
+
+    # Create inverse indices to restore original order
+    inverse_indices = torch.zeros(K, dtype=torch.long)
+    for new_idx, old_idx in enumerate(reorder_indices):
+        inverse_indices[old_idx] = new_idx
+
+    if verbose:
+        print(f"  SSR: {salient_mask.sum().item()} salient channels ({salient_percentile:.1f}%)")
+        print(f"  Salient importance: {importance[salient_mask].mean():.4f}")
+        print(f"  Non-salient importance: {importance[~salient_mask].mean():.4f}")
+
+    return reorder_indices, inverse_indices, salient_mask
+
+
+def quantize_to_ternary_pt2_with_ssr(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    max_iters: int = 10,
+    salient_percentile: float = 1.0,
+    salient_bits: int = 8,
+    verbose: bool = False
+) -> Tuple[torch.Tensor, float, QuantizationStats, Optional[dict]]:
+    """
+    PT²-LLM with SSR: Handles salient channels separately.
+
+    Salient channels (outliers) can cause significant quantization error.
+    SSR keeps these in higher precision or handles them separately.
+
+    Args:
+        weight: [N, K] weight matrix
+        calibration_activations: Optional activation data for AGA
+        max_iters: ITF iterations
+        salient_percentile: Percentile of channels to treat as salient
+        salient_bits: Bit-width for salient channels (8 = int8, -1 = keep fp16)
+        verbose: Print progress
+
+    Returns:
+        w_ternary: Ternary weights (with salient channels handled specially)
+        scale: Average scale
+        stats: Quantization statistics
+        ssr_info: Dict with SSR metadata (salient weights, indices, etc.)
+    """
+    N, K = weight.shape
+    W = weight.float()
+
+    # Step 1: Compute activation scales if we have calibration data
+    if calibration_activations is not None and len(calibration_activations) > 0:
+        act_scales = torch.zeros(K, device=W.device, dtype=W.dtype)
+        num_samples = 0
+        for X in calibration_activations:
+            act_scales += X.float().abs().mean(dim=0)
+            num_samples += 1
+        if num_samples > 0:
+            act_scales = act_scales / num_samples
+    else:
+        act_scales = None
+
+    # Step 2: Identify and reorder salient channels
+    reorder_idx, inverse_idx, salient_mask = salient_channel_reorder(
+        W, act_scales, salient_percentile, verbose
+    )
+
+    num_salient = salient_mask.sum().item()
+
+    # Step 3: Reorder weight columns
+    W_reordered = W[:, reorder_idx]
+
+    # Step 4: Split into salient and non-salient
+    W_salient = W_reordered[:, :num_salient]  # [N, num_salient]
+    W_nonsalient = W_reordered[:, num_salient:]  # [N, K - num_salient]
+
+    # Step 5: Quantize non-salient channels with ITF
+    if W_nonsalient.shape[1] > 0:
+        T_nonsalient, alpha_nonsalient, mu_nonsalient = iterative_ternary_fitting(
+            W_nonsalient, max_iters, verbose
+        )
+
+        # Apply AGA if we have calibration data
+        if calibration_activations is not None and len(calibration_activations) > 0:
+            # Reorder activations too
+            cal_reordered = [X[:, reorder_idx][:, num_salient:] for X in calibration_activations]
+            alpha_nonsalient, mu_nonsalient = activation_aware_alignment(
+                W_nonsalient, T_nonsalient, cal_reordered, verbose
+            )
+    else:
+        T_nonsalient = torch.zeros(N, 0, dtype=torch.int8)
+        alpha_nonsalient = torch.zeros(N)
+        mu_nonsalient = torch.zeros(N)
+
+    # Step 6: Handle salient channels (keep higher precision)
+    if num_salient > 0:
+        if salient_bits == 8:
+            # Quantize to int8 (better than ternary)
+            max_abs = W_salient.abs().max(dim=1, keepdim=True).values.clamp(min=1e-10)
+            W_salient_int8 = (W_salient / max_abs * 127).round().clamp(-127, 127).to(torch.int8)
+            salient_scale = max_abs.squeeze(1)
+        else:
+            # Keep as fp16
+            W_salient_int8 = None
+            salient_scale = None
+
+    # Step 7: Combine ternary weights (salient channels get 0 in ternary)
+    # For our kernel, we'll convert salient to their "best ternary approximation"
+    # but store actual values in ssr_info for hybrid inference
+    if num_salient > 0:
+        # Approximate salient with ternary for pure-ternary inference
+        T_salient = ((W_salient / W_salient.abs().mean(dim=1, keepdim=True).clamp(min=1e-10))
+                     .round().clamp(-1, 1).to(torch.int8))
+    else:
+        T_salient = torch.zeros(N, 0, dtype=torch.int8)
+
+    # Step 8: Reassemble in reordered space, then restore original order
+    T_reordered = torch.cat([T_salient, T_nonsalient], dim=1)
+    T = T_reordered[:, inverse_idx]
+
+    # Compute combined scale (for ternary-only path)
+    avg_scale = alpha_nonsalient.mean().item() if W_nonsalient.shape[1] > 0 else 1.0
+
+    # Compute reconstruction for statistics
+    W_recon = T.float() * avg_scale
+
+    # Statistics
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (T != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+    mse = ((W - W_recon) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=avg_scale,
+        mse=mse
+    )
+
+    # SSR info for hybrid inference
+    ssr_info = {
+        'num_salient': num_salient,
+        'salient_indices': reorder_idx[:num_salient].clone() if num_salient > 0 else None,
+        'salient_weights_int8': W_salient_int8 if num_salient > 0 and salient_bits == 8 else None,
+        'salient_scale': salient_scale if num_salient > 0 and salient_bits == 8 else None,
+        'salient_weights_fp16': W_salient.half() if num_salient > 0 and salient_bits != 8 else None,
+        'reorder_indices': reorder_idx,
+        'inverse_indices': inverse_idx,
+    }
+
+    return T, avg_scale, stats, ssr_info
+
+
+def collect_calibration_data(
+    model: nn.Module,
+    tokenizer,
+    num_samples: int = 32,
+    max_length: int = 512,
+    dataset_name: str = 'wikitext'
+) -> Dict[str, list]:
+    """
+    Collect calibration activations by running samples through the model.
+
+    Args:
+        model: HuggingFace model (before quantization)
+        tokenizer: Tokenizer for the model
+        num_samples: Number of calibration samples
+        max_length: Maximum sequence length
+        dataset_name: Dataset to use for calibration
+
+    Returns:
+        Dict mapping layer names to lists of activation tensors
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("  [!] datasets not installed, skipping calibration")
+        return {}
+
+    # Load calibration dataset
+    if dataset_name == 'wikitext':
+        try:
+            dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        except:
+            print("  [!] Failed to load WikiText, using random data")
+            return {}
+    else:
+        return {}
+
+    calibration_data = {}
+    hooks = []
+
+    def make_hook(name):
+        def hook(module, input, output):
+            if name not in calibration_data:
+                calibration_data[name] = []
+            # Store input activations (what goes INTO the linear layer)
+            inp = input[0].detach()
+            if inp.dim() == 3:
+                inp = inp.view(-1, inp.shape[-1])
+            calibration_data[name].append(inp[:64])  # Limit to 64 tokens per sample
+        return hook
+
+    # Register hooks on all linear layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            hooks.append(module.register_forward_hook(make_hook(name)))
+
+    # Run calibration samples
+    model.eval()
+    samples_collected = 0
+
+    print(f"  Collecting calibration data ({num_samples} samples)...")
+
+    with torch.no_grad():
+        for i, sample in enumerate(dataset):
+            if samples_collected >= num_samples:
+                break
+
+            text = sample['text']
+            if not text.strip() or len(text) < 50:
+                continue
+
+            try:
+                encodings = tokenizer(
+                    text,
+                    return_tensors='pt',
+                    truncation=True,
+                    max_length=max_length
+                )
+                input_ids = encodings['input_ids']
+
+                if input_ids.shape[1] < 10:
+                    continue
+
+                _ = model(input_ids)
+                samples_collected += 1
+
+                if samples_collected % 10 == 0:
+                    print(f"    Collected {samples_collected}/{num_samples} samples")
+
+            except Exception as e:
+                continue
+
+    # Remove hooks
+    for hook in hooks:
+        hook.remove()
+
+    print(f"  Collected activations for {len(calibration_data)} layers")
+
+    return calibration_data
+
+
 def quantize_to_ternary_awq(
     weight: torch.Tensor,
     act_scales: Optional[torch.Tensor] = None,
@@ -709,6 +1001,12 @@ def prepare_ternary_weight_ptq(
         w_ternary, scale, stats = quantize_to_ternary_awq(weight, **kwargs)
     elif method == 'pt2':
         w_ternary, scale, stats = quantize_to_ternary_pt2(weight, **kwargs)
+    elif method == 'pt2_calibrated':
+        # PT2 with calibration - expects calibration_activations in kwargs
+        w_ternary, scale, stats = quantize_to_ternary_pt2(weight, **kwargs)
+    elif method == 'pt2_ssr':
+        # PT2 with SSR (Salient channel Sparse Reordering)
+        w_ternary, scale, stats, _ = quantize_to_ternary_pt2_with_ssr(weight, **kwargs)
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 

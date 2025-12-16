@@ -244,9 +244,13 @@ class TernaryLinear(nn.Module):
 
     Kernel selection based on benchmarks:
     - v4_large_n: Best for large N (>= 4096), e.g., MLP up/gate projections
+    - v4_fused (Graviton): Float input, fused quantize+matmul (eliminates Python overhead)
     - v3: Best for smaller N, e.g., attention projections
     - v2: Best for small layers (K <= 1024, N <= 4096)
     """
+
+    # Pre-allocated output buffer cache (shared across instances)
+    _output_cache = {}
 
     def __init__(
         self,
@@ -278,21 +282,28 @@ class TernaryLinear(nn.Module):
         if bias is not None:
             self.bias_tensor = bias.clone()
 
+    def _get_output_buffer(self, M: int) -> torch.Tensor:
+        """Get or create pre-allocated output buffer."""
+        key = (M, self.out_features)
+        if key not in TernaryLinear._output_cache:
+            TernaryLinear._output_cache[key] = torch.zeros(M, self.out_features, dtype=torch.float32)
+        return TernaryLinear._output_cache[key]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using architecture-appropriate kernel."""
         original_shape = x.shape
         x = x.view(-1, self.in_features)
         M = x.shape[0]
 
-        # Quantize input
-        x_int8, x_scale = quantize_activation(x)
-
         # Select kernel based on architecture and dimensions
         kernel = get_kernel()
         kernel_type = get_kernel_type()
 
         if kernel_type == 'vnni':
-            # x86_64 AVX-512 VNNI
+            # x86_64 AVX-512 VNNI - keep existing logic
+            # Quantize input
+            x_int8, x_scale = quantize_activation(x)
+
             if self.use_v4_large_n:
                 # v4_large_n: outputs int32, ~17x faster for large N
                 y_int32 = torch.zeros(M, self.out_features, dtype=torch.int32)
@@ -324,28 +335,30 @@ class TernaryLinear(nn.Module):
                     M, self.out_features, self.in_features, self.num_threads
                 )
                 y = y * self.scale
+
+            # Apply bias if present (for v4 path, bias wasn't applied in kernel)
+            if self.use_v4_large_n and self.bias_tensor is not None:
+                y = y + self.bias_tensor
+
         elif kernel_type == 'graviton':
-            # AWS Graviton NEON SDOT
-            # TODO: Add v4_large_n for Graviton when available
-            y = torch.zeros(M, self.out_features, dtype=torch.float32)
+            # AWS Graviton NEON SDOT - use v4_fused (float input, fused quantize+matmul)
+            # This eliminates Python quantization overhead
+            y = self._get_output_buffer(M)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-            if self.in_features <= 1024 and self.out_features <= 4096:
-                kernel.matmul_free_graviton_v2(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            else:
-                kernel.matmul_free_graviton_v3(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            y = y * self.scale
+
+            # v4_fused takes float input directly and handles quantization internally
+            kernel.matmul_free_graviton_v4_fused(
+                x.contiguous(),  # Float input
+                self.w_int8, self.w_sum,
+                y, bias,
+                self.scale,  # Weight scale applied inside kernel
+                M, self.out_features, self.in_features, self.num_threads
+            )
+            # Note: scale already applied in kernel, no need to multiply here
+
         elif kernel_type == 'neon':
             # Apple Silicon / Generic ARM NEON SDOT
+            x_int8, x_scale = quantize_activation(x)
             y = torch.zeros(M, self.out_features, dtype=torch.float32)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
             if self.in_features <= 1024 and self.out_features <= 4096:
@@ -365,10 +378,6 @@ class TernaryLinear(nn.Module):
             y = y * self.scale
         else:
             raise RuntimeError(f"Unknown kernel type: {kernel_type}")
-
-        # Apply bias if present (for v4 path, bias wasn't applied in kernel)
-        if self.use_v4_large_n and self.bias_tensor is not None:
-            y = y + self.bias_tensor
 
         # Reshape back
         output_shape = original_shape[:-1] + (self.out_features,)
@@ -547,9 +556,13 @@ class BitNetLinear(nn.Module):
 
     Kernel selection based on benchmarks:
     - v4_large_n: Best for large N (>= 4096), e.g., MLP up/gate projections
+    - v4_fused (Graviton): Float input, fused quantize+matmul (eliminates Python overhead)
     - v3: Best for smaller N, e.g., attention projections
     - v2: Best for small layers (K <= 1024, N <= 4096)
     """
+
+    # Pre-allocated output buffer cache (shared across instances)
+    _output_cache = {}
 
     def __init__(
         self,
@@ -581,20 +594,28 @@ class BitNetLinear(nn.Module):
         if bias is not None:
             self.bias_tensor = bias.clone()
 
+    def _get_output_buffer(self, M: int) -> torch.Tensor:
+        """Get or create pre-allocated output buffer."""
+        key = (M, self.out_features)
+        if key not in BitNetLinear._output_cache:
+            BitNetLinear._output_cache[key] = torch.zeros(M, self.out_features, dtype=torch.float32)
+        return BitNetLinear._output_cache[key]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using architecture-appropriate kernel."""
         original_shape = x.shape
         x = x.view(-1, self.in_features)
         M = x.shape[0]
 
-        # Quantize input
-        x_int8, x_scale = quantize_activation(x)
-
         # Select kernel based on architecture and dimensions
         kernel = get_kernel()
         kernel_type = get_kernel_type()
 
         if kernel_type == 'vnni':
+            # x86_64 AVX-512 VNNI - keep existing logic
+            # Quantize input
+            x_int8, x_scale = quantize_activation(x)
+
             if self.use_v4_large_n:
                 # v4_large_n: outputs int32, ~17x faster for large N
                 y_int32 = torch.zeros(M, self.out_features, dtype=torch.int32)
@@ -627,26 +648,30 @@ class BitNetLinear(nn.Module):
                     M, self.out_features, self.in_features, self.num_threads
                 )
                 y = y * self.scale
+
+            # Apply bias if present (for v4 path, bias wasn't applied in kernel)
+            if self.use_v4_large_n and self.bias_tensor is not None:
+                y = y + self.bias_tensor
+
         elif kernel_type == 'graviton':
-            # TODO: Add v4_large_n for Graviton when available
-            y = torch.zeros(M, self.out_features, dtype=torch.float32)
+            # AWS Graviton NEON SDOT - use v4_fused (float input, fused quantize+matmul)
+            # This eliminates Python quantization overhead
+            y = self._get_output_buffer(M)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-            if self.in_features <= 1024 and self.out_features <= 4096:
-                kernel.matmul_free_graviton_v2(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            else:
-                kernel.matmul_free_graviton_v3(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            y = y * self.scale
+
+            # v4_fused takes float input directly and handles quantization internally
+            kernel.matmul_free_graviton_v4_fused(
+                x.contiguous(),  # Float input
+                self.w_int8, self.w_sum,
+                y, bias,
+                self.scale,  # Weight scale applied inside kernel
+                M, self.out_features, self.in_features, self.num_threads
+            )
+            # Note: scale already applied in kernel, no need to multiply here
+
         elif kernel_type == 'neon':
+            # Apple Silicon / Generic ARM NEON SDOT
+            x_int8, x_scale = quantize_activation(x)
             y = torch.zeros(M, self.out_features, dtype=torch.float32)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
             if self.in_features <= 1024 and self.out_features <= 4096:
@@ -666,10 +691,6 @@ class BitNetLinear(nn.Module):
             y = y * self.scale
         else:
             raise RuntimeError(f"Unknown kernel type: {kernel_type}")
-
-        # Apply bias if present (for v4 path, bias wasn't applied in kernel)
-        if self.use_v4_large_n and self.bias_tensor is not None:
-            y = y + self.bias_tensor
 
         # Reshape back
         output_shape = original_shape[:-1] + (self.out_features,)

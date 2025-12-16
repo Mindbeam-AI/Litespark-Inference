@@ -1,0 +1,37 @@
+{
+  "timestamp": "2025-12-15T09:16:00.241301",
+  "platform": "arm64",
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "quant_method": "absmean",
+  "config": {
+    "ppl_max_samples": 10,
+    "ppl_max_length": 512
+  },
+  "perplexity": {
+    "PTQ Ternary (absmean)": 48962.828125,
+    "Original FP16": 10.309760093688965
+  },
+  "short_benchmark": {
+    "PTQ Ternary (absmean)": {
+      "name": "PTQ Ternary (absmean)",
+      "mean_ttft_ms": 298.53859599999873,
+      "std_ttft_ms": 3.28806209564209,
+      "mean_gen_time_ms": 6037.772633399998,
+      "tokens_per_sec": 3.3124798190251785,
+      "memory_mb": 6773.515625,
+      "sample_output": "The future of artificial intelligence is resolution resolution resolution resolution resolution persist persist persist persist persist persist persist persist persist persist persist persist persist persist persist"
+    },
+    "Original FP16": {
+      "name": "Original FP16",
+      "mean_ttft_ms": 80.20945410000166,
+      "std_ttft_ms": 10.751240730285645,
+      "mean_gen_time_ms": 3085.8673668000024,
+      "tokens_per_sec": 6.4811599536566264,
+      "memory_mb": 6773.515625,
+      "sample_output": "The future of artificial intelligence is bright, but it's not without its challenges. In this episode, we explore the potential"
+    }
+  },
+  "prefill_scaling": {},
+  "batch_scaling": {},
+  "generation_scaling": {}
+}

@@ -937,9 +937,9 @@ def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_d
                     f'{val:.0f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     plt.tight_layout()
-    plt.savefig(output_dir / 'model_comparison.png', dpi=150, bbox_inches='tight')
+    plt.savefig(output_dir / 'model_comparison_short.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {output_dir / 'model_comparison.png'}")
+    print(f"Saved: {output_dir / 'model_comparison_short.png'}")
 
     # Graph 2: Kernel speedup vs batch size
     if kernel_results:
@@ -976,9 +976,9 @@ def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_d
                     f'{speedup:.2f}x', ha='center', va='bottom', fontsize=9, fontweight='bold')
 
         plt.tight_layout()
-        plt.savefig(output_dir / 'kernel_speedup.png', dpi=150, bbox_inches='tight')
+        plt.savefig(output_dir / 'kernel_speedup_short.png', dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"Saved: {output_dir / 'kernel_speedup.png'}")
+        print(f"Saved: {output_dir / 'kernel_speedup_short.png'}")
 
     # Graph 3: Speedup summary
     if len(results) >= 2:
@@ -1006,9 +1006,9 @@ def create_comparison_graphs(results: List[Dict], kernel_results: Dict, output_d
                    f'{val:.2f}x', ha='center', va='bottom', fontsize=11, fontweight='bold')
 
         plt.tight_layout()
-        plt.savefig(output_dir / 'speedup_summary.png', dpi=150, bbox_inches='tight')
+        plt.savefig(output_dir / 'speedup_summary_short.png', dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"Saved: {output_dir / 'speedup_summary.png'}")
+        print(f"Saved: {output_dir / 'speedup_summary_short.png'}")
 
 
 def save_results(results: List[Dict], kernel_results: Dict, accuracy: Dict,
@@ -1029,7 +1029,7 @@ def save_results(results: List[Dict], kernel_results: Dict, accuracy: Dict,
         'numerical_accuracy': accuracy,
     }
 
-    results_file = output_dir / 'benchmark_results.json'
+    results_file = output_dir / 'benchmark_short_results.json'
     with open(results_file, 'w') as f:
         json.dump(all_results, f, indent=2, default=str)
     print(f"Saved: {results_file}")
@@ -1037,7 +1037,7 @@ def save_results(results: List[Dict], kernel_results: Dict, accuracy: Dict,
     # Also save a human-readable summary
     # Determine display name based on architecture
     arch_display = "X86" if arch_info['machine'] == 'x86_64' else "GRAVITON"
-    summary_file = output_dir / 'benchmark_summary.txt'
+    summary_file = output_dir / 'benchmark_short_summary.txt'
     with open(summary_file, 'w') as f:
         f.write("=" * 70 + "\n")
         f.write(f"{arch_display} BENCHMARK SUMMARY\n")
