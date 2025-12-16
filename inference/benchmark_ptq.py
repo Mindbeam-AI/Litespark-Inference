@@ -784,6 +784,8 @@ def compare_all_methods(
             # Load model with appropriate loader
             if method == 'w8a8':
                 ptq_model, tokenizer = load_w8a8_model(model_name)
+            elif method == 'w8a8_ternary':
+                ptq_model, tokenizer = load_w8a8_ternary_model(model_name)
             elif method.startswith('auto_'):
                 strategy = method.replace('auto_', '')  # 'accuracy' or 'balanced'
                 ptq_model, tokenizer, _ = load_auto_quantized_model(
