@@ -34,6 +34,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from ptq_models import load_ptq_model, load_fp16_model
+from auto_quantize import load_auto_quantized_model
+from w8a8_models import load_w8a8_model
 
 # Try to import matplotlib
 try:
@@ -732,7 +734,7 @@ def compare_all_methods(
         output_dir = Path(__file__).parent / 'benchmark_ptq_results'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant']
+    methods = ['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant', 'auto_accuracy', 'auto_balanced', 'w8a8']
 
     print("=" * 70)
     print("PTQ Method Comparison")
@@ -765,10 +767,20 @@ def compare_all_methods(
         print("=" * 70)
 
         try:
-            ptq_model, tokenizer = load_ptq_model(
-                model_name, method=method,
-                use_cache=use_cache, force_requantize=force_requantize
-            )
+            # Load model with appropriate loader
+            if method == 'w8a8':
+                ptq_model, tokenizer = load_w8a8_model(model_name)
+            elif method.startswith('auto_'):
+                strategy = method.replace('auto_', '')  # 'accuracy' or 'balanced'
+                ptq_model, tokenizer, _ = load_auto_quantized_model(
+                    model_name, strategy=strategy,
+                    use_cache=use_cache, force_requantize=force_requantize
+                )
+            else:
+                ptq_model, tokenizer = load_ptq_model(
+                    model_name, method=method,
+                    use_cache=use_cache, force_requantize=force_requantize
+                )
 
             print("\n  Evaluating perplexity...")
             ppl, ppl_stats = evaluate_perplexity(ptq_model, tokenizer, max_samples=config.ppl_max_samples)
@@ -830,7 +842,7 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0',
                         help='HuggingFace model to benchmark')
     parser.add_argument('--method', type=str, default='absmean',
-                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant'],
+                        choices=['absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq', 'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant', 'auto_accuracy', 'auto_balanced', 'w8a8'],
                         help='Quantization method')
     parser.add_argument('--compare-all', action='store_true',
                         help='Compare all quantization methods')
