@@ -959,6 +959,27 @@ def quantize_to_ternary_awq(
     return w_ternary, scale, stats
 
 
+def _hadamard_matrix(n: int) -> torch.Tensor:
+    """
+    Generate a Hadamard matrix of size n x n using Sylvester's construction.
+    n must be a power of 2.
+    """
+    if n == 1:
+        return torch.tensor([[1.0]])
+
+    # Check if n is a power of 2
+    if n & (n - 1) != 0:
+        raise ValueError(f"Hadamard matrix size must be a power of 2, got {n}")
+
+    # Recursive Sylvester construction
+    H_half = _hadamard_matrix(n // 2)
+    H = torch.cat([
+        torch.cat([H_half, H_half], dim=1),
+        torch.cat([H_half, -H_half], dim=1)
+    ], dim=0)
+    return H
+
+
 def get_randomized_hadamard_transform(
     dim: int,
     device: torch.device,
@@ -969,19 +990,22 @@ def get_randomized_hadamard_transform(
     U = D1 * H * D2 * H * D3, where H is Hadamard and Di are random diagonal matrices.
     This creates a random orthogonal matrix.
     """
-    try:
-        from scipy.linalg import hadamard
-    except ImportError:
-        raise ImportError("scipy is required for QuIP quantization. Install with: pip install scipy")
+    # Find the next power of 2 >= dim
+    n = 1
+    while n < dim:
+        n *= 2
 
-    # Create Hadamard matrix (use hadamard instead of fwht for simpler API)
-    H_np = hadamard(dim) / (dim ** 0.5)
-    H = torch.tensor(H_np, device=device, dtype=dtype)
+    # Generate Hadamard matrix (pure PyTorch, no scipy needed)
+    H_full = _hadamard_matrix(n)
+    # Normalize
+    H_full = H_full / (n ** 0.5)
+    # Truncate to dim x dim if needed
+    H = H_full[:dim, :dim].to(device=device, dtype=dtype)
 
-    # Create random diagonal matrices
-    D1 = torch.diag(torch.randint(0, 2, (dim,), device=device, dtype=dtype) * 2 - 1)
-    D2 = torch.diag(torch.randint(0, 2, (dim,), device=device, dtype=dtype) * 2 - 1)
-    
+    # Create random diagonal matrices (random signs)
+    D1 = torch.diag((torch.randint(0, 2, (dim,), device=device).float() * 2 - 1).to(dtype))
+    D2 = torch.diag((torch.randint(0, 2, (dim,), device=device).float() * 2 - 1).to(dtype))
+
     # Combine to form the orthogonal matrix
     U = D1 @ H @ D2 @ H
     return U
@@ -1153,30 +1177,46 @@ def compute_lorc(
     Approximates the quantization error matrix E = W - W_q_recon with
     two low-rank matrices, L and R, such that E ≈ L @ R.
 
+    For the forward pass, we need: y_corrected = y + x @ E.T
+    where x is [M, K], E is [N, K], and y is [M, N].
+
+    So we compute: x @ E.T = x @ (L @ R).T = x @ R.T @ L.T
+
+    We return L_out = R.T [K, rank] and R_out = L.T [rank, N]
+    so forward pass computes: (x @ L_out) @ R_out = x @ R.T @ L.T = x @ E.T
+
     Args:
-        W: Original full-precision weight matrix.
-        W_q_recon: Reconstructed quantized weight matrix.
+        W: Original full-precision weight matrix [N, K].
+        W_q_recon: Reconstructed quantized weight matrix [N, K].
         rank: The rank for the low-rank approximation.
 
     Returns:
-        L: The first low-rank matrix.
-        R: The second low-rank matrix.
+        L_out: [K, rank] matrix for forward pass
+        R_out: [rank, N] matrix for forward pass
     """
-    error = W - W_q_recon
-    
+    error = W - W_q_recon  # [N, K]
+
     # Using SVD to find the best low-rank approximation
+    # error = U @ S @ Vh where U is [N, N], S is [min(N,K)], Vh is [K, K]
     U, S, Vh = torch.linalg.svd(error, full_matrices=False)
-    
+
     # Keep the top 'rank' singular values
-    U_r = U[:, :rank]
-    S_r = torch.diag(S[:rank])
-    Vh_r = Vh[:rank, :]
-    
-    # L and R matrices
-    L = U_r @ S_r
-    R = Vh_r
-    
-    return L, R
+    U_r = U[:, :rank]      # [N, rank]
+    S_r = torch.diag(S[:rank])  # [rank, rank]
+    Vh_r = Vh[:rank, :]    # [rank, K]
+
+    # Original decomposition: E ≈ (U_r @ S_r) @ Vh_r = L @ R
+    # L = U_r @ S_r  [N, rank]
+    # R = Vh_r       [rank, K]
+
+    # For forward: x @ E.T = x @ R.T @ L.T
+    # So L_out = R.T = Vh_r.T  [K, rank]
+    # And R_out = L.T = (U_r @ S_r).T = S_r @ U_r.T  [rank, N]
+
+    L_out = Vh_r.T  # [K, rank]
+    R_out = S_r @ U_r.T  # [rank, N]
+
+    return L_out, R_out
 
 
 def prepare_ternary_weight_ptq(
