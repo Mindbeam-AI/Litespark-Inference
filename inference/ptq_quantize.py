@@ -959,9 +959,6 @@ def quantize_to_ternary_awq(
     return w_ternary, scale, stats
 
 
-from scipy.linalg import fwht
-
-
 def get_randomized_hadamard_transform(
     dim: int,
     device: torch.device,
@@ -972,8 +969,14 @@ def get_randomized_hadamard_transform(
     U = D1 * H * D2 * H * D3, where H is Hadamard and Di are random diagonal matrices.
     This creates a random orthogonal matrix.
     """
-    # Create Hadamard matrix
-    H = torch.tensor(fwht(torch.eye(dim, device=device, dtype=dtype)), device=device, dtype=dtype) / (dim ** 0.5)
+    try:
+        from scipy.linalg import hadamard
+    except ImportError:
+        raise ImportError("scipy is required for QuIP quantization. Install with: pip install scipy")
+
+    # Create Hadamard matrix (use hadamard instead of fwht for simpler API)
+    H_np = hadamard(dim) / (dim ** 0.5)
+    H = torch.tensor(H_np, device=device, dtype=dtype)
 
     # Create random diagonal matrices
     D1 = torch.diag(torch.randint(0, 2, (dim,), device=device, dtype=dtype) * 2 - 1)
