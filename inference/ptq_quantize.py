@@ -1224,6 +1224,238 @@ def quantize_to_ternary_quip(
     return w_ternary, scale, stats, quip_info
 
 
+# ----------------------------------------------------------------------------
+# Learned / experimental variants
+# ----------------------------------------------------------------------------
+
+def get_butterfly_transform(
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype
+) -> torch.Tensor:
+    """
+    Construct an orthogonal transform using a QR factorization of a random
+    Gaussian matrix (cheap surrogate for learnable butterfly/QuaRot).
+    """
+    rnd = torch.randn(dim, dim, device=device, dtype=dtype)
+    q, _ = torch.linalg.qr(rnd, mode='reduced')
+    return q
+
+
+def quantize_to_ternary_butterfly(
+    weight: torch.Tensor,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    Butterfly/QuaRot-style ternary quantization:
+    - Build an orthogonal transform U (QR on random matrix)
+    - Transform columns: W' = W @ U.T
+    - Quantize W' with PT² backend
+    """
+    N, K = weight.shape
+    U = get_butterfly_transform(K, weight.device, weight.dtype)
+    W_rot = weight.float() @ U.T
+
+    if kwargs.get('verbose', False):
+        print("  Applying butterfly/QR orthogonal transform before PT².")
+
+    w_ternary, scale, stats = quantize_to_ternary_pt2(W_rot, **kwargs)
+    info = {'U': U, 'original_shape': (N, K)}
+    return w_ternary, scale, stats, info
+
+
+def quantize_to_ternary_cqe_plus(
+    weight: torch.Tensor,
+    sv_clip_percentile: float = 99.0,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    Cross-layer singular-value preconditioning (CQE+/SVD clamp surrogate):
+    - SVD on weight, clamp singular values to a percentile to tame outliers
+    - Recompose and quantize with PT²
+    """
+    W = weight.float()
+    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+    if sv_clip_percentile <= 0 or sv_clip_percentile > 100:
+        sv_clip = S.max()
+    else:
+        sv_clip = torch.quantile(S, sv_clip_percentile / 100.0)
+    S_clamped = torch.clamp(S, max=sv_clip)
+    W_pre = (U * S_clamped.unsqueeze(0)) @ Vh
+
+    if kwargs.get('verbose', False):
+        print(f"  SVD clamp: clip@{sv_clip_percentile:.1f}pct -> {sv_clip.item():.4f}")
+
+    return quantize_to_ternary_pt2(W_pre, **kwargs)
+
+
+def quantize_to_ternary_pt2_v2(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    max_iters: int = 10,
+    verbose: bool = False
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    PT² with asymmetric per-row scales and lightweight bias correction.
+    - Start from PT² ternary (T, alpha, mu)
+    - Derive separate positive/negative scales per row (a,b)
+    - Return average scale for kernel; stash a,b for reconstruction
+    """
+    T, alpha, mu = iterative_ternary_fitting(weight, max_iters, verbose)
+
+    T_float = T.float()
+    W = weight.float()
+    pos_mask = T_float > 0
+    neg_mask = T_float < 0
+
+    # Per-row asymmetric scales
+    pos_scale = (W * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1).clamp(min=1))
+    neg_scale = (W * neg_mask).sum(dim=1).abs() / (neg_mask.sum(dim=1).clamp(min=1))
+    asym_scale = (pos_scale + neg_scale).clamp(min=1e-8) / 2.0
+
+    # Reconstruct with asym scales and bias mu
+    W_recon = T_float * asym_scale.unsqueeze(1) + mu.unsqueeze(1)
+
+    if calibration_activations is not None and len(calibration_activations) > 0:
+        # Optional AGA refinement
+        alpha_refined, mu_refined = activation_aware_alignment(W, T, calibration_activations, verbose)
+        W_recon = T_float * alpha_refined.unsqueeze(1) + mu_refined.unsqueeze(1)
+        asym_scale = alpha_refined
+
+    original_nonzero = (weight != 0).sum().item()
+    quantized_nonzero = (T != 0).sum().item()
+    sparsity = 1.0 - (quantized_nonzero / weight.numel())
+    mse = ((W - W_recon) ** 2).mean().item()
+
+    avg_scale = asym_scale.mean().item()
+    stats = QuantizationStats(
+        original_nonzero=original_nonzero,
+        quantized_nonzero=quantized_nonzero,
+        sparsity=sparsity,
+        scale=avg_scale,
+        mse=mse
+    )
+
+    extra = {
+        'asym_pos_scale': pos_scale,
+        'asym_neg_scale': neg_scale,
+        'bias_mu': mu,
+    }
+
+    return T, avg_scale, stats, extra
+
+
+def quantize_to_ternary_awq_v2(
+    weight: torch.Tensor,
+    group_size: int = 64,
+    target_sparsity: float = 0.33,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    AWQ-style ternary with group-wise (or head-wise) scaling.
+    Columns are grouped (default 64); important groups get lower thresholds.
+    """
+    N, K = weight.shape
+    num_groups = max(1, K // group_size)
+    # Group importance by mean magnitude
+    imp = weight.abs().view(N, num_groups, -1).mean(dim=2).mean(dim=0)
+    # Normalize importance
+    imp = imp / (imp.max() + 1e-8)
+
+    base_threshold = torch.quantile(weight.abs().flatten(), target_sparsity).item()
+    thresholds = base_threshold / (0.5 + imp)  # important groups get lower threshold
+
+    w_ternary = torch.zeros_like(weight, dtype=torch.int8)
+    for g in range(num_groups):
+        start = g * group_size
+        end = min((g + 1) * group_size, K)
+        thr = thresholds[g].item()
+        block = weight[:, start:end]
+        w_ternary[:, start:end][block > thr] = 1
+        w_ternary[:, start:end][block < -thr] = -1
+
+    mask = w_ternary != 0
+    scale = weight.abs()[mask].mean().item() if mask.sum() > 0 else 1.0
+
+    w_reconstructed = w_ternary.float() * scale
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+    stats = QuantizationStats(
+        original_nonzero=(weight != 0).sum().item(),
+        quantized_nonzero=mask.sum().item(),
+        sparsity=1.0 - (mask.sum().item() / weight.numel()),
+        scale=scale,
+        mse=mse
+    )
+    return w_ternary, scale, stats
+
+
+def quantize_to_ternary_smoothquant_v2(
+    weight: torch.Tensor,
+    act_scales: Optional[torch.Tensor] = None,
+    threshold_percentile: float = 70.0,
+    stochastic_round: bool = False,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats]:
+    """
+    SmoothQuant variant with percentile thresholding and optional stochastic rounding.
+    """
+    N, K = weight.shape
+    if act_scales is None:
+        act_scales = weight.abs().mean(dim=0) + 1e-10
+    w_scales = weight.abs().max(dim=0).values + 1e-10
+    smooth_scales = (act_scales ** 0.5) / (w_scales ** 0.5)
+    w_smooth = weight * smooth_scales.unsqueeze(0)
+
+    abs_weight = w_smooth.abs()
+    threshold = torch.quantile(abs_weight.flatten(), threshold_percentile / 100.0).item()
+
+    if stochastic_round:
+        noise = torch.empty_like(w_smooth).uniform_(-0.5, 0.5) * threshold * 0.05
+        w_smooth = w_smooth + noise
+
+    mask = abs_weight > threshold
+    scale = abs_weight[mask].mean().item() if mask.sum() > 0 else 1.0
+
+    w_ternary = torch.zeros_like(weight, dtype=torch.int8)
+    w_ternary[w_smooth > threshold] = 1
+    w_ternary[w_smooth < -threshold] = -1
+
+    w_reconstructed = (w_ternary.float() * scale) / smooth_scales.unsqueeze(0)
+    mse = ((weight - w_reconstructed) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=(weight != 0).sum().item(),
+        quantized_nonzero=(w_ternary != 0).sum().item(),
+        sparsity=1.0 - ((w_ternary != 0).sum().item() / weight.numel()),
+        scale=scale,
+        mse=mse
+    )
+    return w_ternary, scale, stats
+
+
+def quantize_to_ternary_pt2_ssr_v2(
+    weight: torch.Tensor,
+    salient_percentile: float = 0.5,
+    salient_bits: int = 8,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats, Optional[dict]]:
+    """
+    Enhanced SSR: smaller salient set + optional int8 stash for salient columns.
+    """
+    T, scale, stats, ssr_info = quantize_to_ternary_pt2_with_ssr(
+        weight,
+        salient_percentile=salient_percentile,
+        salient_bits=salient_bits,
+        **kwargs
+    )
+    if ssr_info and ssr_info.get('salient_weights_int8') is None and ssr_info.get('num_salient', 0) > 0:
+        # Build int8 copy for salient columns
+        W_sal = weight[:, ssr_info['salient_indices']].float()
+        max_abs = W_sal.abs().max(dim=1, keepdim=True).values.clamp(min=1e-10)
+        W_int8 = (W_sal / max_abs * 127).round().clamp(-127, 127).to(torch.int8)
+        ssr_info['salient_weights_int8'] = W_int8
+        ssr_info['salient_scale'] = max_abs.squeeze(1)
+    return T, scale, stats, ssr_info
 
 import torch.optim as optim
 
@@ -1663,6 +1895,25 @@ def prepare_ternary_weight_ptq(
         w_ternary, scale, stats = quantize_to_ternary_perchannel_hessian(weight, **kwargs)
         extra_info['scale_w'] = scale  # Store per-channel scales
         scale = scale.mean().item()  # Use mean for backward compat
+    elif method == 'pt2_v2':
+        w_ternary, scale, stats, extra = quantize_to_ternary_pt2_v2(weight, **kwargs)
+        extra_info.update(extra)
+    elif method == 'quip_v2':
+        w_ternary, scale, stats, quip_info = quantize_to_ternary_butterfly(weight, **kwargs)
+        if quip_info:
+            extra_info.update(quip_info)
+    elif method == 'awq_v2':
+        w_ternary, scale, stats = quantize_to_ternary_awq_v2(weight, **kwargs)
+    elif method == 'smoothquant_v2':
+        w_ternary, scale, stats = quantize_to_ternary_smoothquant_v2(weight, **kwargs)
+    elif method == 'pt2_ssr_v2':
+        w_ternary, scale, stats, ssr_info = quantize_to_ternary_pt2_ssr_v2(weight, **kwargs)
+        if ssr_info: extra_info.update(ssr_info)
+    elif method == 'butterfly':
+        w_ternary, scale, stats, info = quantize_to_ternary_butterfly(weight, **kwargs)
+        if info: extra_info.update(info)
+    elif method == 'cqe_plus':
+        w_ternary, scale, stats = quantize_to_ternary_cqe_plus(weight, **kwargs)
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 
