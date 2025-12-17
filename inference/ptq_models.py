@@ -145,6 +145,10 @@ class PTQTernaryLinear(nn.Module):
         # Per-channel weight scales (for perchannel quantization methods)
         self.register_buffer('scale_w', None)  # [N] tensor or None
 
+        # SSR residual correction (store salient column indices and their residuals)
+        self.register_buffer('ssr_indices', None)
+        self.register_buffer('ssr_delta', None)  # [out_features, num_salient]
+
 
     def quantize_from_linear(
         self,
@@ -175,6 +179,7 @@ class PTQTernaryLinear(nn.Module):
         if extra_info:
             if 'salient_indices' in extra_info:
                 self.ssr_info = extra_info
+                self._prepare_ssr_correction(weight, extra_info)
             if 'U' in extra_info:  # Simplified one-sided transform
                 self.quip_info = extra_info
                 self.U = extra_info['U'].to(weight.device)
@@ -188,6 +193,45 @@ class PTQTernaryLinear(nn.Module):
         # Copy bias if present
         if linear.bias is not None:
             self.bias = linear.bias.data.clone()
+
+    def _prepare_ssr_correction(self, full_weight: torch.Tensor, extra_info: Dict):
+        """
+        Precompute a residual matmul for salient channels (SSR).
+        We correct the ternary output with:
+            y += x[:, idx] @ (W_fp16[:, idx] - W_ternary[:, idx])^T
+        Only a small fraction of columns (outliers) are stored, so memory/runtime
+        impact stays low while recovering most of the lost accuracy.
+        """
+        salient_idx = extra_info.get('salient_indices')
+        if salient_idx is None:
+            return
+
+        if not torch.is_tensor(salient_idx):
+            salient_idx = torch.tensor(salient_idx, device=full_weight.device, dtype=torch.long)
+        else:
+            salient_idx = salient_idx.to(full_weight.device, dtype=torch.long)
+
+        if salient_idx.numel() == 0:
+            return
+
+        # Clamp indices to valid range in case upstream rounding produced overflow
+        salient_idx = salient_idx.clamp(min=0, max=full_weight.shape[1] - 1)
+
+        # Reconstruct ternary approximation for salient columns
+        ternary = self.w_int8[:, :full_weight.shape[1]].float()
+        if self.scale_w is not None:
+            ternary = ternary * self.scale_w.unsqueeze(1)
+        else:
+            ternary = ternary * self.scale
+        ternary_salient = ternary[:, salient_idx]
+
+        # Ground-truth salient weights (from original float weight)
+        weight_salient = full_weight[:, salient_idx].float()
+
+        delta = weight_salient - ternary_salient
+        # Store as float32 for numerical stability; small footprint since num_salient is tiny
+        self.ssr_indices = salient_idx
+        self.ssr_delta = delta.contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using ternary kernel (or PyTorch fallback on macOS)."""
@@ -228,6 +272,7 @@ class PTQTernaryLinear(nn.Module):
 
         # Save original x for LoRC (before any transforms)
         x_for_lorc = x if (self.lorc_L is not None) else None
+        x_for_ssr = x  # Keep high-precision activations for SSR correction
 
         if self.U is not None:
             # QuIP: pre-transform input by U.T to undo the column transform
@@ -281,6 +326,12 @@ class PTQTernaryLinear(nn.Module):
         if self.lorc_L is not None and self.lorc_R is not None:
             lorc_correction = (x_for_lorc @ self.lorc_L) @ self.lorc_R
             y = y + lorc_correction
+
+        # Apply SSR residual correction for salient channels (tiny dense matmul)
+        if self.ssr_delta is not None and self.ssr_indices is not None:
+            # Use float activations for accuracy; x_for_ssr already contains any QuIP transform
+            x_salient = x_for_ssr.float()[:, self.ssr_indices]
+            y = y + x_salient @ self.ssr_delta.t()
 
         # Reshape output
         output_shape = original_shape[:-1] + (self.out_features,)
@@ -474,17 +525,20 @@ def save_quantized_model(model: nn.Module, cache_path: Path, quant_stats: Dict):
     ptq_state = {}
     for name, module in model.named_modules():
         if isinstance(module, PTQTernaryLinear):
-            ptq_state[name] = {
-                'w_int8': module.w_int8,
-                'w_sum': module.w_sum,
-                'scale': module.scale,
-                'bias': module.bias,
-                'in_features': module.in_features,
-                'out_features': module.out_features,
-                'U': module.U,
-                'lorc_L': module.lorc_L,
-                'lorc_R': module.lorc_R,
-            }
+                ptq_state[name] = {
+                    'w_int8': module.w_int8,
+                    'w_sum': module.w_sum,
+                    'scale': module.scale,
+                    'bias': module.bias,
+                    'in_features': module.in_features,
+                    'out_features': module.out_features,
+                    'U': module.U,
+                    'lorc_L': module.lorc_L,
+                    'lorc_R': module.lorc_R,
+                    'scale_w': module.scale_w,
+                    'ssr_indices': module.ssr_indices,
+                    'ssr_delta': module.ssr_delta,
+                }
 
     torch.save({
         'ptq_state': ptq_state,
@@ -547,6 +601,9 @@ def load_quantized_model(
                 ptq_linear.U = state['U']
                 ptq_linear.lorc_L = state['lorc_L']
                 ptq_linear.lorc_R = state['lorc_R']
+                ptq_linear.scale_w = state.get('scale_w')
+                ptq_linear.ssr_indices = state.get('ssr_indices')
+                ptq_linear.ssr_delta = state.get('ssr_delta')
 
                 setattr(parent, attr_name, ptq_linear)
 
