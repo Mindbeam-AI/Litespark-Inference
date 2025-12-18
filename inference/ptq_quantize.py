@@ -312,7 +312,8 @@ def quantize_to_ternary_percentile(
 
 def quantize_to_ternary_optimal(
     weight: torch.Tensor,
-    target_sparsity: float = 0.33
+    target_sparsity: float = 0.33,
+    **kwargs  # Accept extra args like calibration_activations
 ) -> Tuple[torch.Tensor, float, QuantizationStats]:
     """
     Quantize with optimal scale to minimize MSE for given sparsity target.

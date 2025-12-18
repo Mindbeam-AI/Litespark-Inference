@@ -32,7 +32,7 @@ ADV_METHODS = [
     'absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq',
     'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant',
     'auto_accuracy', 'auto_balanced', 'w8a8', 'w8a8_ternary',
-    'mixed_attention',
+    'mixed_attention', '2bit',
     # new/v2
     'pt2_v2', 'quip_v2', 'awq_v2', 'smoothquant_v2', 'pt2_ssr_v2',
     'mixed_attention_v2', 'butterfly', 'cqe_plus',
