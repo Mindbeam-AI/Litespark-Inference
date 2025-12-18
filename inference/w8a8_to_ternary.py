@@ -151,6 +151,8 @@ def main():
     parser.add_argument('--ppl-samples', type=int, default=50, help='Samples for perplexity eval')
     parser.add_argument('--no-cache', action='store_true', help='Skip saving cache')
     parser.add_argument('--force-requantize', action='store_true', help='Ignore any caches in loaders')
+    parser.add_argument('--distill-steps', type=int, default=50, help='KD steps for distill-enabled methods')
+    parser.add_argument('--distill-lr', type=float, default=1e-2, help='LR for distillation scale tuning')
     args = parser.parse_args()
 
     # Load W8A8 model
@@ -184,6 +186,8 @@ def main():
             model,
             method=method,
             calibration_data=calibration_data,
+            distill_steps=args.distill_steps,
+            lr=args.distill_lr,
         )
 
         # Wrap

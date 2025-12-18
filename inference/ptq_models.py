@@ -153,6 +153,8 @@ class PTQTernaryLinear(nn.Module):
         self.register_buffer('outlier_indices', None)
         self.register_buffer('outlier_w_int8', None)
         self.register_buffer('outlier_scale', None)
+        self.register_buffer('scale_row', None)  # For distillation-refined scales
+        self.register_buffer('bias_row', None)
 
 
     def quantize_from_linear(
@@ -199,6 +201,10 @@ class PTQTernaryLinear(nn.Module):
                 self.outlier_w_int8 = extra_info['outlier_w_int8'].to(weight.device)
             if 'outlier_scale' in extra_info:
                 self.outlier_scale = extra_info['outlier_scale'].to(weight.device)
+            if 'scale_row' in extra_info:
+                self.scale_row = extra_info['scale_row'].to(weight.device)
+            if 'bias_row' in extra_info:
+                self.bias_row = extra_info['bias_row'].to(weight.device)
 
 
         # Copy bias if present
@@ -324,10 +330,14 @@ class PTQTernaryLinear(nn.Module):
                     M, self.out_features, self.w_int8.shape[1], self.num_threads
                 )
 
-            # Apply weight scale (per-channel or scalar)
-            if self.scale_w is not None:
-                # Per-channel: y[m, n] = y[m, n] * scale_w[n]
-                y = y * self.scale_w.unsqueeze(0)
+        # Apply weight scale (per-channel or scalar)
+        if self.scale_w is not None:
+            # Per-channel: y[m, n] = y[m, n] * scale_w[n]
+            y = y * self.scale_w.unsqueeze(0)
+        else:
+            # Optionally override with distillation-refined per-row scales
+            if self.scale_row is not None:
+                y = y * self.scale_row.unsqueeze(0)
             else:
                 y = y * self.scale
 
@@ -349,6 +359,10 @@ class PTQTernaryLinear(nn.Module):
             # Use float activations for accuracy; x_for_ssr already contains any QuIP transform
             x_salient = x_for_ssr.float()[:, self.ssr_indices]
             y = y + x_salient @ self.ssr_delta.t()
+
+        # Apply per-row bias if distilled
+        if self.bias_row is not None:
+            y = y + self.bias_row.unsqueeze(0)
 
         # Reshape output
         output_shape = original_shape[:-1] + (self.out_features,)
@@ -558,6 +572,8 @@ def save_quantized_model(model: nn.Module, cache_path: Path, quant_stats: Dict):
                     'outlier_indices': module.outlier_indices,
                     'outlier_w_int8': module.outlier_w_int8,
                     'outlier_scale': module.outlier_scale,
+                    'scale_row': module.scale_row,
+                    'bias_row': module.bias_row,
                 }
 
     torch.save({
@@ -627,6 +643,8 @@ def load_quantized_model(
                 ptq_linear.outlier_indices = state.get('outlier_indices')
                 ptq_linear.outlier_w_int8 = state.get('outlier_w_int8')
                 ptq_linear.outlier_scale = state.get('outlier_scale')
+                ptq_linear.scale_row = state.get('scale_row')
+                ptq_linear.bias_row = state.get('bias_row')
 
                 setattr(parent, attr_name, ptq_linear)
 

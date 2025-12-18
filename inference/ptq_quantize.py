@@ -1541,7 +1541,9 @@ def quantize_to_ternary_pt2_distill(
     if calibration_activations is None or len(calibration_activations) == 0:
         return T, scale, stats, {}
 
+    # Learnable per-row scale and optional per-row bias
     scale_row = torch.nn.Parameter(torch.full((weight.shape[0],), scale, device=weight.device))
+    bias_row = torch.nn.Parameter(torch.zeros(weight.shape[0], device=weight.device))
     opt = torch.optim.Adam([scale_row], lr=lr)
 
     W_fp = weight.float()
@@ -1550,7 +1552,7 @@ def quantize_to_ternary_pt2_distill(
     for step in range(distill_steps):
         opt.zero_grad()
         scale_clamped = scale_row.clamp(min=1e-6)
-        W_q = q * scale_clamped.unsqueeze(1)
+        W_q = q * scale_clamped.unsqueeze(1) + bias_row.unsqueeze(1)
 
         # Use a small batch of activations
         X = calibration_activations[step % len(calibration_activations)]
@@ -1568,7 +1570,7 @@ def quantize_to_ternary_pt2_distill(
 
     # Update stats scale to mean of learned scales
     stats.scale = scale_row.mean().item()
-    extra = {'scale_row': scale_row.detach()}
+    extra = {'scale_row': scale_row.detach(), 'bias_row': bias_row.detach()}
     return T, stats.scale, stats, extra
 
 
