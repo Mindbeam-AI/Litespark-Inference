@@ -36,6 +36,8 @@ ADV_METHODS = [
     # new/v2
     'pt2_v2', 'quip_v2', 'awq_v2', 'smoothquant_v2', 'pt2_ssr_v2',
     'mixed_attention_v2', 'butterfly', 'cqe_plus',
+    # experimental new
+    'butterfly_learned', 'pt2_distill', 'pt2_outlier',
 ]
 
 
@@ -145,7 +147,7 @@ def main():
     # Print summary
     print("\nSummary:")
     for m, r in results['methods'].items():
-        ttft = r['short'].get('ttft_ms', float('nan'))
+        ttft = r['short'].get('mean_ttft_ms', float('nan'))
         tokps = r['short'].get('tokens_per_sec', float('nan'))
         ppl = r['ppl']
         print(f"  {m:20s}  TTFT={ttft:.2f} ms   Tok/s={tokps:.2f}   PPL={ppl:.2f}")

@@ -149,6 +149,11 @@ class PTQTernaryLinear(nn.Module):
         self.register_buffer('ssr_indices', None)
         self.register_buffer('ssr_delta', None)  # [out_features, num_salient]
 
+        # Outlier int8 bypass (top-k columns kept in int8)
+        self.register_buffer('outlier_indices', None)
+        self.register_buffer('outlier_w_int8', None)
+        self.register_buffer('outlier_scale', None)
+
 
     def quantize_from_linear(
         self,
@@ -188,6 +193,12 @@ class PTQTernaryLinear(nn.Module):
                 self.lorc_R = extra_info['lorc_R'].to(weight.device)
             if 'scale_w' in extra_info:  # Per-channel weight scales
                 self.scale_w = extra_info['scale_w'].to(weight.device)
+            if 'outlier_indices' in extra_info:
+                self.outlier_indices = extra_info['outlier_indices'].to(weight.device)
+            if 'outlier_w_int8' in extra_info:
+                self.outlier_w_int8 = extra_info['outlier_w_int8'].to(weight.device)
+            if 'outlier_scale' in extra_info:
+                self.outlier_scale = extra_info['outlier_scale'].to(weight.device)
 
 
         # Copy bias if present
@@ -326,6 +337,12 @@ class PTQTernaryLinear(nn.Module):
         if self.lorc_L is not None and self.lorc_R is not None:
             lorc_correction = (x_for_lorc @ self.lorc_L) @ self.lorc_R
             y = y + lorc_correction
+
+        # Outlier int8 bypass: small matmul over top-k columns
+        if self.outlier_indices is not None and self.outlier_w_int8 is not None and self.outlier_scale is not None:
+            x_out = x_for_ssr[:, self.outlier_indices]
+            w_out = self.outlier_w_int8.float() * self.outlier_scale.unsqueeze(1)
+            y = y + x_out @ w_out.T
 
         # Apply SSR residual correction for salient channels (tiny dense matmul)
         if self.ssr_delta is not None and self.ssr_indices is not None:
@@ -538,6 +555,9 @@ def save_quantized_model(model: nn.Module, cache_path: Path, quant_stats: Dict):
                     'scale_w': module.scale_w,
                     'ssr_indices': module.ssr_indices,
                     'ssr_delta': module.ssr_delta,
+                    'outlier_indices': module.outlier_indices,
+                    'outlier_w_int8': module.outlier_w_int8,
+                    'outlier_scale': module.outlier_scale,
                 }
 
     torch.save({
@@ -604,6 +624,9 @@ def load_quantized_model(
                 ptq_linear.scale_w = state.get('scale_w')
                 ptq_linear.ssr_indices = state.get('ssr_indices')
                 ptq_linear.ssr_delta = state.get('ssr_delta')
+                ptq_linear.outlier_indices = state.get('outlier_indices')
+                ptq_linear.outlier_w_int8 = state.get('outlier_w_int8')
+                ptq_linear.outlier_scale = state.get('outlier_scale')
 
                 setattr(parent, attr_name, ptq_linear)
 

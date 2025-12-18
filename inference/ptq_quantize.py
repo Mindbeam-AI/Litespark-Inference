@@ -1265,6 +1265,72 @@ def quantize_to_ternary_butterfly(
     return w_ternary, scale, stats, info
 
 
+def quantize_to_ternary_butterfly_learned(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    num_steps: int = 50,
+    lr: float = 1e-2,
+    max_iters_pt2: int = 5,
+    verbose: bool = False
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    Learn an orthogonal rotation (butterfly/QuaRot-style) that minimizes
+    the reconstruction error after PT² ternary quantization.
+    Uses projected gradient (QR) on a full matrix for simplicity.
+    """
+    N, K = weight.shape
+    device = weight.device
+    dtype = weight.dtype
+
+    # Parameterized matrix initialized as orthogonal
+    with torch.no_grad():
+        U0 = torch.linalg.qr(torch.randn(K, K, device=device, dtype=dtype))[0]
+    U_param = torch.nn.Parameter(U0)
+    opt = torch.optim.Adam([U_param], lr=lr)
+
+    best_loss = float('inf')
+    best_U = U0
+
+    for step in range(num_steps):
+        opt.zero_grad()
+        # Project to orthogonal via QR each step
+        with torch.no_grad():
+            U_qr = torch.linalg.qr(U_param.detach())[0]
+            U_param.copy_(U_qr)
+        U = U_param
+
+        W_rot = weight.float() @ U.T
+        # Quick PT² on rotated weights
+        q, scale, stats = quantize_to_ternary_pt2(W_rot, max_iters=max_iters_pt2, verbose=False)
+        W_recon = q.float() * scale
+        loss = ((W_rot - W_recon) ** 2).mean()
+
+        # Optional activation-aware loss
+        if calibration_activations is not None and len(calibration_activations) > 0:
+            X = calibration_activations[0]
+            if X.dim() == 3:
+                X = X.view(-1, X.shape[-1])
+            y_fp = X.float() @ W_rot.T
+            y_q = X.float() @ W_recon.T
+            loss = loss + 0.1 * ((y_fp - y_q) ** 2).mean()
+
+        loss.backward()
+        opt.step()
+
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            best_U = U.detach().clone()
+
+        if verbose and (step % 10 == 0 or step == num_steps - 1):
+            print(f"  [butterfly_learned] step {step} loss={loss.item():.4e}")
+
+    # Final quantization with best U
+    W_rot = weight.float() @ best_U.T
+    w_ternary, scale, stats = quantize_to_ternary_pt2(W_rot, max_iters=max_iters_pt2, verbose=verbose)
+    info = {'U': best_U, 'original_shape': (N, K)}
+    return w_ternary, scale, stats, info
+
+
 def quantize_to_ternary_cqe_plus(
     weight: torch.Tensor,
     sv_clip_percentile: float = 99.0,
@@ -1457,6 +1523,97 @@ def quantize_to_ternary_pt2_ssr_v2(
         ssr_info['salient_weights_int8'] = W_int8
         ssr_info['salient_scale'] = max_abs.squeeze(1)
     return T, scale, stats, ssr_info
+
+
+def quantize_to_ternary_pt2_distill(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list],
+    max_iters: int = 10,
+    distill_steps: int = 50,
+    lr: float = 1e-2,
+    verbose: bool = False
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    PT² with a post-quantization distillation step that tunes per-row scales
+    to match FP outputs on calibration activations.
+    """
+    T, scale, stats = quantize_to_ternary_pt2(weight, max_iters=max_iters, verbose=verbose)
+    if calibration_activations is None or len(calibration_activations) == 0:
+        return T, scale, stats, {}
+
+    scale_row = torch.nn.Parameter(torch.full((weight.shape[0],), scale, device=weight.device))
+    opt = torch.optim.Adam([scale_row], lr=lr)
+
+    W_fp = weight.float()
+    q = T.float()
+
+    for step in range(distill_steps):
+        opt.zero_grad()
+        scale_clamped = scale_row.clamp(min=1e-6)
+        W_q = q * scale_clamped.unsqueeze(1)
+
+        # Use a small batch of activations
+        X = calibration_activations[step % len(calibration_activations)]
+        if X.dim() == 3:
+            X = X.view(-1, X.shape[-1])
+        y_fp = X.float() @ W_fp.T
+        y_q = X.float() @ W_q.T
+
+        loss = ((y_fp - y_q) ** 2).mean()
+        loss.backward()
+        opt.step()
+
+        if verbose and (step % 10 == 0 or step == distill_steps - 1):
+            print(f"  [pt2_distill] step {step} loss={loss.item():.4e}")
+
+    # Update stats scale to mean of learned scales
+    stats.scale = scale_row.mean().item()
+    extra = {'scale_row': scale_row.detach()}
+    return T, stats.scale, stats, extra
+
+
+def quantize_to_ternary_outlier_bypass(
+    weight: torch.Tensor,
+    target_sparsity: float = 0.33,
+    outlier_percentile: float = 0.5,
+    **kwargs
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    Ternary quantization with an int8 bypass for top outlier columns.
+    """
+    # Identify outlier columns
+    col_importance = weight.abs().mean(dim=0)
+    num_outliers = max(1, int(weight.shape[1] * outlier_percentile / 100))
+    top_vals, top_idx = torch.topk(col_importance, num_outliers)
+
+    # Ternary for the rest
+    mask = torch.ones_like(col_importance, dtype=torch.bool)
+    mask[top_idx] = False
+
+    W_main = weight[:, mask]
+    T_main, scale_main, stats_main = quantize_to_ternary_optimal(W_main, target_sparsity=target_sparsity)
+
+    # Build full ternary with zeros for outliers
+    W_full = torch.zeros_like(weight, dtype=torch.int8)
+    W_full[:, mask] = T_main
+
+    # Int8 stash for outliers
+    W_out = weight[:, top_idx]
+    max_abs = W_out.abs().max(dim=1, keepdim=True).values.clamp(min=1e-6)
+    W_out_int8 = (W_out / max_abs * 127).round().clamp(-127, 127).to(torch.int8)
+    out_scale = max_abs.squeeze(1)
+
+    # Stats from main ternary part
+    stats = stats_main
+    stats.scale = scale_main
+
+    extra = {
+        'outlier_indices': top_idx,
+        'outlier_w_int8': W_out_int8,
+        'outlier_scale': out_scale,
+        'mask_main': mask,
+    }
+    return W_full, scale_main, stats, extra
 
 import torch.optim as optim
 
@@ -1915,6 +2072,15 @@ def prepare_ternary_weight_ptq(
         if info: extra_info.update(info)
     elif method == 'cqe_plus':
         w_ternary, scale, stats = quantize_to_ternary_cqe_plus(weight, **kwargs)
+    elif method == 'butterfly_learned':
+        w_ternary, scale, stats, info = quantize_to_ternary_butterfly_learned(weight, **kwargs)
+        if info: extra_info.update(info)
+    elif method == 'pt2_distill':
+        w_ternary, scale, stats, info = quantize_to_ternary_pt2_distill(weight, **kwargs)
+        if info: extra_info.update(info)
+    elif method == 'pt2_outlier':
+        w_ternary, scale, stats, info = quantize_to_ternary_outlier_bypass(weight, **kwargs)
+        if info: extra_info.update(info)
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 
