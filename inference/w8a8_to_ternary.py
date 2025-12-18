@@ -51,17 +51,24 @@ def convert_w8a8_layer_to_ternary(
     layer: W8A8Linear,
     method: str,
     calibration_activations: Optional[list] = None,
+    distill_steps: int = 50,
+    distill_lr: float = 1e-2,
     **kwargs,
 ) -> (PTQTernaryLinear, QuantizationStats):
     """Create a PTQTernaryLinear from a W8A8Linear."""
     weight = reconstruct_weight_from_w8a8(layer)
     bias = layer.bias.clone() if layer.bias is not None else None
 
+    method_kwargs = {}
+    if method == 'pt2_distill':
+        method_kwargs['distill_steps'] = distill_steps
+        method_kwargs['lr'] = distill_lr
+
     w_int8, w_sum, scale, stats, extra_info = prepare_ternary_weight_ptq(
         weight,
         method=method,
         calibration_activations=calibration_activations,
-        **kwargs,
+        **method_kwargs,
     )
 
     ptq_linear = PTQTernaryLinear(
