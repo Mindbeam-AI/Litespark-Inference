@@ -210,7 +210,7 @@ def main():
 
     print("\nSummary (W8A8 -> ternary):")
     for m, r in results.items():
-        ttft = r['short'].get('ttft_ms', float('nan'))
+        ttft = r['short'].get('mean_ttft_ms', float('nan'))
         tokps = r['short'].get('tokens_per_sec', float('nan'))
         ppl = r['ppl']
         print(f"  {m:20s} TTFT={ttft:.2f} ms   Tok/s={tokps:.2f}   PPL={ppl:.2f}")
