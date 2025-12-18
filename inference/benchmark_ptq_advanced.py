@@ -31,8 +31,11 @@ ADV_METHODS = [
     # originals
     'absmean', 'percentile', 'optimal', 'gptq', 'smoothquant', 'awq',
     'pt2', 'pt2_calibrated', 'pt2_ssr', 'quip', 'omniquant',
-    'auto_accuracy', 'auto_balanced', 'w8a8', 'w8a8_ternary',
+    'auto_accuracy', 'auto_balanced', 'auto_lorc32', 'auto_lorc64',
+    'w8a8', 'w8a8_ternary',
     'mixed_attention', '2bit',
+    'absmean_fp16act', 'perchannel', 'perchannel_hessian',
+    'pt2_lorc32', 'pt2_lorc64',
     # new/v2
     'pt2_v2', 'quip_v2', 'awq_v2', 'smoothquant_v2', 'pt2_ssr_v2',
     'mixed_attention_v2', 'butterfly', 'cqe_plus',
@@ -52,12 +55,22 @@ def load_model_for_method(model_name: str, method: str, use_cache: bool, force_r
         return load_w8a8_ternary_model(model_name)
     if method.startswith('auto_'):
         strategy = method.replace('auto_', '')
-        return load_auto_quantized_model(
-            model_name,
-            strategy=strategy,
-            use_cache=use_cache,
-            force_requantize=force_requantize
-        )[:2]
+        if strategy in ['lorc32', 'lorc64']:
+            lorc_rank = 32 if strategy == 'lorc32' else 64
+            return load_auto_quantized_model(
+                model_name,
+                strategy='balanced',
+                lorc_rank=lorc_rank,
+                use_cache=use_cache,
+                force_requantize=force_requantize
+            )[:2]
+        else:
+            return load_auto_quantized_model(
+                model_name,
+                strategy=strategy,
+                use_cache=use_cache,
+                force_requantize=force_requantize
+            )[:2]
     if method == 'mixed_attention_v2':
         # Keep Q/K higher precision, quantize the rest
         return load_ptq_model(
@@ -74,6 +87,35 @@ def load_model_for_method(model_name: str, method: str, use_cache: bool, force_r
             skip_patterns=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
             use_cache=use_cache,
             force_requantize=force_requantize
+        )
+    if method == 'absmean_fp16act':
+        return load_ptq_model(
+            model_name, method='absmean',
+            use_fp16_activations=True,
+            use_cache=use_cache,
+            force_requantize=force_requantize
+        )
+    if method == 'pt2_lorc32':
+        return load_ptq_model(
+            model_name, method='pt2_calibrated',
+            use_lorc=True, lorc_rank=32,
+            use_cache=use_cache, force_requantize=force_requantize
+        )
+    if method == 'pt2_lorc64':
+        return load_ptq_model(
+            model_name, method='pt2_calibrated',
+            use_lorc=True, lorc_rank=64,
+            use_cache=use_cache, force_requantize=force_requantize
+        )
+    if method == 'perchannel':
+        return load_ptq_model(
+            model_name, method='perchannel',
+            use_cache=use_cache, force_requantize=force_requantize
+        )
+    if method == 'perchannel_hessian':
+        return load_ptq_model(
+            model_name, method='perchannel_hessian',
+            use_cache=use_cache, force_requantize=force_requantize
         )
     # Default: PTQ loader with method string
     return load_ptq_model(
