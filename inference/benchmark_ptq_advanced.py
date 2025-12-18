@@ -38,6 +38,7 @@ ADV_METHODS = [
     'mixed_attention_v2', 'butterfly', 'cqe_plus',
     # experimental new
     'butterfly_learned', 'pt2_distill', 'pt2_outlier',
+    'ptqtp', 'pt2_faithful', 'ttq_kd',
 ]
 
 
@@ -94,6 +95,8 @@ def main():
     parser.add_argument('--no-cache', action='store_true', help='Do not load/save PTQ cache')
     parser.add_argument('--force-requantize', action='store_true', help='Ignore cache and requantize')
     parser.add_argument('--short-only', action='store_true', help='Skip long benchmarks (only short + ppl)')
+    parser.add_argument('--save-summary', type=str, default=None, help='Path to save txt summary')
+    parser.add_argument('--save-plot', type=str, default=None, help='Path to save perplexity bar plot')
     args = parser.parse_args()
 
     if args.compare_all:
@@ -151,6 +154,37 @@ def main():
         tokps = r['short'].get('tokens_per_sec', float('nan'))
         ppl = r['ppl']
         print(f"  {m:20s}  TTFT={ttft:.2f} ms   Tok/s={tokps:.2f}   PPL={ppl:.2f}")
+
+    if args.save_summary:
+        out = Path(args.save_summary)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, 'w') as f:
+            for m, r in results['methods'].items():
+                ttft = r['short'].get('mean_ttft_ms', float('nan'))
+                tokps = r['short'].get('tokens_per_sec', float('nan'))
+                ppl = r['ppl']
+                f.write(f"{m:20s} TTFT={ttft:.2f} Tok/s={tokps:.2f} PPL={ppl:.2f}\n")
+        print(f"Saved summary to {out}")
+
+    if args.save_plot:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            labels = list(results['methods'].keys())
+            ppls = [results['methods'][m]['ppl'] for m in labels]
+            plt.figure(figsize=(10, 5))
+            plt.bar(labels, ppls)
+            plt.xticks(rotation=45, ha='right')
+            plt.ylabel("Perplexity (lower is better)")
+            plt.tight_layout()
+            out = Path(args.save_plot)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(out, dpi=150)
+            plt.close()
+            print(f"Saved plot to {out}")
+        except ImportError:
+            print("matplotlib not available; skipping plot.")
 
 
 if __name__ == '__main__':

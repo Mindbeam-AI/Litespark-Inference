@@ -2083,6 +2083,15 @@ def prepare_ternary_weight_ptq(
     elif method == 'pt2_outlier':
         w_ternary, scale, stats, info = quantize_to_ternary_outlier_bypass(weight, **kwargs)
         if info: extra_info.update(info)
+    elif method == 'ptqtp':
+        w_ternary, scale, stats, info = quantize_to_ternary_ptqtp(weight, **kwargs)
+        if info: extra_info.update(info)
+    elif method == 'pt2_faithful':
+        w_ternary, scale, stats, info = quantize_to_ternary_pt2_faithful(weight, **kwargs)
+        if info: extra_info.update(info)
+    elif method == 'ttq_kd':
+        w_ternary, scale, stats, info = quantize_to_ternary_ttq_kd(weight, **kwargs)
+        if info: extra_info.update(info)
     else:
         raise ValueError(f"Unknown quantization method: {method}")
 
@@ -2121,6 +2130,159 @@ def prepare_ternary_weight_ptq(
     return w_int8, w_sum, scale, stats, extra_info or None
 
 
+#######################################################################
+# Additional experimental methods (PTQTP, faithful PT², TTQ-lite)
+#######################################################################
+
+
+def quantize_to_ternary_ptqtp(
+    weight: torch.Tensor,
+    target_sparsity: float = 0.33,
+    num_planes: int = 2,
+    **kwargs,
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    Simplified PTQTP-style: iteratively peel num_planes ternary components
+    and combine into one ternary tensor.
+    """
+    W = weight.float()
+    residual = W.clone()
+    planes = []
+    scales = []
+    for _ in range(max(1, num_planes)):
+        q, scale, _ = quantize_to_ternary_optimal(residual, target_sparsity=target_sparsity)
+        planes.append(q.float())
+        scales.append(scale)
+        residual = residual - q.float() * scale
+    combined = torch.stack(planes).sum(dim=0)
+    combined = combined.sign().clamp(-1, 1).to(torch.int8)
+    scale_mean = float(sum(scales) / len(scales))
+    w_recon = combined.float() * scale_mean
+    mse = ((weight - w_recon) ** 2).mean().item()
+    stats = QuantizationStats(
+        original_nonzero=(weight != 0).sum().item(),
+        quantized_nonzero=(combined != 0).sum().item(),
+        sparsity=1.0 - (combined != 0).sum().item() / weight.numel(),
+        scale=scale_mean,
+        mse=mse,
+    )
+    info = {'num_planes': num_planes, 'scales': scales}
+    return combined, scale_mean, stats, info
+
+
+def quantize_to_ternary_pt2_faithful(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    max_iters: int = 10,
+    target_sparsity: float = 0.33,
+    verbose: bool = False,
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    Faithful PT² surrogate: asymmetric per-row ternary with ITF + AGA.
+    """
+    T, alpha, mu = iterative_ternary_fitting(weight, max_iters=max_iters, verbose=verbose)
+    if calibration_activations is not None and len(calibration_activations) > 0:
+        alpha, mu = activation_aware_alignment(weight, T, calibration_activations, verbose=verbose)
+
+    W = weight.float()
+    T_f = T.float()
+    pos_mask = T_f > 0
+    neg_mask = T_f < 0
+    pos_scale = (W * pos_mask).sum(dim=1) / pos_mask.sum(dim=1).clamp(min=1)
+    neg_scale = (W * neg_mask).sum(dim=1).abs() / neg_mask.sum(dim=1).clamp(min=1)
+    asym_scale = (pos_scale + neg_scale).clamp(min=1e-8) / 2.0
+
+    W_recon = T_f * asym_scale.unsqueeze(1) + mu.unsqueeze(1)
+    mse = ((W - W_recon) ** 2).mean().item()
+
+    stats = QuantizationStats(
+        original_nonzero=(weight != 0).sum().item(),
+        quantized_nonzero=(T != 0).sum().item(),
+        sparsity=1.0 - (T != 0).sum().item() / weight.numel(),
+        scale=asym_scale.mean().item(),
+        mse=mse,
+    )
+    info = {
+        'asym_pos_scale': pos_scale,
+        'asym_neg_scale': neg_scale,
+        'bias_mu': mu,
+    }
+    return T, stats.scale, stats, info
+
+
+def quantize_to_ternary_ttq_kd(
+    weight: torch.Tensor,
+    calibration_activations: Optional[list] = None,
+    steps: int = 100,
+    lr: float = 1e-3,
+    delta_init: float = 0.05,
+    verbose: bool = False,
+) -> Tuple[torch.Tensor, float, QuantizationStats, Dict]:
+    """
+    TTQ-like light distillation: learn per-row alpha+/alpha- and threshold delta
+    to match teacher outputs on calibration activations.
+    """
+    W = weight.float()
+    N, K = W.shape
+
+    if calibration_activations is None or len(calibration_activations) == 0:
+        q = W.sign().to(torch.int8)
+        scale = W.abs().mean().item()
+        stats = QuantizationStats(
+            original_nonzero=(W != 0).sum().item(),
+            quantized_nonzero=(q != 0).sum().item(),
+            sparsity=1.0 - (q != 0).sum().item() / W.numel(),
+            scale=scale,
+            mse=((W - q.float() * scale) ** 2).mean().item(),
+        )
+        return q, scale, stats, {}
+
+    alpha_p = torch.nn.Parameter(W.abs().mean(dim=1).clone())
+    alpha_n = torch.nn.Parameter(W.abs().mean(dim=1).clone())
+    delta = torch.nn.Parameter(torch.tensor(delta_init, device=W.device, dtype=W.dtype))
+    opt = torch.optim.Adam([alpha_p, alpha_n, delta], lr=lr)
+
+    X = calibration_activations[0]
+    if X.dim() == 3:
+        X = X.view(-1, X.shape[-1])
+    X = X.float()
+
+    for step in range(steps):
+        opt.zero_grad()
+        m = (W / delta).clamp(-1, 1)
+        q = torch.round(m)
+        q_detached = q.detach()
+        q_ste = q_detached + (m - m.detach())
+        alpha = torch.where(q_ste > 0, alpha_p.unsqueeze(1),
+                            torch.where(q_ste < 0, -alpha_n.unsqueeze(1), torch.zeros_like(q_ste)))
+        W_q = (q_ste != 0).float() * alpha
+        y_fp = X @ W.T
+        y_q = X @ W_q.T
+        loss = ((y_fp - y_q) ** 2).mean()
+        loss.backward()
+        opt.step()
+        if verbose and (step % 10 == 0 or step == steps - 1):
+            print(f"  [ttq_kd] step {step} loss={loss.item():.4e}")
+
+    q_final = torch.round((W / delta).clamp(-1, 1)).to(torch.int8)
+    scale_mean = (alpha_p.mean() + alpha_n.mean()).item() / 2.0
+    W_recon = q_final.float()
+    W_recon[q_final > 0] = alpha_p.unsqueeze(1)[q_final > 0]
+    W_recon[q_final < 0] = -alpha_n.unsqueeze(1)[q_final < 0]
+    mse = ((W - W_recon) ** 2).mean().item()
+    stats = QuantizationStats(
+        original_nonzero=(weight != 0).sum().item(),
+        quantized_nonzero=(q_final != 0).sum().item(),
+        sparsity=1.0 - (q_final != 0).sum().item() / weight.numel(),
+        scale=scale_mean,
+        mse=mse,
+    )
+    info = {
+        'alpha_p': alpha_p.detach(),
+        'alpha_n': alpha_n.detach(),
+        'delta': delta.detach(),
+    }
+    return q_final, scale_mean, stats, info
 
 
 def analyze_model_weights(model: nn.Module) -> Dict[str, Dict]:

@@ -12,6 +12,7 @@ Usage (from inference/):
 
 import argparse
 import gc
+import copy
 from typing import Dict, Optional
 from pathlib import Path
 
@@ -160,9 +161,11 @@ def main():
     parser.add_argument('--force-requantize', action='store_true', help='Ignore any caches in loaders')
     parser.add_argument('--distill-steps', type=int, default=50, help='KD steps for distill-enabled methods')
     parser.add_argument('--distill-lr', type=float, default=1e-2, help='LR for distillation scale tuning')
+    parser.add_argument('--save-summary', type=str, default=None, help='Path to save txt summary')
+    parser.add_argument('--save-plot', type=str, default=None, help='Path to save perplexity bar plot')
     args = parser.parse_args()
 
-    # Load W8A8 model
+    # Load W8A8 model once (reuse via deepcopy to avoid re-quantizing each method)
     print(f"Loading W8A8 model {args.model} ...")
     w8a8_model, tokenizer = load_w8a8_model(args.model)
 
@@ -185,8 +188,8 @@ def main():
     results = {}
     for method in args.methods:
         print(f"\n=== Converting with method: {method} ===")
-        # Reload fresh W8A8 each time to avoid cross-contamination
-        model, _ = load_w8a8_model(args.model)
+        # Deep copy quantized W8A8 to avoid re-quantizing per method
+        model = copy.deepcopy(w8a8_model)
 
         # Convert
         stats = convert_model(
@@ -225,6 +228,37 @@ def main():
         tokps = r['short'].get('tokens_per_sec', float('nan'))
         ppl = r['ppl']
         print(f"  {m:20s} TTFT={ttft:.2f} ms   Tok/s={tokps:.2f}   PPL={ppl:.2f}")
+
+    if args.save_summary:
+        out = Path(args.save_summary)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, 'w') as f:
+            for m, r in results.items():
+                ttft = r['short'].get('mean_ttft_ms', float('nan'))
+                tokps = r['short'].get('tokens_per_sec', float('nan'))
+                ppl = r['ppl']
+                f.write(f"{m:20s} TTFT={ttft:.2f} Tok/s={tokps:.2f} PPL={ppl:.2f}\n")
+        print(f"Saved summary to {out}")
+
+    if args.save_plot:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            labels = list(results.keys())
+            ppls = [results[m]['ppl'] for m in labels]
+            plt.figure(figsize=(10, 5))
+            plt.bar(labels, ppls)
+            plt.xticks(rotation=45, ha='right')
+            plt.ylabel("Perplexity (lower is better)")
+            plt.tight_layout()
+            out = Path(args.save_plot)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(out, dpi=150)
+            plt.close()
+            print(f"Saved plot to {out}")
+        except ImportError:
+            print("matplotlib not available; skipping plot.")
 
 
 if __name__ == '__main__':
