@@ -1,72 +1,24 @@
-# Documentation (keep local only)
-*.md
-*.docx
-*.pdf
-docs/
-
-# Jupyter Notebooks
-v2.ipynb
-
-# Virtual environments
-cpu-matmul-env/
-.venv/
-venv/
-env/
-
-# Profiling output
-prof.out
-*.prof
-
-# Claude Code
-.claude/
-
-# Benchmark cache
-.benchmarks/
-
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-
-# Model checkpoints and cache
-hf_cache/
-hgrn_bit_step*/
-SlimPajama-*/
-
-# Large datasets
-*.arrow
-
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+dist/
+build/
 
-# PyTorch
-*.pth
-*.pt
-checkpoint_*.pt
+# Virtual environments
+.venv/
+venv/
+env/
 
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
 
 # OS
 .DS_Store
-Thumbs.db
-.ipynb_checkpoints/
+
+# Cache
+.cache/
+hf_cache/
