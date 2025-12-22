@@ -122,11 +122,45 @@ def get_kernel():
                 # Apple Silicon or other ARM64 with NEON SDOT
                 kernel_path = Path(__file__).parent.parent / 'src/cpu_ops/kernels/arm64/matmul_free_neon_int8.cpp'
 
+                # macOS with Apple Clang needs special OpenMP flags
+                if platform.system() == 'Darwin':
+                    # Use homebrew libomp on macOS
+                    # Try common homebrew paths
+                    libomp_paths = [
+                        '/opt/homebrew/opt/libomp',  # Apple Silicon homebrew
+                        '/usr/local/opt/libomp',     # Intel Mac homebrew
+                    ]
+                    libomp_path = None
+                    for p in libomp_paths:
+                        if os.path.exists(p):
+                            libomp_path = p
+                            break
+
+                    if libomp_path:
+                        extra_cflags = [
+                            '-O3', '-march=native',
+                            '-Xclang', '-fopenmp',
+                            f'-I{libomp_path}/include',
+                        ]
+                        extra_ldflags = [
+                            f'-L{libomp_path}/lib',
+                            '-lomp',
+                            '-framework', 'Accelerate',  # Apple Accelerate (AMX)
+                        ]
+                    else:
+                        # No OpenMP available, compile without it (single-threaded)
+                        extra_cflags = ['-O3', '-march=native', '-DDISABLE_OPENMP']
+                        extra_ldflags = ['-framework', 'Accelerate']
+                else:
+                    # Linux ARM64 (non-Graviton)
+                    extra_cflags = ['-O3', '-march=native', '-fopenmp']
+                    extra_ldflags = ['-fopenmp']
+
                 _kernel = load(
                     name='matmul_free_neon',
                     sources=[str(kernel_path)],
-                    extra_cflags=['-O3', '-march=native', '-fopenmp'],
-                    extra_ldflags=['-fopenmp'],
+                    extra_cflags=extra_cflags,
+                    extra_ldflags=extra_ldflags,
                     verbose=False
                 )
                 _kernel_type = 'neon'
@@ -358,24 +392,19 @@ class TernaryLinear(nn.Module):
 
         elif kernel_type == 'neon':
             # Apple Silicon / Generic ARM NEON SDOT
-            x_int8, x_scale = quantize_activation(x)
-            y = torch.zeros(M, self.out_features, dtype=torch.float32)
+            # Use v4_fused kernel (float input, fused quantize+matmul)
+            # This eliminates Python quantization overhead
+            y = self._get_output_buffer(M)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-            if self.in_features <= 1024 and self.out_features <= 4096:
-                kernel.matmul_free_neon_sdot_v2(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            else:
-                kernel.matmul_free_neon_sdot_v3(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            y = y * self.scale
+
+            kernel.matmul_free_neon_sdot_v4_fused(
+                x.contiguous(),  # Float input
+                self.w_int8, self.w_sum,
+                y, bias,
+                self.scale,  # Weight scale applied inside kernel
+                M, self.out_features, self.in_features, self.num_threads
+            )
+            # Note: scale already applied in kernel, no need to multiply here
         else:
             raise RuntimeError(f"Unknown kernel type: {kernel_type}")
 
@@ -671,24 +700,19 @@ class BitNetLinear(nn.Module):
 
         elif kernel_type == 'neon':
             # Apple Silicon / Generic ARM NEON SDOT
-            x_int8, x_scale = quantize_activation(x)
-            y = torch.zeros(M, self.out_features, dtype=torch.float32)
+            # Use v4_fused kernel (float input, fused quantize+matmul)
+            # This eliminates Python quantization overhead
+            y = self._get_output_buffer(M)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-            if self.in_features <= 1024 and self.out_features <= 4096:
-                kernel.matmul_free_neon_sdot_v2(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            else:
-                kernel.matmul_free_neon_sdot_v3(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-            y = y * self.scale
+
+            kernel.matmul_free_neon_sdot_v4_fused(
+                x.contiguous(),  # Float input
+                self.w_int8, self.w_sum,
+                y, bias,
+                self.scale,  # Weight scale applied inside kernel
+                M, self.out_features, self.in_features, self.num_threads
+            )
+            # Note: scale already applied in kernel, no need to multiply here
         else:
             raise RuntimeError(f"Unknown kernel type: {kernel_type}")
 
