@@ -16,23 +16,28 @@ import time
 
 def cmd_generate(args):
     """Generate text from a prompt."""
-    from .models import load_model, generate
+    from .models import load_ternary_model
+    import torch
 
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_ternary_model(args.model, mode=args.mode)
 
     print(f"\nPrompt: {args.prompt}")
     print("-" * 50)
 
+    input_ids = tokenizer.encode(args.prompt, return_tensors='pt')
+
     start = time.perf_counter()
-    output = generate(
-        model, tokenizer, args.prompt,
-        max_new_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-    )
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+        )
     elapsed = time.perf_counter() - start
 
+    output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(output)
     print("-" * 50)
     print(f"Generated in {elapsed:.2f}s")
@@ -40,10 +45,10 @@ def cmd_generate(args):
 
 def cmd_chat(args):
     """Interactive chat mode."""
-    from .models import load_model
+    from .models import load_ternary_model
     import torch
 
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_ternary_model(args.model, mode=args.mode)
 
     print("\nBitNet CPU Chat")
     print("Type 'quit' or 'exit' to end the conversation")
@@ -93,8 +98,7 @@ def cmd_chat(args):
 
 def cmd_benchmark(args):
     """Run performance benchmark."""
-    from .models import load_model
-    from .arch import get_arch_info, get_kernel_type
+    from .models import load_ternary_model, get_arch_info, get_kernel_type
     import torch
     import gc
 
@@ -128,7 +132,7 @@ def cmd_benchmark(args):
             return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
     mem_before = get_memory_mb()
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_ternary_model(args.model, mode=args.mode)
     gc.collect()
     mem_after = get_memory_mb()
 
@@ -190,7 +194,7 @@ def cmd_benchmark(args):
 
 def cmd_info(args):
     """Show system and model information."""
-    from .arch import get_arch_info
+    from .models import get_arch_info
     from . import __version__
 
     print(f"BitNet CPU v{__version__}")
@@ -218,9 +222,7 @@ def cmd_info(args):
         print("Platform: Unknown")
 
     print("\nAvailable Models:")
-    from .models import list_available_models
-    for name, info in list_available_models().items():
-        print(f"  {name}: {info['description']} (~{info['size_mb']} MB)")
+    print("  bitnet-2b: BitNet b1.58 2B parameters, 4T tokens trained (~556 MB)")
 
 
 def main():
@@ -236,6 +238,7 @@ def main():
     gen_parser = subparsers.add_parser('generate', help='Generate text from a prompt')
     gen_parser.add_argument('prompt', type=str, help='Input prompt')
     gen_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name')
+    gen_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     gen_parser.add_argument('--max-tokens', '-n', type=int, default=100, help='Max tokens to generate')
     gen_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
     gen_parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling threshold')
@@ -245,6 +248,7 @@ def main():
     # chat command
     chat_parser = subparsers.add_parser('chat', help='Interactive chat mode')
     chat_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name')
+    chat_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     chat_parser.add_argument('--max-tokens', '-n', type=int, default=200, help='Max tokens per response')
     chat_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
     chat_parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling threshold')
@@ -254,6 +258,7 @@ def main():
     # benchmark command
     bench_parser = subparsers.add_parser('benchmark', help='Run performance benchmark')
     bench_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name')
+    bench_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     bench_parser.add_argument('--tokens', '-n', type=int, default=20, help='Tokens to generate')
     bench_parser.set_defaults(func=cmd_benchmark)
 
