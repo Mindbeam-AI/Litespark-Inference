@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitnet-cpu"
+version = "0.1.0"
+description = "Efficient CPU inference for BitNet 1.58-bit models"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "BitNet CPU Contributors"}
+]
+keywords = ["bitnet", "llm", "inference", "cpu", "simd", "ternary"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "safetensors>=0.3.0",
+    "huggingface_hub>=0.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+bitnet-cpu = "bitnet_cpu.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/bitnet-cpu/bitnet-cpu"
+Documentation = "https://github.com/bitnet-cpu/bitnet-cpu#readme"
+Repository = "https://github.com/bitnet-cpu/bitnet-cpu"
+
+[tool.setuptools.packages.find]
+include = ["bitnet_cpu*"]
+
+[tool.setuptools.package-data]
+"bitnet_cpu.kernels.arm64" = ["*.cpp"]
+"bitnet_cpu.kernels.x86_64" = ["*.cpp"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
