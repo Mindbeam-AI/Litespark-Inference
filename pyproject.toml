@@ -45,9 +45,9 @@ dev = [
 bitnet-cpu = "bitnet_cpu.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/bitnet-cpu/bitnet-cpu"
-Documentation = "https://github.com/bitnet-cpu/bitnet-cpu#readme"
-Repository = "https://github.com/bitnet-cpu/bitnet-cpu"
+Homepage = "https://github.com/tonymindbeam/matmulMM"
+Documentation = "https://github.com/tonymindbeam/matmulMM#readme"
+Repository = "https://github.com/tonymindbeam/matmulMM"
 
 [tool.setuptools.packages.find]
 include = ["bitnet_cpu*"]
