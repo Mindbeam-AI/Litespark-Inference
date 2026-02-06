@@ -500,13 +500,25 @@ class TernaryLinear(nn.Module):
             y = torch.zeros(M, self.out_features, dtype=torch.float32)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
 
-            kernel.matmul_free_neon_sdot_v4_fused(
-                x.contiguous(),  # Float input
-                self.w_int8, self.w_sum,
-                y, bias,
-                self.scale,  # Weight scale applied inside kernel
-                M, self.out_features, self.in_features, self.num_threads
-            )
+            if M <= 4 and self.num_threads > 1:
+                # Weight Parallel: parallelize over N (output channels) for small M
+                # This is faster for token generation (M=1) because we can't parallelize over M
+                kernel.matmul_free_neon_sdot_v4_fused_wp(
+                    x.contiguous(),  # Float input
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    self.scale,  # Weight scale applied inside kernel
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                # Activation Parallel: parallelize over M (rows) for large batches
+                kernel.matmul_free_neon_sdot_v4_fused(
+                    x.contiguous(),  # Float input
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    self.scale,  # Weight scale applied inside kernel
+                    M, self.out_features, self.in_features, self.num_threads
+                )
             # Note: scale already applied in kernel, no need to multiply here
         else:
             raise RuntimeError(f"Unknown kernel type: {kernel_type}")
@@ -841,13 +853,25 @@ class BitNetLinear(nn.Module):
             y = torch.zeros(M, self.out_features, dtype=torch.float32)
             bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
 
-            kernel.matmul_free_neon_sdot_v4_fused(
-                x.contiguous(),  # Float input
-                self.w_int8, self.w_sum,
-                y, bias,
-                self.scale,  # Weight scale applied inside kernel
-                M, self.out_features, self.in_features, self.num_threads
-            )
+            if M <= 4 and self.num_threads > 1:
+                # Weight Parallel: parallelize over N (output channels) for small M
+                # This is faster for token generation (M=1) because we can't parallelize over M
+                kernel.matmul_free_neon_sdot_v4_fused_wp(
+                    x.contiguous(),  # Float input
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    self.scale,  # Weight scale applied inside kernel
+                    M, self.out_features, self.in_features, self.num_threads
+                )
+            else:
+                # Activation Parallel: parallelize over M (rows) for large batches
+                kernel.matmul_free_neon_sdot_v4_fused(
+                    x.contiguous(),  # Float input
+                    self.w_int8, self.w_sum,
+                    y, bias,
+                    self.scale,  # Weight scale applied inside kernel
+                    M, self.out_features, self.in_features, self.num_threads
+                )
             # Note: scale already applied in kernel, no need to multiply here
         else:
             raise RuntimeError(f"Unknown kernel type: {kernel_type}")

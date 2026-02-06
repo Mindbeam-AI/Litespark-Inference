@@ -843,6 +843,279 @@ void matmul_free_neon_sdot_v4_fused(
     }
 }
 
+/**
+ * SDOT v4 Fused - Weight Parallel version for M=1 (token generation)
+ *
+ * When M=1, parallelizing over M gives no benefit. Instead, we parallelize
+ * over N (output channels). This is critical for efficient token generation.
+ *
+ * Key optimizations:
+ * 1. Quantize the single input row ONCE (not per-thread)
+ * 2. Parallelize the N loop across threads
+ * 3. Each thread computes a chunk of output channels
+ */
+void matmul_free_neon_sdot_v4_fused_wp(
+    torch::Tensor x_float_tensor,   // [M, K] float32 input
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8
+    torch::Tensor w_sum_tensor,     // [N] int32 (unused)
+    torch::Tensor y_tensor,         // [M, N] float32 output
+    torch::Tensor bias_tensor,
+    float weight_scale,
+    int M, int N, int K,
+    int num_threads
+) {
+    const float* __restrict__ x_float = x_float_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.defined() ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_padded = ((K + 15) / 16) * 16;
+
+#ifndef DISABLE_OPENMP
+    omp_set_num_threads(num_threads);
+#endif
+
+    // For M=1 (or small M), use Weight Parallel strategy
+    if (M <= 4) {
+        // Allocate quantized activation buffer (shared across threads)
+        std::vector<int8_t> x_q_storage(M * K_padded + 15);
+        int8_t* x_q = reinterpret_cast<int8_t*>(
+            (reinterpret_cast<uintptr_t>(x_q_storage.data()) + 15) & ~uintptr_t(15)
+        );
+
+        // Store scales for each row
+        std::vector<float> act_scales(M);
+
+        // Step 1: Quantize all M rows (sequential, M is small)
+        for (int m = 0; m < M; m++) {
+            const float* x_row = x_float + m * K;
+            int8_t* x_q_row = x_q + m * K_padded;
+
+            // Find max absolute value
+            float32x4_t max_vec = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 3 < K; k += 4) {
+                float32x4_t x_vec = vld1q_f32(x_row + k);
+                float32x4_t abs_vec = vabsq_f32(x_vec);
+                max_vec = vmaxq_f32(max_vec, abs_vec);
+            }
+            float max_abs = vmaxvq_f32(max_vec);
+            for (; k < K; k++) {
+                float abs_val = std::abs(x_row[k]);
+                if (abs_val > max_abs) max_abs = abs_val;
+            }
+
+            float act_scale = max_abs / 127.0f;
+            if (act_scale == 0.0f) act_scale = 1.0f;
+            act_scales[m] = act_scale;
+
+            float inv_scale = 1.0f / act_scale;
+            float32x4_t inv_scale_vec = vdupq_n_f32(inv_scale);
+            float32x4_t min_val = vdupq_n_f32(-127.0f);
+            float32x4_t max_val_f = vdupq_n_f32(127.0f);
+
+            k = 0;
+            for (; k + 3 < K; k += 4) {
+                float32x4_t x_vec = vld1q_f32(x_row + k);
+                float32x4_t scaled = vmulq_f32(x_vec, inv_scale_vec);
+                scaled = vmaxq_f32(min_val, vminq_f32(max_val_f, scaled));
+                int32x4_t rounded = vcvtnq_s32_f32(scaled);
+                int16x4_t narrow16 = vmovn_s32(rounded);
+                int8x8_t narrow8 = vmovn_s16(vcombine_s16(narrow16, narrow16));
+                x_q_row[k + 0] = vget_lane_s8(narrow8, 0);
+                x_q_row[k + 1] = vget_lane_s8(narrow8, 1);
+                x_q_row[k + 2] = vget_lane_s8(narrow8, 2);
+                x_q_row[k + 3] = vget_lane_s8(narrow8, 3);
+            }
+            for (; k < K; k++) {
+                float val = x_row[k] * inv_scale;
+                val = std::max(-127.0f, std::min(127.0f, val));
+                x_q_row[k] = static_cast<int8_t>(std::round(val));
+            }
+            for (k = K; k < K_padded; k++) {
+                x_q_row[k] = 0;
+            }
+        }
+
+        // Step 2: Parallel over N (Weight Parallel)
+        constexpr int N_BLOCK = 8;
+
+        #pragma omp parallel for schedule(static)
+        for (int n_block = 0; n_block < N; n_block += N_BLOCK) {
+            const int n_end = std::min(n_block + N_BLOCK, N);
+
+            for (int m = 0; m < M; m++) {
+                const int8_t* x_q_row = x_q + m * K_padded;
+                float* y_row = y + m * N;
+                float combined_scale = act_scales[m] * weight_scale;
+
+                // Process outputs in this block
+                for (int n = n_block; n < n_end; n++) {
+                    const int8_t* w_row = w_int8 + n * K_padded;
+
+                    int32x4_t acc = vdupq_n_s32(0);
+                    int k = 0;
+                    for (; k + 15 < K; k += 16) {
+                        int8x16_t x_vec = vld1q_s8(x_q_row + k);
+                        int8x16_t w_vec = vld1q_s8(w_row + k);
+                        acc = vdotq_s32(acc, x_vec, w_vec);
+                    }
+
+                    int32_t sum = vaddvq_s32(acc);
+                    for (; k < K; k++) {
+                        sum += static_cast<int32_t>(x_q_row[k]) * static_cast<int32_t>(w_row[k]);
+                    }
+
+                    y_row[n] = static_cast<float>(sum) * combined_scale + (bias ? bias[n] : 0.0f);
+                }
+            }
+        }
+    } else {
+        // For larger M, use the regular Activation Parallel (parallelize over M)
+        #pragma omp parallel
+        {
+            std::vector<int8_t> x_q_storage(K_padded + 15);
+            int8_t* x_q_local = reinterpret_cast<int8_t*>(
+                (reinterpret_cast<uintptr_t>(x_q_storage.data()) + 15) & ~uintptr_t(15)
+            );
+
+            #pragma omp for schedule(static)
+            for (int m = 0; m < M; m++) {
+                const float* x_row = x_float + m * K;
+                float* y_row = y + m * N;
+
+                // Quantize
+                float32x4_t max_vec = vdupq_n_f32(0.0f);
+                int k = 0;
+                for (; k + 3 < K; k += 4) {
+                    float32x4_t x_vec = vld1q_f32(x_row + k);
+                    max_vec = vmaxq_f32(max_vec, vabsq_f32(x_vec));
+                }
+                float max_abs = vmaxvq_f32(max_vec);
+                for (; k < K; k++) {
+                    float abs_val = std::abs(x_row[k]);
+                    if (abs_val > max_abs) max_abs = abs_val;
+                }
+
+                float act_scale = max_abs / 127.0f;
+                if (act_scale == 0.0f) act_scale = 1.0f;
+                float inv_scale = 1.0f / act_scale;
+
+                float32x4_t inv_scale_vec = vdupq_n_f32(inv_scale);
+                float32x4_t min_val = vdupq_n_f32(-127.0f);
+                float32x4_t max_val_f = vdupq_n_f32(127.0f);
+
+                k = 0;
+                for (; k + 3 < K; k += 4) {
+                    float32x4_t x_vec = vld1q_f32(x_row + k);
+                    float32x4_t scaled = vmulq_f32(x_vec, inv_scale_vec);
+                    scaled = vmaxq_f32(min_val, vminq_f32(max_val_f, scaled));
+                    int32x4_t rounded = vcvtnq_s32_f32(scaled);
+                    int16x4_t narrow16 = vmovn_s32(rounded);
+                    int8x8_t narrow8 = vmovn_s16(vcombine_s16(narrow16, narrow16));
+                    x_q_local[k + 0] = vget_lane_s8(narrow8, 0);
+                    x_q_local[k + 1] = vget_lane_s8(narrow8, 1);
+                    x_q_local[k + 2] = vget_lane_s8(narrow8, 2);
+                    x_q_local[k + 3] = vget_lane_s8(narrow8, 3);
+                }
+                for (; k < K; k++) {
+                    float val = x_row[k] * inv_scale;
+                    val = std::max(-127.0f, std::min(127.0f, val));
+                    x_q_local[k] = static_cast<int8_t>(std::round(val));
+                }
+                for (k = K; k < K_padded; k++) {
+                    x_q_local[k] = 0;
+                }
+
+                float combined_scale = act_scale * weight_scale;
+
+                // Compute matmul
+                int n = 0;
+                for (; n + 7 < N; n += 8) {
+                    int32x4_t acc0 = vdupq_n_s32(0);
+                    int32x4_t acc1 = vdupq_n_s32(0);
+                    int32x4_t acc2 = vdupq_n_s32(0);
+                    int32x4_t acc3 = vdupq_n_s32(0);
+                    int32x4_t acc4 = vdupq_n_s32(0);
+                    int32x4_t acc5 = vdupq_n_s32(0);
+                    int32x4_t acc6 = vdupq_n_s32(0);
+                    int32x4_t acc7 = vdupq_n_s32(0);
+
+                    const int8_t* w0 = w_int8 + (n + 0) * K_padded;
+                    const int8_t* w1 = w_int8 + (n + 1) * K_padded;
+                    const int8_t* w2 = w_int8 + (n + 2) * K_padded;
+                    const int8_t* w3 = w_int8 + (n + 3) * K_padded;
+                    const int8_t* w4 = w_int8 + (n + 4) * K_padded;
+                    const int8_t* w5 = w_int8 + (n + 5) * K_padded;
+                    const int8_t* w6 = w_int8 + (n + 6) * K_padded;
+                    const int8_t* w7 = w_int8 + (n + 7) * K_padded;
+
+                    k = 0;
+                    for (; k + 15 < K; k += 16) {
+                        int8x16_t x_vec = vld1q_s8(x_q_local + k);
+                        acc0 = vdotq_s32(acc0, x_vec, vld1q_s8(w0 + k));
+                        acc1 = vdotq_s32(acc1, x_vec, vld1q_s8(w1 + k));
+                        acc2 = vdotq_s32(acc2, x_vec, vld1q_s8(w2 + k));
+                        acc3 = vdotq_s32(acc3, x_vec, vld1q_s8(w3 + k));
+                        acc4 = vdotq_s32(acc4, x_vec, vld1q_s8(w4 + k));
+                        acc5 = vdotq_s32(acc5, x_vec, vld1q_s8(w5 + k));
+                        acc6 = vdotq_s32(acc6, x_vec, vld1q_s8(w6 + k));
+                        acc7 = vdotq_s32(acc7, x_vec, vld1q_s8(w7 + k));
+                    }
+
+                    int32_t sum0 = vaddvq_s32(acc0);
+                    int32_t sum1 = vaddvq_s32(acc1);
+                    int32_t sum2 = vaddvq_s32(acc2);
+                    int32_t sum3 = vaddvq_s32(acc3);
+                    int32_t sum4 = vaddvq_s32(acc4);
+                    int32_t sum5 = vaddvq_s32(acc5);
+                    int32_t sum6 = vaddvq_s32(acc6);
+                    int32_t sum7 = vaddvq_s32(acc7);
+
+                    for (; k < K; k++) {
+                        int8_t x_val = x_q_local[k];
+                        sum0 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w0[k]);
+                        sum1 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w1[k]);
+                        sum2 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w2[k]);
+                        sum3 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w3[k]);
+                        sum4 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w4[k]);
+                        sum5 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w5[k]);
+                        sum6 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w6[k]);
+                        sum7 += static_cast<int32_t>(x_val) * static_cast<int32_t>(w7[k]);
+                    }
+
+                    y_row[n + 0] = static_cast<float>(sum0) * combined_scale + (bias ? bias[n + 0] : 0.0f);
+                    y_row[n + 1] = static_cast<float>(sum1) * combined_scale + (bias ? bias[n + 1] : 0.0f);
+                    y_row[n + 2] = static_cast<float>(sum2) * combined_scale + (bias ? bias[n + 2] : 0.0f);
+                    y_row[n + 3] = static_cast<float>(sum3) * combined_scale + (bias ? bias[n + 3] : 0.0f);
+                    y_row[n + 4] = static_cast<float>(sum4) * combined_scale + (bias ? bias[n + 4] : 0.0f);
+                    y_row[n + 5] = static_cast<float>(sum5) * combined_scale + (bias ? bias[n + 5] : 0.0f);
+                    y_row[n + 6] = static_cast<float>(sum6) * combined_scale + (bias ? bias[n + 6] : 0.0f);
+                    y_row[n + 7] = static_cast<float>(sum7) * combined_scale + (bias ? bias[n + 7] : 0.0f);
+                }
+
+                for (; n < N; n++) {
+                    const int8_t* w_row = w_int8 + n * K_padded;
+                    int32x4_t acc = vdupq_n_s32(0);
+
+                    k = 0;
+                    for (; k + 15 < K; k += 16) {
+                        int8x16_t x_vec = vld1q_s8(x_q_local + k);
+                        acc = vdotq_s32(acc, x_vec, vld1q_s8(w_row + k));
+                    }
+
+                    int32_t sum = vaddvq_s32(acc);
+                    for (; k < K; k++) {
+                        sum += static_cast<int32_t>(x_q_local[k]) * static_cast<int32_t>(w_row[k]);
+                    }
+
+                    y_row[n] = static_cast<float>(sum) * combined_scale + (bias ? bias[n] : 0.0f);
+                }
+            }
+        }
+    }
+}
+
 #ifdef APPLE_SILICON
 
 /**
@@ -968,6 +1241,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "SDOT v4: 8-way register blocking");
     m.def("matmul_free_neon_sdot_v4_fused", &matmul_free_neon_sdot_v4_fused,
           "SDOT v4 Fused: Float input, fused quantize+matmul");
+    m.def("matmul_free_neon_sdot_v4_fused_wp", &matmul_free_neon_sdot_v4_fused_wp,
+          "SDOT v4 Fused Weight Parallel: Optimized for M=1 token generation");
 
 #ifdef APPLE_SILICON
     m.def("matmul_free_accelerate", &matmul_free_accelerate,
