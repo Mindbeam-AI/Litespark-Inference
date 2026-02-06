@@ -1052,6 +1052,9 @@ class BitNetAttention(nn.Module):
 
         self.scale = 1.0 / (self.head_dim ** 0.5)
 
+        # Use SDPA only on x86_64 where it provides speedup (hurts ARM performance)
+        self.use_sdpa = platform.machine() in ('x86_64', 'AMD64')
+
         # Precompute RoPE frequencies
         self.rope_theta = config.rope_theta
         self._init_rope(config.max_position_embeddings)
@@ -1125,23 +1128,29 @@ class BitNetAttention(nn.Module):
         k_expanded = k.repeat_interleave(self.num_kv_groups, dim=1)
         v_expanded = v.repeat_interleave(self.num_kv_groups, dim=1)
 
-        # Attention: Q @ K^T
-        total_len = k.shape[2]
-        attn = torch.matmul(q, k_expanded.transpose(-2, -1)) * self.scale
-
-        # Causal mask - only mask future tokens relative to each query position
-        # For cached generation: query positions are [past_len, past_len + seq_len)
-        # They can attend to all positions [0, past_len + seq_len)
-        if seq_len > 1:
-            # Prefill: standard causal mask
-            causal_mask = torch.triu(
-                torch.ones(seq_len, total_len, dtype=torch.bool, device=x.device),
-                diagonal=past_len + 1
+        if self.use_sdpa:
+            # Use PyTorch's optimized scaled_dot_product_attention (faster on x86_64)
+            # This fuses Q@K^T, scale, softmax, @V into a single optimized kernel
+            out = F.scaled_dot_product_attention(
+                q, k_expanded, v_expanded,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=(seq_len > 1)
             )
-            attn = attn.masked_fill(causal_mask, float('-inf'))
+        else:
+            # Manual attention (faster on ARM)
+            attn_weights = torch.matmul(q, k_expanded.transpose(-2, -1)) * self.scale
 
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_expanded)
+            # Apply causal mask if needed
+            if seq_len > 1:
+                causal_mask = torch.triu(
+                    torch.ones(seq_len, k_expanded.shape[2], device=q.device, dtype=torch.bool),
+                    diagonal=k_expanded.shape[2] - seq_len + 1
+                )
+                attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            out = torch.matmul(attn_weights, v_expanded)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_size)
 
