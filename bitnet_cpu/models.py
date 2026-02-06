@@ -404,45 +404,60 @@ class TernaryLinear(nn.Module):
         kernel_type = get_kernel_type()
 
         if kernel_type == 'vnni':
-            # x86_64 AVX-512 VNNI - keep existing logic
-            # Quantize input
-            x_int8, x_scale = quantize_activation(x)
-
-            if self.use_v4_large_n:
-                # v4_large_n: outputs int32, ~17x faster for large N
-                y_int32 = torch.zeros(M, self.out_features, dtype=torch.int32)
-                kernel.matmul_free_vnni_v4_large_n(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y_int32,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-                # Convert to float and apply scales
-                y = y_int32.float() * x_scale.unsqueeze(1) * self.scale
-            elif self.in_features <= 1024 and self.out_features <= 4096:
+            # x86_64 AVX-512 VNNI
+            if M <= 4 and self.num_threads > 1:
+                # Weight Parallel: fused kernel for small M (token generation)
+                # Parallelizes over N instead of M for better thread utilization
                 y = torch.zeros(M, self.out_features, dtype=torch.float32)
                 bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-                kernel.matmul_free_vnni_v2(
-                    x_int8, x_scale,
+                kernel.matmul_free_vnni_v4_fused_wp(
+                    x.contiguous(),  # Float input
                     self.w_int8, self.w_sum,
                     y, bias,
+                    self.scale,  # Weight scale applied inside kernel
                     M, self.out_features, self.in_features, self.num_threads
                 )
-                y = y * self.scale
+                # Note: scale and bias already applied in kernel
             else:
-                y = torch.zeros(M, self.out_features, dtype=torch.float32)
-                bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-                kernel.matmul_free_vnni_v3(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-                y = y * self.scale
+                # Activation Parallel: original logic for larger M
+                # Quantize input
+                x_int8, x_scale = quantize_activation(x)
 
-            # Apply bias if present (for v4 path, bias wasn't applied in kernel)
-            if self.use_v4_large_n and self.bias_tensor is not None:
-                y = y + self.bias_tensor
+                if self.use_v4_large_n:
+                    # v4_large_n: outputs int32, ~17x faster for large N
+                    y_int32 = torch.zeros(M, self.out_features, dtype=torch.int32)
+                    kernel.matmul_free_vnni_v4_large_n(
+                        x_int8, x_scale,
+                        self.w_int8, self.w_sum,
+                        y_int32,
+                        M, self.out_features, self.in_features, self.num_threads
+                    )
+                    # Convert to float and apply scales
+                    y = y_int32.float() * x_scale.unsqueeze(1) * self.scale
+                elif self.in_features <= 1024 and self.out_features <= 4096:
+                    y = torch.zeros(M, self.out_features, dtype=torch.float32)
+                    bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
+                    kernel.matmul_free_vnni_v2(
+                        x_int8, x_scale,
+                        self.w_int8, self.w_sum,
+                        y, bias,
+                        M, self.out_features, self.in_features, self.num_threads
+                    )
+                    y = y * self.scale
+                else:
+                    y = torch.zeros(M, self.out_features, dtype=torch.float32)
+                    bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
+                    kernel.matmul_free_vnni_v3(
+                        x_int8, x_scale,
+                        self.w_int8, self.w_sum,
+                        y, bias,
+                        M, self.out_features, self.in_features, self.num_threads
+                    )
+                    y = y * self.scale
+
+                # Apply bias if present (for v4 path, bias wasn't applied in kernel)
+                if self.use_v4_large_n and self.bias_tensor is not None:
+                    y = y + self.bias_tensor
 
         elif kernel_type == 'graviton':
             # AWS Graviton NEON SDOT - use v4_fused (float input, fused quantize+matmul)
@@ -756,46 +771,61 @@ class BitNetLinear(nn.Module):
         kernel_type = get_kernel_type()
 
         if kernel_type == 'vnni':
-            # x86_64 AVX-512 VNNI - keep existing logic
-            # Quantize input
-            x_int8, x_scale = quantize_activation(x)
-
-            if self.use_v4_large_n:
-                # v4_large_n: outputs int32, ~17x faster for large N
-                y_int32 = torch.zeros(M, self.out_features, dtype=torch.int32)
-                kernel.matmul_free_vnni_v4_large_n(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y_int32,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-                # Convert to float and apply scales
-                # v4 outputs raw int32 dot products, need to apply x_scale and weight scale
-                y = y_int32.float() * x_scale.unsqueeze(1) * self.scale
-            elif self.in_features <= 1024 and self.out_features <= 4096:
+            # x86_64 AVX-512 VNNI
+            if M <= 4 and self.num_threads > 1:
+                # Weight Parallel: fused kernel for small M (token generation)
+                # Parallelizes over N instead of M for better thread utilization
                 y = torch.zeros(M, self.out_features, dtype=torch.float32)
                 bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-                kernel.matmul_free_vnni_v2(
-                    x_int8, x_scale,
+                kernel.matmul_free_vnni_v4_fused_wp(
+                    x.contiguous(),  # Float input
                     self.w_int8, self.w_sum,
                     y, bias,
+                    self.scale,  # Weight scale applied inside kernel
                     M, self.out_features, self.in_features, self.num_threads
                 )
-                y = y * self.scale
+                # Note: scale and bias already applied in kernel
             else:
-                y = torch.zeros(M, self.out_features, dtype=torch.float32)
-                bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
-                kernel.matmul_free_vnni_v3(
-                    x_int8, x_scale,
-                    self.w_int8, self.w_sum,
-                    y, bias,
-                    M, self.out_features, self.in_features, self.num_threads
-                )
-                y = y * self.scale
+                # Activation Parallel: original logic for larger M
+                # Quantize input
+                x_int8, x_scale = quantize_activation(x)
 
-            # Apply bias if present (for v4 path, bias wasn't applied in kernel)
-            if self.use_v4_large_n and self.bias_tensor is not None:
-                y = y + self.bias_tensor
+                if self.use_v4_large_n:
+                    # v4_large_n: outputs int32, ~17x faster for large N
+                    y_int32 = torch.zeros(M, self.out_features, dtype=torch.int32)
+                    kernel.matmul_free_vnni_v4_large_n(
+                        x_int8, x_scale,
+                        self.w_int8, self.w_sum,
+                        y_int32,
+                        M, self.out_features, self.in_features, self.num_threads
+                    )
+                    # Convert to float and apply scales
+                    # v4 outputs raw int32 dot products, need to apply x_scale and weight scale
+                    y = y_int32.float() * x_scale.unsqueeze(1) * self.scale
+                elif self.in_features <= 1024 and self.out_features <= 4096:
+                    y = torch.zeros(M, self.out_features, dtype=torch.float32)
+                    bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
+                    kernel.matmul_free_vnni_v2(
+                        x_int8, x_scale,
+                        self.w_int8, self.w_sum,
+                        y, bias,
+                        M, self.out_features, self.in_features, self.num_threads
+                    )
+                    y = y * self.scale
+                else:
+                    y = torch.zeros(M, self.out_features, dtype=torch.float32)
+                    bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
+                    kernel.matmul_free_vnni_v3(
+                        x_int8, x_scale,
+                        self.w_int8, self.w_sum,
+                        y, bias,
+                        M, self.out_features, self.in_features, self.num_threads
+                    )
+                    y = y * self.scale
+
+                # Apply bias if present (for v4 path, bias wasn't applied in kernel)
+                if self.use_v4_large_n and self.bias_tensor is not None:
+                    y = y + self.bias_tensor
 
         elif kernel_type == 'graviton':
             # AWS Graviton NEON SDOT - use v4_fused (float input, fused quantize+matmul)

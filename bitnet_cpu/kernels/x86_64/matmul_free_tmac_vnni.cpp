@@ -4640,12 +4640,203 @@ void quantize_int32_to_int8(
     }
 }
 
+/**
+ * Weight Parallel fused kernel for small M (token generation)
+ *
+ * Takes float input, fuses quantization, parallelizes over N blocks.
+ * Optimized for M=1 case where we can't parallelize over M.
+ *
+ * Key differences from v4_large_n:
+ * 1. Takes float input directly (no separate Python quantization)
+ * 2. Quantizes activation internally using SIMD
+ * 3. Outputs float with all scales applied
+ */
+void matmul_free_vnni_v4_fused_wp(
+    torch::Tensor x_float_tensor,   // [M, K] float32 input
+    torch::Tensor w_int8_tensor,    // [N, K_padded] int8
+    torch::Tensor w_sum_tensor,     // [N] int32
+    torch::Tensor y_tensor,         // [M, N] float32 output
+    torch::Tensor bias_tensor,      // [N] float32 or empty
+    float weight_scale,
+    int M, int N, int K,
+    int num_threads
+) {
+    const float* __restrict__ x_float = x_float_tensor.data_ptr<float>();
+    const int8_t* __restrict__ w_int8 = w_int8_tensor.data_ptr<int8_t>();
+    const int32_t* __restrict__ w_sum = w_sum_tensor.data_ptr<int32_t>();
+    float* __restrict__ y = y_tensor.data_ptr<float>();
+    const float* bias = bias_tensor.numel() > 0 ? bias_tensor.data_ptr<float>() : nullptr;
+
+    const int K_padded = ((K + 63) / 64) * 64;
+
+    omp_set_num_threads(num_threads);
+
+    // Quantize all M rows (small cost for small M)
+    // Allocate aligned buffers for quantized activations and scales
+    uint8_t* x_uint8_all = (uint8_t*)aligned_alloc(64, M * K_padded);
+    float* x_scales = (float*)aligned_alloc(64, M * sizeof(float));
+
+    // Quantize activations (parallel over M for M > 1)
+    #pragma omp parallel for schedule(static) if(M > 1)
+    for (int m = 0; m < M; m++) {
+        const float* x_row = x_float + m * K;
+        uint8_t* x_uint8 = x_uint8_all + m * K_padded;
+
+        // Find max absolute value using SIMD
+        __m512 max_abs_vec = _mm512_setzero_ps();
+        int k = 0;
+        for (; k + 15 < K; k += 16) {
+            __m512 x_vec = _mm512_loadu_ps(x_row + k);
+            __m512 abs_vec = _mm512_abs_ps(x_vec);
+            max_abs_vec = _mm512_max_ps(max_abs_vec, abs_vec);
+        }
+        float max_abs = _mm512_reduce_max_ps(max_abs_vec);
+        for (; k < K; k++) {
+            float abs_val = std::abs(x_row[k]);
+            if (abs_val > max_abs) max_abs = abs_val;
+        }
+
+        // Compute scale
+        float scale = max_abs / 127.0f;
+        if (scale < 1e-10f) scale = 1e-10f;
+        x_scales[m] = scale;
+        float inv_scale = 127.0f / max_abs;
+
+        // Quantize to uint8 (int8 + 128 offset for unsigned dpbusd)
+        const __m512 scale_vec = _mm512_set1_ps(inv_scale);
+        const __m512i offset_vec = _mm512_set1_epi32(128);
+        k = 0;
+        for (; k + 15 < K; k += 16) {
+            __m512 x_vec = _mm512_loadu_ps(x_row + k);
+            __m512 scaled = _mm512_mul_ps(x_vec, scale_vec);
+            __m512i rounded = _mm512_cvtps_epi32(scaled);
+            rounded = _mm512_max_epi32(rounded, _mm512_set1_epi32(-127));
+            rounded = _mm512_min_epi32(rounded, _mm512_set1_epi32(127));
+            rounded = _mm512_add_epi32(rounded, offset_vec);
+
+            // Pack to bytes (only lower 8 bits of each 32-bit element)
+            __m128i packed = _mm512_cvtsepi32_epi8(rounded);
+            _mm_store_si128((__m128i*)(x_uint8 + k), packed);
+        }
+        for (; k < K; k++) {
+            int8_t q = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, x_row[k] * inv_scale)));
+            x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(q) + 128);
+        }
+        // Zero-pad
+        for (; k < K_padded; k++) {
+            x_uint8[k] = 128;
+        }
+    }
+
+    // Process N in parallel blocks
+    constexpr int N_BLOCK = 16;
+    const int n_blocks = (N + N_BLOCK - 1) / N_BLOCK;
+
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int nb = 0; nb < n_blocks; nb++) {
+        const int n_start = nb * N_BLOCK;
+        const int n_end = std::min(n_start + N_BLOCK, N);
+        const int block_size = n_end - n_start;
+
+        // Process all M rows for this N block
+        for (int m = 0; m < M; m++) {
+            const uint8_t* x_uint8 = x_uint8_all + m * K_padded;
+            float x_scale = x_scales[m];
+            float combined_scale = x_scale * weight_scale;
+            float* y_row = y + m * N;
+
+            if (block_size >= 16) {
+                __m512i acc[16];
+                for (int i = 0; i < 16; i++) {
+                    acc[i] = _mm512_setzero_si512();
+                }
+
+                const int8_t* w_ptrs[16];
+                for (int i = 0; i < 16; i++) {
+                    w_ptrs[i] = w_int8 + (n_start + i) * K_padded;
+                }
+
+                // Main compute loop
+                for (int kk = 0; kk < K_padded; kk += 64) {
+                    __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+
+                    // 4 groups of 4 outputs
+                    __m512i w0 = _mm512_loadu_si512((__m512i*)(w_ptrs[0] + kk));
+                    __m512i w1 = _mm512_loadu_si512((__m512i*)(w_ptrs[1] + kk));
+                    __m512i w2 = _mm512_loadu_si512((__m512i*)(w_ptrs[2] + kk));
+                    __m512i w3 = _mm512_loadu_si512((__m512i*)(w_ptrs[3] + kk));
+                    acc[0] = _mm512_dpbusd_epi32(acc[0], x_vec, w0);
+                    acc[1] = _mm512_dpbusd_epi32(acc[1], x_vec, w1);
+                    acc[2] = _mm512_dpbusd_epi32(acc[2], x_vec, w2);
+                    acc[3] = _mm512_dpbusd_epi32(acc[3], x_vec, w3);
+
+                    __m512i w4 = _mm512_loadu_si512((__m512i*)(w_ptrs[4] + kk));
+                    __m512i w5 = _mm512_loadu_si512((__m512i*)(w_ptrs[5] + kk));
+                    __m512i w6 = _mm512_loadu_si512((__m512i*)(w_ptrs[6] + kk));
+                    __m512i w7 = _mm512_loadu_si512((__m512i*)(w_ptrs[7] + kk));
+                    acc[4] = _mm512_dpbusd_epi32(acc[4], x_vec, w4);
+                    acc[5] = _mm512_dpbusd_epi32(acc[5], x_vec, w5);
+                    acc[6] = _mm512_dpbusd_epi32(acc[6], x_vec, w6);
+                    acc[7] = _mm512_dpbusd_epi32(acc[7], x_vec, w7);
+
+                    __m512i w8 = _mm512_loadu_si512((__m512i*)(w_ptrs[8] + kk));
+                    __m512i w9 = _mm512_loadu_si512((__m512i*)(w_ptrs[9] + kk));
+                    __m512i w10 = _mm512_loadu_si512((__m512i*)(w_ptrs[10] + kk));
+                    __m512i w11 = _mm512_loadu_si512((__m512i*)(w_ptrs[11] + kk));
+                    acc[8] = _mm512_dpbusd_epi32(acc[8], x_vec, w8);
+                    acc[9] = _mm512_dpbusd_epi32(acc[9], x_vec, w9);
+                    acc[10] = _mm512_dpbusd_epi32(acc[10], x_vec, w10);
+                    acc[11] = _mm512_dpbusd_epi32(acc[11], x_vec, w11);
+
+                    __m512i w12 = _mm512_loadu_si512((__m512i*)(w_ptrs[12] + kk));
+                    __m512i w13 = _mm512_loadu_si512((__m512i*)(w_ptrs[13] + kk));
+                    __m512i w14 = _mm512_loadu_si512((__m512i*)(w_ptrs[14] + kk));
+                    __m512i w15 = _mm512_loadu_si512((__m512i*)(w_ptrs[15] + kk));
+                    acc[12] = _mm512_dpbusd_epi32(acc[12], x_vec, w12);
+                    acc[13] = _mm512_dpbusd_epi32(acc[13], x_vec, w13);
+                    acc[14] = _mm512_dpbusd_epi32(acc[14], x_vec, w14);
+                    acc[15] = _mm512_dpbusd_epi32(acc[15], x_vec, w15);
+                }
+
+                // Reduce and store with scales applied
+                for (int i = 0; i < 16; i++) {
+                    int32_t sum = _mm512_reduce_add_epi32(acc[i]) - 128 * w_sum[n_start + i];
+                    float result = static_cast<float>(sum) * combined_scale;
+                    if (bias) result += bias[n_start + i];
+                    y_row[n_start + i] = result;
+                }
+            } else {
+                // Handle remainder (< 16 outputs)
+                for (int n = n_start; n < n_end; n++) {
+                    const int8_t* w_row = w_int8 + n * K_padded;
+                    __m512i acc = _mm512_setzero_si512();
+
+                    for (int kk = 0; kk < K_padded; kk += 64) {
+                        __m512i x_vec = _mm512_load_si512((__m512i*)(x_uint8 + kk));
+                        acc = _mm512_dpbusd_epi32(acc, x_vec, _mm512_loadu_si512((__m512i*)(w_row + kk)));
+                    }
+
+                    int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * w_sum[n];
+                    float result = static_cast<float>(sum) * combined_scale;
+                    if (bias) result += bias[n];
+                    y_row[n] = result;
+                }
+            }
+        }
+    }
+
+    free(x_uint8_all);
+    free(x_scales);
+}
+
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_activations_int8_vnni", &quantize_activations_int8_vnni,
           "Quantize activations to int8");
     m.def("pack_weights_vnni", &pack_weights_vnni,
           "Pack ternary weights for VNNI kernel");
+    m.def("matmul_free_vnni_v4_fused_wp", &matmul_free_vnni_v4_fused_wp,
+          "VNNI v4 fused Weight Parallel kernel for small M (token generation)");
     m.def("matmul_free_vnni_simple", &matmul_free_vnni_simple,
           "VNNI-based ternary matmul (simple)");
     m.def("matmul_free_vnni_v2", &matmul_free_vnni_v2,
