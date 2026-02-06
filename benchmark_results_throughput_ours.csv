@@ -1,0 +1,7 @@
+Platform,Metric,1 Thread,2 Threads,4 Threads,8 Threads
+AMD EPYC 9R14,pp128 (tok/s),38.30,74.76,140.90,244.33
+AMD EPYC 9R14,tg128 (tok/s),4.72,6.78,8.31,8.93
+Intel Xeon 8488C,pp128 (tok/s),52.06,97.40,159.57,126.42
+Intel Xeon 8488C,tg128 (tok/s),3.08,5.25,8.22,7.06
+Apple M4,pp128 (tok/s),23.93,40.92,64.97,70.29
+Apple M4,tg128 (tok/s),6.55,6.31,6.77,6.96

@@ -332,7 +332,7 @@ def run_inference_benchmark(num_threads: int = 4, num_tokens: int = 128) -> Dict
 
     # Load model
     print("Loading model: bitnet-2b")
-    model, tokenizer = load_ternary_model('bitnet-2b', mode='neon')
+    model, tokenizer = load_ternary_model('bitnet-2b', num_threads=num_threads, mode='neon')
     gc.collect()
 
     kernel_type = get_kernel_type()

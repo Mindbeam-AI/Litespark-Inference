@@ -1,0 +1,7 @@
+Platform,Metric,1 Thread,2 Threads,4 Threads,8 Threads,12 Threads,16 Threads
+AMD EPYC 7V13,pp128 (tok/s),35,70,140,210,260,310
+AMD EPYC 7V13,tg128 (tok/s),10,18,30,42,48,55
+Intel i7-13800H,pp128 (tok/s),27,40,55,79,-,-
+Intel i7-13800H,tg128 (tok/s),10,13,16,20,-,-
+Cobalt 100 ARM,pp128 (tok/s),20,50,100,165,215,-
+Cobalt 100 ARM,tg128 (tok/s),8,18,32,45,53,-

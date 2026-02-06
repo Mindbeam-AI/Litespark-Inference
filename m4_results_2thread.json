@@ -1,0 +1,116 @@
+{
+  "system": {
+    "cpu_model": "Apple M4",
+    "cpu_cores": 10,
+    "architecture": "arm64",
+    "simd_features": {
+      "avx512f": false,
+      "avx512vnni": false,
+      "avx_vnni": false,
+      "neon": true
+    }
+  },
+  "benchmarks": {
+    "matrix": {
+      "system": {
+        "cpu_model": "Apple M4",
+        "cpu_cores": 10,
+        "architecture": "arm64",
+        "simd_features": {
+          "avx512f": false,
+          "avx512vnni": false,
+          "avx_vnni": false,
+          "neon": true
+        },
+        "kernel_type": "neon"
+      },
+      "config": {
+        "num_threads": 2,
+        "num_runs": 20
+      },
+      "matrix_benchmarks": [
+        {
+          "matrix_size": "[1, 2048] \u00d7 [2048, 2048]",
+          "M": 1,
+          "K": 2048,
+          "N": 2048,
+          "mean_ms": 0.0543102971278131,
+          "std_ms": 0.006156283149353594
+        },
+        {
+          "matrix_size": "[32, 2048] \u00d7 [2048, 2048]",
+          "M": 32,
+          "K": 2048,
+          "N": 2048,
+          "mean_ms": 1.0898519598413259,
+          "std_ms": 0.22074279608616454
+        },
+        {
+          "matrix_size": "[128, 2048] \u00d7 [2048, 2048]",
+          "M": 128,
+          "K": 2048,
+          "N": 2048,
+          "mean_ms": 3.4039395628497005,
+          "std_ms": 0.9907578711481966
+        },
+        {
+          "matrix_size": "[256, 2048] \u00d7 [2048, 2048]",
+          "M": 256,
+          "K": 2048,
+          "N": 2048,
+          "mean_ms": 6.575347849866375,
+          "std_ms": 0.5787535174536257
+        },
+        {
+          "matrix_size": "[512, 2048] \u00d7 [2048, 2048]",
+          "M": 512,
+          "K": 2048,
+          "N": 2048,
+          "mean_ms": 13.452560448786244,
+          "std_ms": 1.4729905852372986
+        },
+        {
+          "matrix_size": "[2048, 2048] \u00d7 [2048, 2048]",
+          "M": 2048,
+          "K": 2048,
+          "N": 2048,
+          "mean_ms": 53.51798130432144,
+          "std_ms": 2.600729824869255
+        },
+        {
+          "matrix_size": "[128, 2048] \u00d7 [2048, 8192]",
+          "M": 128,
+          "K": 2048,
+          "N": 8192,
+          "mean_ms": 37.65662711230107,
+          "std_ms": 14.39179298536335
+        },
+        {
+          "matrix_size": "[128, 8192] \u00d7 [8192, 2048]",
+          "M": 128,
+          "K": 8192,
+          "N": 2048,
+          "mean_ms": 28.387943899724633,
+          "std_ms": 5.899521166288866
+        }
+      ]
+    },
+    "inference": {
+      "model": "bitnet-2b",
+      "kernel": "neon",
+      "threads": 2,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 3128.2011416042224,
+        "std_ms": 187.3778506445826,
+        "throughput_tps": 40.91808493310577
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 20272.75962533895,
+        "std_ms": 682.1919570907812,
+        "throughput_tps": 6.313891269149792
+      }
+    }
+  }
+}
