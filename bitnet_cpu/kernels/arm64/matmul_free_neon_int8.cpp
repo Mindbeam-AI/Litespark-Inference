@@ -1225,10 +1225,855 @@ void convert_weights_to_f32(
 
 #endif // APPLE_SILICON
 
+// ============================================================================
+// Fused Attention Kernel for Token Generation
+// ============================================================================
+// Fuses: RoPE + GQA expand + Q@K^T + scale + softmax + @V
+// Optimized for single-token generation (seq_len=1)
+
+/**
+ * Apply RoPE to a single vector in-place
+ * x: [head_dim] tensor
+ * cos, sin: [head_dim] precomputed RoPE values for this position
+ */
+inline void apply_rope_single_neon(
+    float* x,
+    const float* cos_ptr,
+    const float* sin_ptr,
+    int head_dim
+) {
+    const int half_dim = head_dim / 2;
+
+    // Process in chunks of 4 (NEON vector width)
+    int i = 0;
+    for (; i + 3 < half_dim; i += 4) {
+        // Load x1 (first half) and x2 (second half)
+        float32x4_t x1 = vld1q_f32(x + i);
+        float32x4_t x2 = vld1q_f32(x + half_dim + i);
+
+        // Load cos and sin
+        float32x4_t cos_v = vld1q_f32(cos_ptr + i);
+        float32x4_t sin_v = vld1q_f32(sin_ptr + i);
+
+        // RoPE: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
+        // But the actual formula is: [-x2, x1] rotated
+        // out[i] = x[i] * cos[i] - x[i + half] * sin[i]  (for i < half)
+        // out[i] = x[i - half] * sin[i - half] + x[i] * cos[i - half]  (for i >= half)
+
+        // Simpler: treat as complex rotation
+        // For first half: out = x1*cos - x2*sin
+        float32x4_t out1 = vmlsq_f32(vmulq_f32(x1, cos_v), x2, sin_v);
+        // For second half: out = x2*cos + x1*sin
+        float32x4_t out2 = vmlaq_f32(vmulq_f32(x2, cos_v), x1, sin_v);
+
+        vst1q_f32(x + i, out1);
+        vst1q_f32(x + half_dim + i, out2);
+    }
+
+    // Handle remainder
+    for (; i < half_dim; i++) {
+        float x1 = x[i];
+        float x2 = x[half_dim + i];
+        float c = cos_ptr[i];
+        float s = sin_ptr[i];
+        x[i] = x1 * c - x2 * s;
+        x[half_dim + i] = x2 * c + x1 * s;
+    }
+}
+
+/**
+ * Fused attention for single-token generation
+ *
+ * Inputs:
+ *   q: [batch, num_heads, 1, head_dim] - query (single token)
+ *   k: [batch, num_kv_heads, seq_len, head_dim] - key cache (already has RoPE applied to past)
+ *   v: [batch, num_kv_heads, seq_len, head_dim] - value cache
+ *   cos: [head_dim] - RoPE cos for current position
+ *   sin: [head_dim] - RoPE sin for current position
+ *
+ * Output:
+ *   out: [batch, num_heads, 1, head_dim]
+ *
+ * Note: This kernel applies RoPE to q and k_new (the new K being added)
+ * The KV cache should have RoPE already applied to past tokens.
+ */
+void fused_attention_neon(
+    torch::Tensor q_tensor,      // [batch, num_heads, 1, head_dim]
+    torch::Tensor k_tensor,      // [batch, num_kv_heads, kv_len, head_dim]
+    torch::Tensor v_tensor,      // [batch, num_kv_heads, kv_len, head_dim]
+    torch::Tensor out_tensor,    // [batch, num_heads, 1, head_dim]
+    torch::Tensor cos_tensor,    // [head_dim] - for current position
+    torch::Tensor sin_tensor,    // [head_dim] - for current position
+    float scale,                 // 1/sqrt(head_dim)
+    int num_threads
+) {
+    const int batch = q_tensor.size(0);
+    const int num_heads = q_tensor.size(1);
+    const int num_kv_heads = k_tensor.size(1);
+    const int kv_len = k_tensor.size(2);
+    const int head_dim = q_tensor.size(3);
+    const int num_kv_groups = num_heads / num_kv_heads;
+
+    float* q = q_tensor.data_ptr<float>();
+    float* k = k_tensor.data_ptr<float>();
+    float* v = v_tensor.data_ptr<float>();
+    float* out = out_tensor.data_ptr<float>();
+    const float* cos_ptr = cos_tensor.data_ptr<float>();
+    const float* sin_ptr = sin_tensor.data_ptr<float>();
+
+    #ifndef DISABLE_OPENMP
+    omp_set_num_threads(num_threads);
+    #endif
+
+    // Process each batch and head
+    #pragma omp parallel for collapse(2)
+    for (int b = 0; b < batch; b++) {
+        for (int h = 0; h < num_heads; h++) {
+            // Get pointers for this head
+            float* q_head = q + b * num_heads * head_dim + h * head_dim;
+            float* out_head = out + b * num_heads * head_dim + h * head_dim;
+
+            // Determine which KV head this Q head uses (GQA)
+            int kv_h = h / num_kv_groups;
+            const float* k_head = k + b * num_kv_heads * kv_len * head_dim + kv_h * kv_len * head_dim;
+            const float* v_head = v + b * num_kv_heads * kv_len * head_dim + kv_h * kv_len * head_dim;
+
+            // Apply RoPE to Q (in-place for this head)
+            // Note: We make a copy to avoid modifying the original
+            float q_rope[256];  // Assume head_dim <= 256
+            memcpy(q_rope, q_head, head_dim * sizeof(float));
+            apply_rope_single_neon(q_rope, cos_ptr, sin_ptr, head_dim);
+
+            // Compute attention scores: Q @ K^T
+            // scores[i] = dot(q_rope, k[i]) * scale
+            float scores[4096];  // Assume kv_len <= 4096
+            float max_score = -1e9f;
+
+            for (int i = 0; i < kv_len; i++) {
+                const float* k_vec = k_head + i * head_dim;
+
+                // Dot product using NEON
+                float32x4_t sum_vec = vdupq_n_f32(0.0f);
+                int d = 0;
+                for (; d + 3 < head_dim; d += 4) {
+                    float32x4_t q_v = vld1q_f32(q_rope + d);
+                    float32x4_t k_v = vld1q_f32(k_vec + d);
+                    sum_vec = vmlaq_f32(sum_vec, q_v, k_v);
+                }
+                float dot = vaddvq_f32(sum_vec);
+                for (; d < head_dim; d++) {
+                    dot += q_rope[d] * k_vec[d];
+                }
+
+                scores[i] = dot * scale;
+                if (scores[i] > max_score) max_score = scores[i];
+            }
+
+            // Softmax: exp(scores - max) / sum(exp(scores - max))
+            float sum_exp = 0.0f;
+            for (int i = 0; i < kv_len; i++) {
+                scores[i] = expf(scores[i] - max_score);
+                sum_exp += scores[i];
+            }
+            float inv_sum = 1.0f / sum_exp;
+            for (int i = 0; i < kv_len; i++) {
+                scores[i] *= inv_sum;
+            }
+
+            // Compute output: attention @ V
+            // out = sum(scores[i] * v[i])
+            memset(out_head, 0, head_dim * sizeof(float));
+
+            for (int i = 0; i < kv_len; i++) {
+                const float* v_vec = v_head + i * head_dim;
+                float score = scores[i];
+
+                // Accumulate: out += score * v
+                float32x4_t score_vec = vdupq_n_f32(score);
+                int d = 0;
+                for (; d + 3 < head_dim; d += 4) {
+                    float32x4_t out_v = vld1q_f32(out_head + d);
+                    float32x4_t v_v = vld1q_f32(v_vec + d);
+                    out_v = vmlaq_f32(out_v, score_vec, v_v);
+                    vst1q_f32(out_head + d, out_v);
+                }
+                for (; d < head_dim; d++) {
+                    out_head[d] += score * v_vec[d];
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Optimized version for longer sequences - tiles the KV dimension
+ * to improve cache efficiency for the softmax computation
+ */
+void fused_attention_neon_tiled(
+    torch::Tensor q_tensor,      // [batch, num_heads, seq_q, head_dim]
+    torch::Tensor k_tensor,      // [batch, num_kv_heads, seq_kv, head_dim]
+    torch::Tensor v_tensor,      // [batch, num_kv_heads, seq_kv, head_dim]
+    torch::Tensor out_tensor,    // [batch, num_heads, seq_q, head_dim]
+    float scale,
+    bool is_causal,
+    int num_threads
+) {
+    // For now, just call the simple version for single-token case
+    // TODO: Implement tiled version for longer sequences
+    const int seq_q = q_tensor.size(2);
+
+    if (seq_q == 1) {
+        // Single token case - use simple kernel without RoPE
+        // (RoPE should be applied before calling this)
+        const int batch = q_tensor.size(0);
+        const int num_heads = q_tensor.size(1);
+        const int num_kv_heads = k_tensor.size(1);
+        const int kv_len = k_tensor.size(2);
+        const int head_dim = q_tensor.size(3);
+        const int num_kv_groups = num_heads / num_kv_heads;
+
+        float* q = q_tensor.data_ptr<float>();
+        float* k = k_tensor.data_ptr<float>();
+        float* v = v_tensor.data_ptr<float>();
+        float* out = out_tensor.data_ptr<float>();
+
+        #ifndef DISABLE_OPENMP
+        omp_set_num_threads(num_threads);
+        #endif
+
+        #pragma omp parallel for collapse(2)
+        for (int b = 0; b < batch; b++) {
+            for (int h = 0; h < num_heads; h++) {
+                float* q_head = q + b * num_heads * head_dim + h * head_dim;
+                float* out_head = out + b * num_heads * head_dim + h * head_dim;
+
+                int kv_h = h / num_kv_groups;
+                const float* k_head = k + b * num_kv_heads * kv_len * head_dim + kv_h * kv_len * head_dim;
+                const float* v_head = v + b * num_kv_heads * kv_len * head_dim + kv_h * kv_len * head_dim;
+
+                // Compute attention scores
+                float scores[4096];
+                float max_score = -1e9f;
+
+                for (int i = 0; i < kv_len; i++) {
+                    const float* k_vec = k_head + i * head_dim;
+                    float32x4_t sum_vec = vdupq_n_f32(0.0f);
+                    int d = 0;
+                    for (; d + 3 < head_dim; d += 4) {
+                        float32x4_t q_v = vld1q_f32(q_head + d);
+                        float32x4_t k_v = vld1q_f32(k_vec + d);
+                        sum_vec = vmlaq_f32(sum_vec, q_v, k_v);
+                    }
+                    float dot = vaddvq_f32(sum_vec);
+                    for (; d < head_dim; d++) {
+                        dot += q_head[d] * k_vec[d];
+                    }
+                    scores[i] = dot * scale;
+                    if (scores[i] > max_score) max_score = scores[i];
+                }
+
+                // Softmax
+                float sum_exp = 0.0f;
+                for (int i = 0; i < kv_len; i++) {
+                    scores[i] = expf(scores[i] - max_score);
+                    sum_exp += scores[i];
+                }
+                float inv_sum = 1.0f / sum_exp;
+                for (int i = 0; i < kv_len; i++) {
+                    scores[i] *= inv_sum;
+                }
+
+                // Output: attention @ V
+                memset(out_head, 0, head_dim * sizeof(float));
+                for (int i = 0; i < kv_len; i++) {
+                    const float* v_vec = v_head + i * head_dim;
+                    float score = scores[i];
+                    float32x4_t score_vec = vdupq_n_f32(score);
+                    int d = 0;
+                    for (; d + 3 < head_dim; d += 4) {
+                        float32x4_t out_v = vld1q_f32(out_head + d);
+                        float32x4_t v_v = vld1q_f32(v_vec + d);
+                        out_v = vmlaq_f32(out_v, score_vec, v_v);
+                        vst1q_f32(out_head + d, out_v);
+                    }
+                    for (; d < head_dim; d++) {
+                        out_head[d] += score * v_vec[d];
+                    }
+                }
+            }
+        }
+    } else {
+        // TODO: Multi-token case (prompt processing)
+        // For now, fall back to PyTorch
+        throw std::runtime_error("fused_attention_neon_tiled: seq_q > 1 not yet implemented");
+    }
+}
+
+/**
+ * Apply RoPE to a batch of vectors (e.g., K tensor for all heads)
+ * Input: x [batch, num_heads, seq_len, head_dim]
+ * cos/sin: [seq_len, head_dim] or [head_dim] for single position
+ * Modifies x in-place
+ */
+void apply_rope_batch_neon(
+    torch::Tensor x_tensor,      // [batch, num_heads, seq_len, head_dim] - modified in-place
+    torch::Tensor cos_tensor,    // [head_dim] for single position
+    torch::Tensor sin_tensor,    // [head_dim] for single position
+    int num_threads
+) {
+    const int batch = x_tensor.size(0);
+    const int num_heads = x_tensor.size(1);
+    const int seq_len = x_tensor.size(2);
+    const int head_dim = x_tensor.size(3);
+    const int half_dim = head_dim / 2;
+
+    float* x = x_tensor.data_ptr<float>();
+    const float* cos_ptr = cos_tensor.data_ptr<float>();
+    const float* sin_ptr = sin_tensor.data_ptr<float>();
+
+    #ifndef DISABLE_OPENMP
+    omp_set_num_threads(num_threads);
+    #endif
+
+    // Process all heads in parallel
+    #pragma omp parallel for collapse(3)
+    for (int b = 0; b < batch; b++) {
+        for (int h = 0; h < num_heads; h++) {
+            for (int s = 0; s < seq_len; s++) {
+                float* x_head = x + b * num_heads * seq_len * head_dim
+                              + h * seq_len * head_dim
+                              + s * head_dim;
+
+                // Apply RoPE using NEON
+                int i = 0;
+                for (; i + 3 < half_dim; i += 4) {
+                    float32x4_t x1 = vld1q_f32(x_head + i);
+                    float32x4_t x2 = vld1q_f32(x_head + half_dim + i);
+                    float32x4_t cos_v = vld1q_f32(cos_ptr + i);
+                    float32x4_t sin_v = vld1q_f32(sin_ptr + i);
+
+                    float32x4_t out1 = vmlsq_f32(vmulq_f32(x1, cos_v), x2, sin_v);
+                    float32x4_t out2 = vmlaq_f32(vmulq_f32(x2, cos_v), x1, sin_v);
+
+                    vst1q_f32(x_head + i, out1);
+                    vst1q_f32(x_head + half_dim + i, out2);
+                }
+
+                // Remainder
+                for (; i < half_dim; i++) {
+                    float x1 = x_head[i];
+                    float x2 = x_head[half_dim + i];
+                    x_head[i] = x1 * cos_ptr[i] - x2 * sin_ptr[i];
+                    x_head[half_dim + i] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
+                }
+            }
+        }
+    }
+}
+
+/**
+ * LM Head matmul optimized for single-token generation (M=1)
+ * Computes: output = input @ weight.T where weight is (vocab_size, hidden_size)
+ * Uses fp32 for ARM NEON (bf16 not widely supported on ARM)
+ */
+void lm_head_neon(
+    torch::Tensor input_tensor,   // [batch, hidden_size] in fp32
+    torch::Tensor weight_tensor,  // [vocab_size, hidden_size] in fp32
+    torch::Tensor output_tensor,  // [batch, vocab_size] in fp32
+    int num_threads
+) {
+    const int batch = input_tensor.dim() == 3 ? input_tensor.size(0) : input_tensor.size(0);
+    const int hidden_size = input_tensor.dim() == 3 ? input_tensor.size(2) : input_tensor.size(1);
+    const int vocab_size = weight_tensor.size(0);
+
+    float* input = input_tensor.data_ptr<float>();
+    float* weight = weight_tensor.data_ptr<float>();
+    float* output = output_tensor.data_ptr<float>();
+
+    omp_set_num_threads(num_threads);
+
+    for (int b = 0; b < batch; b++) {
+        const float* x = input + b * hidden_size;
+        float* y = output + b * vocab_size;
+
+        // Parallelize over vocab_size (output dimension)
+        constexpr int N_BLOCK = 64;
+        const int n_blocks = (vocab_size + N_BLOCK - 1) / N_BLOCK;
+
+        #pragma omp parallel for schedule(dynamic, 4)
+        for (int nb = 0; nb < n_blocks; nb++) {
+            const int n_start = nb * N_BLOCK;
+            const int n_end = std::min(n_start + N_BLOCK, vocab_size);
+
+            for (int n = n_start; n < n_end; n++) {
+                const float* w_row = weight + n * hidden_size;
+
+                // Dot product using NEON
+                float32x4_t sum_vec = vdupq_n_f32(0.0f);
+                int k = 0;
+
+                // Process 16 elements at a time (4 vectors of 4)
+                for (; k + 15 < hidden_size; k += 16) {
+                    float32x4_t x0 = vld1q_f32(x + k);
+                    float32x4_t x1 = vld1q_f32(x + k + 4);
+                    float32x4_t x2 = vld1q_f32(x + k + 8);
+                    float32x4_t x3 = vld1q_f32(x + k + 12);
+
+                    float32x4_t w0 = vld1q_f32(w_row + k);
+                    float32x4_t w1 = vld1q_f32(w_row + k + 4);
+                    float32x4_t w2 = vld1q_f32(w_row + k + 8);
+                    float32x4_t w3 = vld1q_f32(w_row + k + 12);
+
+                    sum_vec = vfmaq_f32(sum_vec, x0, w0);
+                    sum_vec = vfmaq_f32(sum_vec, x1, w1);
+                    sum_vec = vfmaq_f32(sum_vec, x2, w2);
+                    sum_vec = vfmaq_f32(sum_vec, x3, w3);
+                }
+
+                // Process 4 elements at a time
+                for (; k + 3 < hidden_size; k += 4) {
+                    float32x4_t x_v = vld1q_f32(x + k);
+                    float32x4_t w_v = vld1q_f32(w_row + k);
+                    sum_vec = vfmaq_f32(sum_vec, x_v, w_v);
+                }
+
+                // Reduce
+                float sum = vaddvq_f32(sum_vec);
+
+                // Remainder
+                for (; k < hidden_size; k++) {
+                    sum += x[k] * w_row[k];
+                }
+
+                y[n] = sum;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// C++ Transformer Forward Pass (Eliminates Python Overhead)
+// ============================================================================
+
+/**
+ * RMSNorm: x = x * weight / sqrt(mean(x^2) + eps)
+ * In-place operation on x
+ */
+inline void rms_norm_neon(
+    float* x,           // [hidden_size] input/output
+    const float* weight, // [hidden_size]
+    int hidden_size,
+    float eps = 1e-5f
+) {
+    // Compute sum of squares
+    float32x4_t sum_sq = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < hidden_size; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        sum_sq = vfmaq_f32(sum_sq, v, v);
+    }
+    float ss = vaddvq_f32(sum_sq);
+    for (; i < hidden_size; i++) {
+        ss += x[i] * x[i];
+    }
+
+    // Compute scale: 1 / sqrt(mean + eps)
+    float scale = 1.0f / sqrtf(ss / hidden_size + eps);
+    float32x4_t scale_vec = vdupq_n_f32(scale);
+
+    // Apply: x = x * scale * weight
+    i = 0;
+    for (; i + 3 < hidden_size; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        float32x4_t w = vld1q_f32(weight + i);
+        v = vmulq_f32(vmulq_f32(v, scale_vec), w);
+        vst1q_f32(x + i, v);
+    }
+    for (; i < hidden_size; i++) {
+        x[i] = x[i] * scale * weight[i];
+    }
+}
+
+/**
+ * ReLU squared: relu2(x) = max(0, x)^2
+ */
+inline void relu2_inplace_neon(float* x, int size) {
+    float32x4_t zero = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < size; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        v = vmaxq_f32(v, zero);  // ReLU
+        v = vmulq_f32(v, v);      // Square
+        vst1q_f32(x + i, v);
+    }
+    for (; i < size; i++) {
+        float v = x[i];
+        v = v > 0.0f ? v : 0.0f;
+        x[i] = v * v;
+    }
+}
+
+/**
+ * Element-wise multiply: out = a * b
+ */
+inline void elementwise_mul_neon(
+    const float* a,
+    const float* b,
+    float* out,
+    int size
+) {
+    int i = 0;
+    for (; i + 3 < size; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        vst1q_f32(out + i, vmulq_f32(va, vb));
+    }
+    for (; i < size; i++) {
+        out[i] = a[i] * b[i];
+    }
+}
+
+/**
+ * Single ternary matmul for M=1: y = x @ W^T * scale
+ * Optimized for single-token inference
+ */
+inline void ternary_matmul_single_neon(
+    const float* x,           // [K] input
+    const int8_t* w_int8,     // [N, K_padded] weights
+    float* y,                 // [N] output
+    int N, int K, int K_padded,
+    float weight_scale,
+    int num_threads
+) {
+    // First quantize input to int8
+    float max_abs = 0.0f;
+    for (int k = 0; k < K; k++) {
+        float abs_val = fabsf(x[k]);
+        if (abs_val > max_abs) max_abs = abs_val;
+    }
+    float act_scale = max_abs / 127.0f;
+    if (act_scale == 0.0f) act_scale = 1.0f;
+    float inv_scale = 1.0f / act_scale;
+
+    // Quantize with alignment
+    std::vector<int8_t> x_q_storage(K_padded + 16);
+    int8_t* x_q = reinterpret_cast<int8_t*>(
+        (reinterpret_cast<uintptr_t>(x_q_storage.data()) + 15) & ~uintptr_t(15)
+    );
+
+    for (int k = 0; k < K; k++) {
+        float val = x[k] * inv_scale;
+        val = fmaxf(-127.0f, fminf(127.0f, val));
+        x_q[k] = static_cast<int8_t>(roundf(val));
+    }
+    for (int k = K; k < K_padded; k++) {
+        x_q[k] = 0;
+    }
+
+    float combined_scale = act_scale * weight_scale;
+
+    // Parallel matmul over N
+    #pragma omp parallel for num_threads(num_threads) schedule(static)
+    for (int n = 0; n < N; n++) {
+        const int8_t* w_row = w_int8 + n * K_padded;
+
+        int32x4_t acc = vdupq_n_s32(0);
+        int k = 0;
+        for (; k + 15 < K_padded; k += 16) {
+            int8x16_t x_vec = vld1q_s8(x_q + k);
+            int8x16_t w_vec = vld1q_s8(w_row + k);
+            acc = vdotq_s32(acc, x_vec, w_vec);
+        }
+
+        int32_t sum = vaddvq_s32(acc);
+        for (; k < K; k++) {
+            sum += static_cast<int32_t>(x_q[k]) * static_cast<int32_t>(w_row[k]);
+        }
+
+        y[n] = static_cast<float>(sum) * combined_scale;
+    }
+}
+
+/**
+ * Full transformer forward pass for single token generation
+ * Runs all layers in C++ to eliminate Python overhead
+ *
+ * This function implements one full forward pass through all transformer layers
+ * for a single token, updating the KV cache in place.
+ */
+void transformer_forward_single_neon(
+    torch::Tensor hidden_tensor,      // [hidden_size] current hidden state (modified in-place)
+    // Attention weights (per layer)
+    std::vector<torch::Tensor> q_w_int8,
+    std::vector<torch::Tensor> q_w_sum,
+    std::vector<float> q_scale,
+    std::vector<torch::Tensor> k_w_int8,
+    std::vector<torch::Tensor> k_w_sum,
+    std::vector<float> k_scale,
+    std::vector<torch::Tensor> v_w_int8,
+    std::vector<torch::Tensor> v_w_sum,
+    std::vector<float> v_scale,
+    std::vector<torch::Tensor> o_w_int8,
+    std::vector<torch::Tensor> o_w_sum,
+    std::vector<float> o_scale,
+    // MLP weights (per layer)
+    std::vector<torch::Tensor> gate_w_int8,
+    std::vector<torch::Tensor> gate_w_sum,
+    std::vector<float> gate_scale,
+    std::vector<torch::Tensor> up_w_int8,
+    std::vector<torch::Tensor> up_w_sum,
+    std::vector<float> up_scale,
+    std::vector<torch::Tensor> down_w_int8,
+    std::vector<torch::Tensor> down_w_sum,
+    std::vector<float> down_scale,
+    // Norm weights (per layer)
+    std::vector<torch::Tensor> input_norm_weights,
+    std::vector<torch::Tensor> post_attn_norm_weights,
+    std::vector<torch::Tensor> attn_sub_norm_weights,
+    std::vector<torch::Tensor> ffn_sub_norm_weights,
+    torch::Tensor final_norm_weight,
+    // KV cache [num_layers, num_kv_heads, max_seq_len, head_dim]
+    torch::Tensor k_cache_tensor,
+    torch::Tensor v_cache_tensor,
+    int cache_seq_len,  // Current position in cache
+    // RoPE
+    torch::Tensor cos_tensor,  // [head_dim] for current position
+    torch::Tensor sin_tensor,
+    // Config
+    int num_layers,
+    int hidden_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int intermediate_size,
+    float attn_scale,
+    int num_threads
+) {
+    float* hidden = hidden_tensor.data_ptr<float>();
+    const int num_kv_groups = num_heads / num_kv_heads;
+    const int kv_dim = num_kv_heads * head_dim;
+    const int K_padded = ((hidden_size + 15) / 16) * 16;
+    const int K_padded_inter = ((intermediate_size + 15) / 16) * 16;
+
+    // Pre-allocated buffers for intermediate results
+    std::vector<float> residual(hidden_size);
+    std::vector<float> normed(hidden_size);
+    std::vector<float> q_out(hidden_size);
+    std::vector<float> k_out(kv_dim);
+    std::vector<float> v_out(kv_dim);
+    std::vector<float> attn_out(hidden_size);
+    std::vector<float> o_out(hidden_size);
+    std::vector<float> gate_out(intermediate_size);
+    std::vector<float> up_out(intermediate_size);
+    std::vector<float> down_out(hidden_size);
+    std::vector<float> mlp_hidden(intermediate_size);
+
+    const float* cos_ptr = cos_tensor.data_ptr<float>();
+    const float* sin_ptr = sin_tensor.data_ptr<float>();
+
+    #ifndef DISABLE_OPENMP
+    omp_set_num_threads(num_threads);
+    #endif
+
+    for (int layer = 0; layer < num_layers; layer++) {
+        // === Save residual ===
+        memcpy(residual.data(), hidden, hidden_size * sizeof(float));
+
+        // === Input Norm ===
+        memcpy(normed.data(), hidden, hidden_size * sizeof(float));
+        rms_norm_neon(normed.data(), input_norm_weights[layer].data_ptr<float>(), hidden_size);
+
+        // === Attention ===
+        // Q projection
+        ternary_matmul_single_neon(
+            normed.data(),
+            q_w_int8[layer].data_ptr<int8_t>(),
+            q_out.data(),
+            hidden_size, hidden_size, K_padded,
+            q_scale[layer], num_threads
+        );
+
+        // K projection
+        ternary_matmul_single_neon(
+            normed.data(),
+            k_w_int8[layer].data_ptr<int8_t>(),
+            k_out.data(),
+            kv_dim, hidden_size, K_padded,
+            k_scale[layer], num_threads
+        );
+
+        // V projection
+        ternary_matmul_single_neon(
+            normed.data(),
+            v_w_int8[layer].data_ptr<int8_t>(),
+            v_out.data(),
+            kv_dim, hidden_size, K_padded,
+            v_scale[layer], num_threads
+        );
+
+        // Apply RoPE to Q and K (per head)
+        for (int h = 0; h < num_heads; h++) {
+            apply_rope_single_neon(q_out.data() + h * head_dim, cos_ptr, sin_ptr, head_dim);
+        }
+        for (int h = 0; h < num_kv_heads; h++) {
+            apply_rope_single_neon(k_out.data() + h * head_dim, cos_ptr, sin_ptr, head_dim);
+        }
+
+        // Update KV cache
+        float* k_cache = k_cache_tensor.data_ptr<float>() +
+                         layer * num_kv_heads * k_cache_tensor.size(2) * head_dim +
+                         cache_seq_len * head_dim;
+        float* v_cache = v_cache_tensor.data_ptr<float>() +
+                         layer * num_kv_heads * v_cache_tensor.size(2) * head_dim +
+                         cache_seq_len * head_dim;
+
+        // Copy K and V to cache (interleaved by head)
+        for (int h = 0; h < num_kv_heads; h++) {
+            memcpy(k_cache + h * k_cache_tensor.size(2) * head_dim,
+                   k_out.data() + h * head_dim,
+                   head_dim * sizeof(float));
+            memcpy(v_cache + h * v_cache_tensor.size(2) * head_dim,
+                   v_out.data() + h * head_dim,
+                   head_dim * sizeof(float));
+        }
+
+        // Compute attention for each head
+        const int kv_len = cache_seq_len + 1;
+        memset(attn_out.data(), 0, hidden_size * sizeof(float));
+
+        #pragma omp parallel for num_threads(num_threads)
+        for (int h = 0; h < num_heads; h++) {
+            const int kv_h = h / num_kv_groups;
+            const float* q_head = q_out.data() + h * head_dim;
+            float* out_head = attn_out.data() + h * head_dim;
+
+            // Get K and V for this head from cache
+            const float* k_head_base = k_cache_tensor.data_ptr<float>() +
+                                       layer * num_kv_heads * k_cache_tensor.size(2) * head_dim +
+                                       kv_h * k_cache_tensor.size(2) * head_dim;
+            const float* v_head_base = v_cache_tensor.data_ptr<float>() +
+                                       layer * num_kv_heads * v_cache_tensor.size(2) * head_dim +
+                                       kv_h * v_cache_tensor.size(2) * head_dim;
+
+            // Compute attention scores
+            float scores[4096];
+            float max_score = -1e9f;
+
+            for (int i = 0; i < kv_len; i++) {
+                const float* k_vec = k_head_base + i * head_dim;
+                float32x4_t sum_vec = vdupq_n_f32(0.0f);
+                int d = 0;
+                for (; d + 3 < head_dim; d += 4) {
+                    float32x4_t q_v = vld1q_f32(q_head + d);
+                    float32x4_t k_v = vld1q_f32(k_vec + d);
+                    sum_vec = vfmaq_f32(sum_vec, q_v, k_v);
+                }
+                float dot = vaddvq_f32(sum_vec);
+                for (; d < head_dim; d++) {
+                    dot += q_head[d] * k_vec[d];
+                }
+                scores[i] = dot * attn_scale;
+                if (scores[i] > max_score) max_score = scores[i];
+            }
+
+            // Softmax
+            float sum_exp = 0.0f;
+            for (int i = 0; i < kv_len; i++) {
+                scores[i] = expf(scores[i] - max_score);
+                sum_exp += scores[i];
+            }
+            float inv_sum = 1.0f / sum_exp;
+            for (int i = 0; i < kv_len; i++) {
+                scores[i] *= inv_sum;
+            }
+
+            // Weighted sum of V
+            for (int i = 0; i < kv_len; i++) {
+                const float* v_vec = v_head_base + i * head_dim;
+                float score = scores[i];
+                for (int d = 0; d < head_dim; d++) {
+                    out_head[d] += score * v_vec[d];
+                }
+            }
+        }
+
+        // Attention sub-norm
+        rms_norm_neon(attn_out.data(), attn_sub_norm_weights[layer].data_ptr<float>(), hidden_size);
+
+        // O projection
+        ternary_matmul_single_neon(
+            attn_out.data(),
+            o_w_int8[layer].data_ptr<int8_t>(),
+            o_out.data(),
+            hidden_size, hidden_size, K_padded,
+            o_scale[layer], num_threads
+        );
+
+        // Residual connection
+        for (int i = 0; i < hidden_size; i++) {
+            hidden[i] = residual[i] + o_out[i];
+        }
+
+        // === MLP ===
+        // Save residual
+        memcpy(residual.data(), hidden, hidden_size * sizeof(float));
+
+        // Post-attention norm
+        memcpy(normed.data(), hidden, hidden_size * sizeof(float));
+        rms_norm_neon(normed.data(), post_attn_norm_weights[layer].data_ptr<float>(), hidden_size);
+
+        // Gate projection + relu2
+        ternary_matmul_single_neon(
+            normed.data(),
+            gate_w_int8[layer].data_ptr<int8_t>(),
+            gate_out.data(),
+            intermediate_size, hidden_size, K_padded,
+            gate_scale[layer], num_threads
+        );
+        relu2_inplace_neon(gate_out.data(), intermediate_size);
+
+        // Up projection
+        ternary_matmul_single_neon(
+            normed.data(),
+            up_w_int8[layer].data_ptr<int8_t>(),
+            up_out.data(),
+            intermediate_size, hidden_size, K_padded,
+            up_scale[layer], num_threads
+        );
+
+        // Gate * Up
+        elementwise_mul_neon(gate_out.data(), up_out.data(), mlp_hidden.data(), intermediate_size);
+
+        // FFN sub-norm
+        rms_norm_neon(mlp_hidden.data(), ffn_sub_norm_weights[layer].data_ptr<float>(), intermediate_size);
+
+        // Down projection
+        ternary_matmul_single_neon(
+            mlp_hidden.data(),
+            down_w_int8[layer].data_ptr<int8_t>(),
+            down_out.data(),
+            hidden_size, intermediate_size, K_padded_inter,
+            down_scale[layer], num_threads
+        );
+
+        // Residual connection
+        for (int i = 0; i < hidden_size; i++) {
+            hidden[i] = residual[i] + down_out[i];
+        }
+    }
+
+    // === Final Norm ===
+    rms_norm_neon(hidden, final_norm_weight.data_ptr<float>(), hidden_size);
+}
+
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("lm_head_neon", &lm_head_neon,
+          "LM head matmul using NEON");
     m.def("quantize_activations_int8_neon", &quantize_activations_int8_neon,
           "Quantize activations to int8 (NEON)");
+    m.def("apply_rope_batch_neon", &apply_rope_batch_neon,
+          "Apply RoPE to batch of vectors (in-place)");
     m.def("pack_weights_neon_int8", &pack_weights_neon_int8,
           "Pack ternary weights for SDOT kernel");
     m.def("matmul_free_neon_sdot_simple", &matmul_free_neon_sdot_simple,
@@ -1243,6 +2088,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "SDOT v4 Fused: Float input, fused quantize+matmul");
     m.def("matmul_free_neon_sdot_v4_fused_wp", &matmul_free_neon_sdot_v4_fused_wp,
           "SDOT v4 Fused Weight Parallel: Optimized for M=1 token generation");
+    m.def("fused_attention_neon", &fused_attention_neon,
+          "Fused attention with RoPE for single-token generation");
+    m.def("fused_attention_neon_tiled", &fused_attention_neon_tiled,
+          "Fused attention without RoPE (RoPE pre-applied)");
+    m.def("transformer_forward_single_neon", &transformer_forward_single_neon,
+          "Full transformer forward pass for single token (eliminates Python overhead)");
 
 #ifdef APPLE_SILICON
     m.def("matmul_free_accelerate", &matmul_free_accelerate,
