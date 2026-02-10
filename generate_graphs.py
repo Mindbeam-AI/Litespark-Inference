@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate benchmark comparison graphs: MS BitNet vs LiteSpark-Inf
+Generate benchmark comparison graphs: MS BitNet vs Litespark-Inf
 Uses REAL measured data only.
 """
 
@@ -8,13 +8,26 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 import os
+from pathlib import Path
 
-OUTPUT_DIR = '/Users/mauriziomorri/Desktop/release_local/bitnet-cpu/report/figures'
+OUTPUT_DIR = str(Path(__file__).parent / 'report' / 'figures')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Setup Times New Roman font to match paper
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif'],
+    'font.size': 11,
+    'axes.labelsize': 12,
+    'axes.titlesize': 13,
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
+    'legend.fontsize': 10,
+})
 
 # Colors
 RED = '#E74C3C'    # MS BitNet
-GREEN = '#2ECC71'  # LiteSpark-Inf
+GREEN = '#2ECC71'  # Litespark-Inf
 
 # ============================================================================
 # REAL DATA
@@ -42,7 +55,7 @@ MS_BITNET = {
     }
 }
 
-# LiteSpark-Inf throughput (real measured)
+# Litespark-Inf throughput (real measured)
 LITESPARK = {
     'amd': {
         'name': 'AMD EPYC 9R14',
@@ -112,7 +125,7 @@ def create_throughput_comparison(platform_key, filename, show_msbitnet=True):
     if show_msbitnet and platform_key in MS_BITNET:
         ms = MS_BITNET[platform_key]
         ax1.plot(ms['threads'], ms['pp128'], 'o-', color=RED, linewidth=2, markersize=8, label='MS BitNet')
-    ax1.plot(ls['threads'], ls['pp128'], 's-', color=GREEN, linewidth=2, markersize=8, label='LiteSpark-Inf')
+    ax1.plot(ls['threads'], ls['pp128'], 's-', color=GREEN, linewidth=2, markersize=8, label='Litespark-Inf')
     ax1.set_xlabel('Number of Threads', fontsize=11)
     ax1.set_ylabel('Throughput (tokens/s)', fontsize=11)
     ax1.set_title('Prefill (pp128)', fontsize=12)
@@ -124,7 +137,7 @@ def create_throughput_comparison(platform_key, filename, show_msbitnet=True):
     if show_msbitnet and platform_key in MS_BITNET:
         ms = MS_BITNET[platform_key]
         ax2.plot(ms['threads'][:len(ls['threads'])], ms['tg128'][:len(ls['threads'])], 'o-', color=RED, linewidth=2, markersize=8, label='MS BitNet')
-    ax2.plot(ls['threads'], ls['tg128'], 's-', color=GREEN, linewidth=2, markersize=8, label='LiteSpark-Inf')
+    ax2.plot(ls['threads'], ls['tg128'], 's-', color=GREEN, linewidth=2, markersize=8, label='Litespark-Inf')
     ax2.set_xlabel('Number of Threads', fontsize=11)
     ax2.set_ylabel('Throughput (tokens/s)', fontsize=11)
     ax2.set_title('Token Generation (tg128)', fontsize=12)
@@ -158,7 +171,7 @@ def create_kernel_comparison(platform_key, platform_name, filename):
     width = 0.35
 
     bars1 = ax.bar(x - width/2, ms_times, width, label='MS BitNet', color=RED, alpha=0.8)
-    bars2 = ax.bar(x + width/2, ls_times, width, label='LiteSpark-Inf', color=GREEN, alpha=0.8)
+    bars2 = ax.bar(x + width/2, ls_times, width, label='Litespark-Inf', color=GREEN, alpha=0.8)
 
     # Speedup annotations
     for i, (ms_t, ls_t) in enumerate(zip(ms_times, ls_times)):
@@ -170,7 +183,7 @@ def create_kernel_comparison(platform_key, platform_name, filename):
 
     ax.set_xlabel('Matrix Size', fontsize=11)
     ax.set_ylabel('Time (ms)', fontsize=11)
-    ax.set_title(f'Kernel Performance: MS BitNet vs LiteSpark-Inf ({platform_name})', fontsize=12, fontweight='bold')
+    ax.set_title(f'Kernel Performance: MS BitNet vs Litespark-Inf ({platform_name})', fontsize=12, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels([s.replace(' × ', '\n×\n') for s in sizes], fontsize=8)
     ax.legend(loc='upper left')

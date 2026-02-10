@@ -37,7 +37,7 @@
 }
 \lstset{style=mystyle}
 
-\title{\textbf{LiteSpark-Inf: High-Performance SIMD Kernels for BitNet CPU Inference}}
+\title{\textbf{Litespark-Inf: High-Performance SIMD Kernels for BitNet CPU Inference}}
 \author{Mindbeam AI}
 \date{February 2026}
 
@@ -46,14 +46,14 @@
 \maketitle
 
 \begin{abstract}
-We present LiteSpark-Inf, a high-performance CPU inference library for BitNet ternary neural networks. Our custom SIMD kernels exploit the ternary weight structure $\{-1, 0, +1\}$ to eliminate floating-point multiplication entirely, replacing it with integer addition and subtraction via hardware dot product instructions. We provide optimized implementations for three major CPU architectures: AVX-512 VNNI (Intel Ice Lake+, AMD Zen4+), AVX-VNNI (Intel Core Ultra), and NEON SDOT (Apple Silicon M1--M4). Benchmarks demonstrate \textbf{1.02--1.57$\times$ speedup} over MS BitNet on x86 platforms, with throughput reaching \textbf{11.2 tokens/s} on AVX-512 and \textbf{9.08 tokens/s} on Apple M4.
+We present Litespark-Inf, a high-performance CPU inference library for BitNet ternary neural networks. Our custom SIMD kernels exploit the ternary weight structure $\{-1, 0, +1\}$ to eliminate floating-point multiplication entirely, replacing it with integer addition and subtraction via hardware dot product instructions. We provide optimized implementations for three major CPU architectures: AVX-512 VNNI (Intel Ice Lake+, AMD Zen4+), AVX-VNNI (Intel Core Ultra), and NEON SDOT (Apple Silicon M1--M4). Benchmarks demonstrate \textbf{1.02--1.57$\times$ speedup} over MS BitNet on x86 platforms, with throughput reaching \textbf{11.2 tokens/s} on AVX-512 and \textbf{9.08 tokens/s} on Apple M4.
 \end{abstract}
 
 \section{Introduction}
 
 BitNet b1.58, Microsoft's ternary neural network architecture, constrains all weights to $\{-1, 0, +1\}$, theoretically eliminating the need for multiplication in matrix operations. However, existing implementations do not fully exploit this structure.
 
-LiteSpark-Inf addresses this gap with custom SIMD kernels that:
+Litespark-Inf addresses this gap with custom SIMD kernels that:
 \begin{itemize}
     \item Replace matrix multiplication with conditional addition/subtraction
     \item Leverage hardware integer dot product instructions (VPDPBUSD, SDOT)
@@ -66,13 +66,13 @@ LiteSpark-Inf addresses this gap with custom SIMD kernels that:
 \subsection{Installation}
 
 \begin{lstlisting}[language=bash]
-pip install bitnet-cpu
+pip install litespark-inf
 \end{lstlisting}
 
 \subsection{Python API}
 
 \begin{lstlisting}[language=Python]
-from bitnet_cpu import load_model
+from litespark_inf import load_model
 
 model, tokenizer = load_model("bitnet-2b")
 input_ids = tokenizer.encode("Hello, world!", return_tensors="pt")
@@ -83,9 +83,9 @@ print(tokenizer.decode(output[0]))
 \subsection{Command-Line Interface}
 
 \begin{lstlisting}[language=bash]
-bitnet-cpu generate "The meaning of life is"
-bitnet-cpu chat
-bitnet-cpu benchmark
+litespark-inf generate "The meaning of life is"
+litespark-inf chat
+litespark-inf benchmark
 \end{lstlisting}
 
 \subsection{Configuration Options}
@@ -120,15 +120,15 @@ We implement this using hardware dot product instructions:
 
 \subsection{Kernel Performance Comparison}
 
-Table~\ref{tab:kernel_perf} compares kernel execution times across matrix sizes. LiteSpark-Inf achieves 1.02--1.57$\times$ speedup over MS BitNet on most configurations.
+Table~\ref{tab:kernel_perf} compares kernel execution times across matrix sizes. Litespark-Inf achieves 1.02--1.57$\times$ speedup over MS BitNet on most configurations.
 
 \begin{table}[H]
 \centering
-\caption{Kernel Performance: LiteSpark-Inf vs MS BitNet (Single Thread, AVX-512 VNNI)}
+\caption{Kernel Performance: Litespark-Inf vs MS BitNet (Single Thread, AVX-512 VNNI)}
 \label{tab:kernel_perf}
 \begin{tabular}{lrrr}
 \toprule
-\textbf{Matrix Size} & \textbf{MS BitNet (ms)} & \textbf{LiteSpark-Inf (ms)} & \textbf{Speedup} \\
+\textbf{Matrix Size} & \textbf{MS BitNet (ms)} & \textbf{Litespark-Inf (ms)} & \textbf{Speedup} \\
 \midrule
 $[1, 2048] \times [2048, 2048]$ & 0.139 & 0.136 $\pm$ 0.005 & 1.02$\times$ \\
 $[32, 2048] \times [2048, 2048]$ & 1.096 & 0.748 $\pm$ 0.033 & 1.47$\times$ \\
@@ -273,11 +273,11 @@ AMD Zen4+ & AVX-512 VNNI & 512-bit & 64 \\
 
 \begin{table}[H]
 \centering
-\caption{Feature Comparison: LiteSpark-Inf vs MS BitNet}
+\caption{Feature Comparison: Litespark-Inf vs MS BitNet}
 \label{tab:comparison}
 \begin{tabular}{lll}
 \toprule
-\textbf{Feature} & \textbf{MS BitNet} & \textbf{LiteSpark-Inf} \\
+\textbf{Feature} & \textbf{MS BitNet} & \textbf{Litespark-Inf} \\
 \midrule
 Installation & Manual build & \texttt{pip install} \\
 HuggingFace integration & No & Yes \\
@@ -293,7 +293,7 @@ Python API & No & Yes \\
 
 \section{Conclusion}
 
-LiteSpark-Inf provides high-performance CPU inference for BitNet ternary models through custom SIMD kernels. Our implementation achieves:
+Litespark-Inf provides high-performance CPU inference for BitNet ternary models through custom SIMD kernels. Our implementation achieves:
 
 \begin{itemize}
     \item \textbf{1.02--1.57$\times$ speedup} over MS BitNet on most matrix sizes

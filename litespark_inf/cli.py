@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-BitNet CPU Command Line Interface
+Litespark-Inf Command Line Interface
 
 Usage:
-    bitnet-cpu generate "Your prompt here"
-    bitnet-cpu chat
-    bitnet-cpu benchmark
-    bitnet-cpu info
+    litespark-inf generate "Your prompt here"
+    litespark-inf chat
+    litespark-inf benchmark
+    litespark-inf info
 """
 
 import argparse
@@ -50,7 +50,7 @@ def cmd_chat(args):
 
     model, tokenizer = load_ternary_model(args.model, mode=args.mode)
 
-    print("\nBitNet CPU Chat")
+    print("\nLitespark-Inf Chat")
     print("Type 'quit' or 'exit' to end the conversation")
     print("-" * 50)
 
@@ -102,7 +102,7 @@ def cmd_benchmark(args):
     import torch
     import gc
 
-    print("BitNet CPU Benchmark")
+    print("Litespark-Inf Benchmark")
     print("=" * 60)
 
     # Show system info
@@ -197,7 +197,7 @@ def cmd_info(args):
     from .models import get_arch_info
     from . import __version__
 
-    print(f"BitNet CPU v{__version__}")
+    print(f"Litespark-Inf v{__version__}")
     print("=" * 50)
 
     arch_info = get_arch_info()
@@ -227,8 +227,8 @@ def cmd_info(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='bitnet-cpu',
-        description='BitNet CPU - Efficient inference for BitNet 1.58-bit models'
+        prog='litespark-inf',
+        description='Litespark-Inf - Efficient inference for BitNet 1.58-bit models'
     )
     parser.add_argument('--version', action='version', version='%(prog)s 0.1.0')
 

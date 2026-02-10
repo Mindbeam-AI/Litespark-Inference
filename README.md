@@ -1,4 +1,4 @@
-# BitNet CPU
+# Litespark-Inf
 
 Fast CPU inference for Microsoft BitNet 1.58-bit models.
 
@@ -25,16 +25,16 @@ pip install -e .
 
 ```bash
 # Generate text
-bitnet-cpu generate "The capital of France is"
+litespark-inf generate "The capital of France is"
 
 # Interactive chat
-bitnet-cpu chat
+litespark-inf chat
 
 # Run benchmark
-bitnet-cpu benchmark
+litespark-inf benchmark
 
 # System info
-bitnet-cpu info
+litespark-inf info
 ```
 
 ### Kernel Modes
@@ -43,16 +43,16 @@ Two modes available on Apple Silicon:
 
 ```bash
 # NEON (default) - fast, int8 quantized, ~556 MB
-bitnet-cpu generate "Hello" --mode neon
+litespark-inf generate "Hello" --mode neon
 
 # Accelerate - accurate, float32, ~2.5 GB
-bitnet-cpu generate "Hello" --mode accelerate
+litespark-inf generate "Hello" --mode accelerate
 ```
 
 ### Python API
 
 ```python
-from bitnet_cpu import load_model
+from litespark_inf import load_model
 
 model, tokenizer = load_model("bitnet-2b")
 # or: load_model("bitnet-2b", mode="accelerate")
@@ -65,7 +65,7 @@ print(tokenizer.decode(output[0]))
 ## Performance
 
 On Apple M4:
-- NEON: ~556 MB memory, ~15-20 tokens/sec
+- NEON: ~556 MB memory, ~20 tokens/sec
 - Accelerate: ~2.5 GB memory, ~10-15 tokens/sec
 
 ## License

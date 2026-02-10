@@ -1,4 +1,4 @@
-Matrix Size,MS BitNet (AMD EPYC 7V13),LiteSpark-Inf (AMD EPYC 9R14),LiteSpark-Inf (Intel 8488C),LiteSpark-Inf (Apple M4)
+Matrix Size,MS BitNet (AMD EPYC 7V13),Litespark-Inf (AMD EPYC 9R14),Litespark-Inf (Intel 8488C),Litespark-Inf (Apple M4)
 "[1, 2048] × [2048, 2048]",0.076,0.073,0.136,0.044
 "[32, 2048] × [2048, 2048]",1.202,0.999,0.748,1.450
 "[128, 2048] × [2048, 2048]",5.805,3.884,2.645,5.835

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kernel Benchmark Script for bitnet-cpu
+Kernel Benchmark Script for Litespark-Inf
 
 Reproduces the benchmark format from Microsoft BitNet src/README.md
 Tests raw kernel performance on specific matrix sizes with timing statistics.
@@ -89,7 +89,7 @@ def get_simd_features() -> Dict:
 
 def load_kernel():
     """Load the appropriate kernel."""
-    from bitnet_cpu.models import get_kernel, get_kernel_type
+    from litespark_inf.models import get_kernel, get_kernel_type
     kernel = get_kernel()
     kernel_type = get_kernel_type()
     return kernel, kernel_type
@@ -323,7 +323,7 @@ def run_inference_benchmark(num_threads: int = 4, num_tokens: int = 128) -> Dict
     """
     Run end-to-end inference benchmark (pp128 + tg128 style).
     """
-    from bitnet_cpu.models import load_ternary_model, get_kernel_type
+    from litespark_inf.models import load_ternary_model, get_kernel_type
     import gc
 
     print(f"\n{'='*70}")
@@ -405,7 +405,7 @@ def run_inference_benchmark(num_threads: int = 4, num_tokens: int = 128) -> Dict
 
 
 def main():
-    parser = argparse.ArgumentParser(description='BitNet-CPU Kernel Benchmark')
+    parser = argparse.ArgumentParser(description='Litespark-Inf Kernel Benchmark')
     parser.add_argument('--threads', '-t', type=int, default=1,
                         help='Number of threads (default: 1)')
     parser.add_argument('--runs', '-r', type=int, default=20,

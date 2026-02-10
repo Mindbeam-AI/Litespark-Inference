@@ -33,7 +33,7 @@ def time_function(name):
 
 def profile_inference(num_threads=4, num_tokens=32):
     """Profile token generation with detailed timing."""
-    from bitnet_cpu.models import load_ternary_model, get_kernel, get_kernel_type
+    from litespark_inf.models import load_ternary_model, get_kernel, get_kernel_type
     import gc
 
     print(f"{'='*70}")
