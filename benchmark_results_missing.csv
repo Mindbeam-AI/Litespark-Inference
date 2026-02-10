@@ -1,7 +1,0 @@
-Data Type,MS BitNet Has,Litespark-Inf Has,Status
-Kernel times (ms),Yes,Yes,Complete
-pp128/tg128 throughput,Yes (graphs),Yes (measured),Complete
-Thread scaling 1-8,Yes,Yes,Complete
-Perplexity table,Yes,No,MISSING
-Fine-tuning 3D plots,Yes,No,MISSING
-Embedding quantization,Yes,No,MISSING
