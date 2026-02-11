@@ -12,11 +12,15 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 *Performance comparison on Apple Silicon M4. Litespark-Inference achieves ~14× memory reduction, 9.2× faster TTFT, and 52× higher throughput compared to PyTorch.*
 
+<div align="center">
+
 | Metric | PyTorch | NEON | Accelerate |
 |--------|---------|------|------------|
 | Memory (MB) | 7,673 | 556 | 6,949 |
 | TTFT (ms) | 2,632 | 288 | 373 |
 | Throughput (tok/s) | 0.39 | 20.4 | 5.52 |
+
+</div>
 
 ### Intel Ice Lake / AMD Zen4 (AVX-512 VNNI)
 
@@ -24,11 +28,15 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 *Performance comparison on Intel Ice Lake / AMD Zen4 using AVX-512 VNNI kernels.*
 
+<div align="center">
+
 | Metric | PyTorch | AVX-512 VNNI | Speedup |
 |--------|---------|--------------|---------|
 | Memory (MB) | 7,800 | 556 | 14.0× |
 | TTFT (ms) | 2,450 | 195 | 12.6× |
 | Throughput (tok/s) | 0.42 | 11.2 | 26.7× |
+
+</div>
 
 ### Intel Core Ultra (AVX-VNNI)
 
@@ -36,11 +44,15 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 *Performance comparison on Intel Core Ultra using AVX-VNNI kernels.*
 
+<div align="center">
+
 | Metric | PyTorch | AVX-VNNI | Speedup |
 |--------|---------|----------|---------|
 | Memory (MB) | 7,750 | 556 | 13.9× |
 | TTFT (ms) | 2,580 | 310 | 8.3× |
 | Throughput (tok/s) | 0.40 | 8.5 | 21.3× |
+
+</div>
 
 ### Cross-Platform Comparison
 
@@ -58,6 +70,8 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 
 *Scaling behavior on AMD EPYC 9R14. BitNet.cpp V2 shows strong prefill scaling, while all implementations converge on similar token generation performance at higher thread counts.*
 
+<div align="center">
+
 | Threads | Prefill (Original) | Prefill (V2) | Prefill (Litespark) | Gen (Original) | Gen (V2) | Gen (Litespark) |
 |---------|-------------------|--------------|---------------------|----------------|----------|-----------------|
 | 1 | 35.0 | 43.4 | 38.2 | 10.0 | 15.6 | **15.9** |
@@ -65,11 +79,15 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 | 4 | 140.0 | 156.8 | 140.7 | 30.0 | 49.2 | 48.2 |
 | 8 | 210.0 | **291.8** | 230.7 | 42.0 | 66.2 | **67.5** |
 
+</div>
+
 ### Intel Xeon Platinum 8488C (AWS c7i.2xlarge)
 
 ![Intel Xeon Comparison](docs/figures/performance_comparison_intel_xeon_8488c_user.png)
 
 *Scaling behavior on Intel Xeon Platinum 8488C. Litespark-Inference maintains a consistent lead in prefill throughput across all thread configurations.*
+
+<div align="center">
 
 | Threads | Prefill (Original) | Prefill (V2) | Prefill (Litespark) | Gen (Original) | Gen (V2) | Gen (Litespark) |
 |---------|-------------------|--------------|---------------------|----------------|----------|-----------------|
@@ -78,11 +96,15 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 | 4 | 55.0 | 77.9 | **110.2** | 16.0 | 24.3 | **25.0** |
 | 6 | 79.0 | 101.3 | **120.7** | 20.0 | **29.5** | 28.0 |
 
+</div>
+
 ### Apple M4 (MacBook Pro)
 
 ![Apple M4 Scaling](docs/figures/performance_comparison_apple_m4_user.png)
 
 *Litespark-Inference scaling on Apple M4. Prefill throughput scales nearly linearly up to 4 threads, while token generation benefits from using all 10 CPU cores.*
+
+<div align="center">
 
 | Threads | Prefill pp128 (tok/s) | Generation tg128 (tok/s) |
 |---------|----------------------|--------------------------|
@@ -91,6 +113,8 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 | 4 | 81.9 | 15.4 |
 | 8 | 101.2 | 14.0 |
 | 10 | 108.8 | 19.6 |
+
+</div>
 
 ## Supported Platforms
 
