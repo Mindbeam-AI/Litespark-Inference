@@ -1,8 +1,8 @@
 # Litespark-Inference
 
-**Fast CPU inference for BitNet 1.58-bit ternary neural networks**
+**Fast CPU inference for ternary neural networks**
 
-Litespark-Inference is a pip-installable Python library that enables efficient inference of Microsoft's BitNet models on consumer CPUs. By exploiting the ternary weight structure ({-1, 0, +1}) with custom SIMD kernels, we eliminate floating-point multiplication entirely and achieve dramatic speedups over standard PyTorch inference.
+Litespark-Inference is a pip-installable Python library that enables efficient inference of ternary models on consumer CPUs. By exploiting the ternary weight structure ({-1, 0, +1}) with custom SIMD kernels, we eliminate floating-point multiplication entirely and achieve dramatic speedups over standard PyTorch inference.
 
 ## Key Results
 
@@ -194,7 +194,7 @@ model, tokenizer = load_model("bitnet-2b", mode="accelerate") # accurate
 
 ## How It Works
 
-BitNet models use ternary weights constrained to {-1, 0, +1}. This means matrix multiplication reduces to simple addition and subtraction:
+Ternary models use weights constrained to {-1, 0, +1}. This means matrix multiplication reduces to simple addition and subtraction:
 
 ```
 y = Σ x_j · w_j  →  y = Σ(w=+1) x_j - Σ(w=-1) x_j
