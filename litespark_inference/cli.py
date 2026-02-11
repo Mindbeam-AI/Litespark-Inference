@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Litespark-Inf Command Line Interface
+Litespark-Inference Command Line Interface
 
 Usage:
-    litespark-inf generate "Your prompt here"
-    litespark-inf chat
-    litespark-inf benchmark
-    litespark-inf info
+    litespark-inference generate "Your prompt here"
+    litespark-inference chat
+    litespark-inference benchmark
+    litespark-inference info
 """
 
 import argparse
@@ -50,7 +50,7 @@ def cmd_chat(args):
 
     model, tokenizer = load_ternary_model(args.model, mode=args.mode)
 
-    print("\nLitespark-Inf Chat")
+    print("\nLitespark-Inference Chat")
     print("Type 'quit' or 'exit' to end the conversation")
     print("-" * 50)
 
@@ -102,7 +102,7 @@ def cmd_benchmark(args):
     import torch
     import gc
 
-    print("Litespark-Inf Benchmark")
+    print("Litespark-Inference Benchmark")
     print("=" * 60)
 
     # Show system info
@@ -197,7 +197,7 @@ def cmd_info(args):
     from .models import get_arch_info
     from . import __version__
 
-    print(f"Litespark-Inf v{__version__}")
+    print(f"Litespark-Inference v{__version__}")
     print("=" * 50)
 
     arch_info = get_arch_info()
@@ -227,8 +227,8 @@ def cmd_info(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='litespark-inf',
-        description='Litespark-Inf - Efficient inference for BitNet 1.58-bit models'
+        prog='litespark-inference',
+        description='Litespark-Inference - Efficient inference for BitNet 1.58-bit models'
     )
     parser.add_argument('--version', action='version', version='%(prog)s 0.1.0')
 

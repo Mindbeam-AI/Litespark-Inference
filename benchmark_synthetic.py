@@ -6,7 +6,7 @@ import torch
 import os
 import platform
 import subprocess
-from litespark_inf.models import get_kernel, get_kernel_type, prepare_ternary_weight
+from litespark_inference.models import get_kernel, get_kernel_type, prepare_ternary_weight
 
 # BitNet 2B model dimensions (matching MS BitNet paper)
 MODEL_DIMS = {

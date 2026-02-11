@@ -89,7 +89,7 @@ def get_simd_features() -> Dict:
 
 def load_kernel():
     """Load the appropriate kernel."""
-    from litespark_inf.models import get_kernel, get_kernel_type
+    from litespark_inference.models import get_kernel, get_kernel_type
     kernel = get_kernel()
     kernel_type = get_kernel_type()
     return kernel, kernel_type
@@ -323,7 +323,7 @@ def run_inference_benchmark(num_threads: int = 4, num_tokens: int = 128) -> Dict
     """
     Run end-to-end inference benchmark (pp128 + tg128 style).
     """
-    from litespark_inf.models import load_ternary_model, get_kernel_type
+    from litespark_inference.models import load_ternary_model, get_kernel_type
     import gc
 
     print(f"\n{'='*70}")

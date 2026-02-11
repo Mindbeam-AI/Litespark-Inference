@@ -3,14 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "litespark-inf"
+name = "litespark-inference"
 version = "0.1.0"
 description = "Efficient CPU inference for BitNet 1.58-bit models"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "Litespark-Inf Contributors"}
+    {name = "Litespark-Inference Contributors"}
 ]
 keywords = ["bitnet", "llm", "inference", "cpu", "simd", "ternary", "litespark"]
 classifiers = [
@@ -42,19 +42,19 @@ dev = [
 ]
 
 [project.scripts]
-litespark-inf = "litespark_inf.cli:main"
+litespark-inference = "litespark_inference.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/tonymindbeam/matmulMM"
-Documentation = "https://github.com/tonymindbeam/matmulMM#readme"
-Repository = "https://github.com/tonymindbeam/matmulMM"
+Homepage = "https://github.com/Mindbeam-AI/Litespark-Inference"
+Documentation = "https://github.com/Mindbeam-AI/Litespark-Inference#readme"
+Repository = "https://github.com/Mindbeam-AI/Litespark-Inference"
 
 [tool.setuptools.packages.find]
-include = ["litespark_inf*"]
+include = ["litespark_inference*"]
 
 [tool.setuptools.package-data]
-"litespark_inf.kernels.arm64" = ["*.cpp"]
-"litespark_inf.kernels.x86_64" = ["*.cpp"]
+"litespark_inference.kernels.arm64" = ["*.cpp"]
+"litespark_inference.kernels.x86_64" = ["*.cpp"]
 
 [tool.black]
 line-length = 100

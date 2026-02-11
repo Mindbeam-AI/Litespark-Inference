@@ -4,7 +4,7 @@
 import time
 import torch
 import os
-from litespark_inf.models import get_kernel, get_kernel_type, prepare_ternary_weight
+from litespark_inference.models import get_kernel, get_kernel_type, prepare_ternary_weight
 
 def benchmark_kernels(N, K, num_threads=8, num_warmup=10, num_runs=100):
     """Compare LUT vs VNNI kernels for M=1 case."""

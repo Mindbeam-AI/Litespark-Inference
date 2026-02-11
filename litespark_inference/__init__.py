@@ -1,5 +1,5 @@
 """
-Litespark-Inf - Efficient CPU inference for BitNet 1.58-bit models
+Litespark-Inference - Efficient CPU inference for BitNet 1.58-bit models
 
 Supports:
 - Apple Silicon (M1/M2/M3/M4) with NEON SDOT
@@ -7,7 +7,7 @@ Supports:
 - Intel Core Ultra with AVX-VNNI (256-bit)
 
 Usage:
-    from litespark_inf import load_model
+    from litespark_inference import load_model
 
     model, tokenizer = load_model("bitnet-2b")
     output = model.generate(tokenizer.encode("Hello", return_tensors='pt'), max_new_tokens=50)

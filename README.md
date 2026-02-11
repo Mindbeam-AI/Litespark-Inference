@@ -1,8 +1,8 @@
-# Litespark-Inference
+# Litespark-Inferenceerence
 
 **Fast CPU inference for BitNet 1.58-bit ternary neural networks**
 
-Litespark-Inference is a pip-installable Python library that enables efficient inference of Microsoft's BitNet models on consumer CPUs. By exploiting the ternary weight structure ({-1, 0, +1}) with custom SIMD kernels, we eliminate floating-point multiplication entirely and achieve dramatic speedups over standard PyTorch inference.
+Litespark-Inferenceerence is a pip-installable Python library that enables efficient inference of Microsoft's BitNet models on consumer CPUs. By exploiting the ternary weight structure ({-1, 0, +1}) with custom SIMD kernels, we eliminate floating-point multiplication entirely and achieve dramatic speedups over standard PyTorch inference.
 
 ## Key Results
 
@@ -10,7 +10,7 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 ![Performance on Apple Silicon](docs/figures/apple_silicon_summary.png)
 
-*Performance comparison on Apple Silicon M4. Litespark-Inference achieves ~14× memory reduction, 9.2× faster TTFT, and 52× higher throughput compared to PyTorch.*
+*Performance comparison on Apple Silicon M4. Litespark-Inferenceerence achieves ~14× memory reduction, 9.2× faster TTFT, and 52× higher throughput compared to PyTorch.*
 
 | Metric | PyTorch | NEON | Accelerate |
 |--------|---------|------|------------|
@@ -50,7 +50,7 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 ## Comparison with BitNet.cpp v2
 
-We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their pp128+tg128 methodology (128-token prompt processing + 128-token generation).
+We benchmarked Litespark-Inferenceerence against Microsoft's BitNet.cpp v2 using their pp128+tg128 methodology (128-token prompt processing + 128-token generation).
 
 ### AMD EPYC 9R14 (AWS c7a.2xlarge)
 
@@ -69,7 +69,7 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 
 ![Intel Xeon Comparison](docs/figures/performance_comparison_intel_xeon_8488c_user.png)
 
-*Scaling behavior on Intel Xeon Platinum 8488C. Litespark-Inference maintains a consistent lead in prefill throughput across all thread configurations.*
+*Scaling behavior on Intel Xeon Platinum 8488C. Litespark-Inferenceerence maintains a consistent lead in prefill throughput across all thread configurations.*
 
 | Threads | Prefill (Original) | Prefill (V2) | Prefill (Litespark) | Gen (Original) | Gen (V2) | Gen (Litespark) |
 |---------|-------------------|--------------|---------------------|----------------|----------|-----------------|
@@ -82,7 +82,7 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 
 ![Apple M4 Scaling](docs/figures/performance_comparison_apple_m4_user.png)
 
-*Litespark-Inference scaling on Apple M4. Prefill throughput scales nearly linearly up to 4 threads, while token generation benefits from using all 10 CPU cores.*
+*Litespark-Inferenceerence scaling on Apple M4. Prefill throughput scales nearly linearly up to 4 threads, while token generation benefits from using all 10 CPU cores.*
 
 | Threads | Prefill pp128 (tok/s) | Generation tg128 (tok/s) |
 |---------|----------------------|--------------------------|
@@ -102,14 +102,14 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 ## Installation
 
 ```bash
-pip install litespark-inf
+pip install litespark-inferenceerence
 ```
 
 Or install from source:
 
 ```bash
-git clone https://github.com/Mindbeam-AI/Litespark-Inf.git
-cd Litespark-Inf
+git clone https://github.com/Mindbeam-AI/Litespark-Inferenceerence.git
+cd Litespark-Inferenceerence
 pip install -e .
 ```
 
@@ -124,22 +124,22 @@ pip install -e .
 
 ```bash
 # Generate text
-litespark-inf generate "The meaning of life is"
+litespark-inference generate "The meaning of life is"
 
 # Interactive chat
-litespark-inf chat
+litespark-inference chat
 
 # Run benchmark on your hardware
-litespark-inf benchmark
+litespark-inference benchmark
 
 # Show system info and detected SIMD capabilities
-litespark-inf info
+litespark-inference info
 ```
 
 ### Python API
 
 ```python
-from litespark_inf import load_model
+from litespark_inference import load_model
 
 # Load the BitNet 2B model (auto-downloads from HuggingFace)
 model, tokenizer = load_model("bitnet-2b")
@@ -156,10 +156,10 @@ Two inference modes are available on Apple Silicon:
 
 ```bash
 # NEON mode (default) — fast int8 quantized inference, ~556 MB
-litespark-inf generate "Hello" --mode neon
+litespark-inference generate "Hello" --mode neon
 
 # Accelerate mode — float32 with Apple AMX, bit-exact accuracy, ~2.5 GB
-litespark-inf generate "Hello" --mode accelerate
+litespark-inference generate "Hello" --mode accelerate
 ```
 
 ```python
@@ -176,7 +176,7 @@ BitNet models use ternary weights constrained to {-1, 0, +1}. This means matrix 
 y = Σ x_j · w_j  →  y = Σ(w=+1) x_j - Σ(w=-1) x_j
 ```
 
-Litespark-Inf exploits this structure with custom SIMD kernels that:
+Litespark-Inference exploits this structure with custom SIMD kernels that:
 
 1. **Store weights as int8** — enabling direct use of hardware dot product instructions
 2. **Quantize activations per-row** — converting float32 inputs to int8 with scale factors
@@ -190,7 +190,7 @@ The library automatically detects your CPU's SIMD capabilities and dispatches to
 Run the built-in benchmark to measure performance on your hardware:
 
 ```bash
-litespark-inf benchmark
+litespark-inference benchmark
 ```
 
 Or use the benchmark scripts for detailed profiling:
@@ -202,7 +202,7 @@ python benchmark_synthetic.py   # Synthetic workload benchmarks
 
 ## Citation
 
-If you use Litespark-Inf in your research, please cite:
+If you use Litespark-Inference in your research, please cite:
 
 ```bibtex
 @article{litespark2024,
