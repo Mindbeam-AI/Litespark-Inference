@@ -1,8 +1,8 @@
-# Litespark-Inf
+# Litespark-Inference
 
 **Fast CPU inference for BitNet 1.58-bit ternary neural networks**
 
-Litespark-Inf is a pip-installable Python library that enables efficient inference of Microsoft's BitNet models on consumer CPUs. By exploiting the ternary weight structure ({-1, 0, +1}) with custom SIMD kernels, we eliminate floating-point multiplication entirely and achieve dramatic speedups over standard PyTorch inference.
+Litespark-Inference is a pip-installable Python library that enables efficient inference of Microsoft's BitNet models on consumer CPUs. By exploiting the ternary weight structure ({-1, 0, +1}) with custom SIMD kernels, we eliminate floating-point multiplication entirely and achieve dramatic speedups over standard PyTorch inference.
 
 ## Key Results
 
@@ -10,7 +10,7 @@ Litespark-Inf is a pip-installable Python library that enables efficient inferen
 
 ![Performance on Apple Silicon](docs/figures/apple_silicon_summary.png)
 
-*Performance comparison on Apple Silicon M4. Litespark-Inf achieves ~14× memory reduction, 9.2× faster TTFT, and 52× higher throughput compared to PyTorch.*
+*Performance comparison on Apple Silicon M4. Litespark-Inference achieves ~14× memory reduction, 9.2× faster TTFT, and 52× higher throughput compared to PyTorch.*
 
 | Metric | PyTorch | NEON | Accelerate |
 |--------|---------|------|------------|
@@ -50,7 +50,7 @@ Litespark-Inf is a pip-installable Python library that enables efficient inferen
 
 ## Comparison with BitNet.cpp v2
 
-We benchmarked Litespark-Inf against Microsoft's BitNet.cpp v2 using their pp128+tg128 methodology (128-token prompt processing + 128-token generation).
+We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their pp128+tg128 methodology (128-token prompt processing + 128-token generation).
 
 ### AMD EPYC 9R14 (AWS c7a.2xlarge)
 
@@ -69,7 +69,7 @@ We benchmarked Litespark-Inf against Microsoft's BitNet.cpp v2 using their pp128
 
 ![Intel Xeon Comparison](docs/figures/performance_comparison_intel_xeon_8488c_user.png)
 
-*Scaling behavior on Intel Xeon Platinum 8488C. Litespark-Inf maintains a consistent lead in prefill throughput across all thread configurations.*
+*Scaling behavior on Intel Xeon Platinum 8488C. Litespark-Inference maintains a consistent lead in prefill throughput across all thread configurations.*
 
 | Threads | Prefill (Original) | Prefill (V2) | Prefill (Litespark) | Gen (Original) | Gen (V2) | Gen (Litespark) |
 |---------|-------------------|--------------|---------------------|----------------|----------|-----------------|
@@ -82,7 +82,7 @@ We benchmarked Litespark-Inf against Microsoft's BitNet.cpp v2 using their pp128
 
 ![Apple M4 Scaling](docs/figures/performance_comparison_apple_m4_user.png)
 
-*Litespark-Inf scaling on Apple M4. Prefill throughput scales nearly linearly up to 4 threads, while token generation benefits from using all 10 CPU cores.*
+*Litespark-Inference scaling on Apple M4. Prefill throughput scales nearly linearly up to 4 threads, while token generation benefits from using all 10 CPU cores.*
 
 | Threads | Prefill pp128 (tok/s) | Generation tg128 (tok/s) |
 |---------|----------------------|--------------------------|
