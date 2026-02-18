@@ -237,7 +237,7 @@ def main():
     # generate command
     gen_parser = subparsers.add_parser('generate', help='Generate text from a prompt')
     gen_parser.add_argument('prompt', type=str, help='Input prompt')
-    gen_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name')
+    gen_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
     gen_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     gen_parser.add_argument('--max-tokens', '-n', type=int, default=100, help='Max tokens to generate')
     gen_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
@@ -247,7 +247,7 @@ def main():
 
     # chat command
     chat_parser = subparsers.add_parser('chat', help='Interactive chat mode')
-    chat_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name')
+    chat_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
     chat_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     chat_parser.add_argument('--max-tokens', '-n', type=int, default=200, help='Max tokens per response')
     chat_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
@@ -257,7 +257,7 @@ def main():
 
     # benchmark command
     bench_parser = subparsers.add_parser('benchmark', help='Run performance benchmark')
-    bench_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name')
+    bench_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
     bench_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     bench_parser.add_argument('--tokens', '-n', type=int, default=20, help='Tokens to generate')
     bench_parser.set_defaults(func=cmd_benchmark)
