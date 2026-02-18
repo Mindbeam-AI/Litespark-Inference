@@ -10,8 +10,11 @@ Usage:
 """
 
 import argparse
+import platform
 import sys
 import time
+
+_is_apple_silicon = platform.machine() in ('arm64', 'aarch64') and platform.system() == 'Darwin'
 
 
 def cmd_generate(args):
@@ -19,7 +22,7 @@ def cmd_generate(args):
     from .models import load_ternary_model
     import torch
 
-    model, tokenizer = load_ternary_model(args.model, mode=args.mode)
+    model, tokenizer = load_ternary_model(args.model, mode=getattr(args, 'mode', 'neon'))
 
     print(f"\nPrompt: {args.prompt}")
     print("-" * 50)
@@ -48,7 +51,7 @@ def cmd_chat(args):
     from .models import load_ternary_model
     import torch
 
-    model, tokenizer = load_ternary_model(args.model, mode=args.mode)
+    model, tokenizer = load_ternary_model(args.model, mode=getattr(args, 'mode', 'neon'))
 
     print("\nLitespark-Inference Chat")
     print("Type 'quit' or 'exit' to end the conversation")
@@ -132,7 +135,7 @@ def cmd_benchmark(args):
             return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
     mem_before = get_memory_mb()
-    model, tokenizer = load_ternary_model(args.model, mode=args.mode)
+    model, tokenizer = load_ternary_model(args.model, mode=getattr(args, 'mode', 'neon'))
     gc.collect()
     mem_after = get_memory_mb()
 
@@ -238,7 +241,8 @@ def main():
     gen_parser = subparsers.add_parser('generate', help='Generate text from a prompt')
     gen_parser.add_argument('prompt', type=str, help='Input prompt')
     gen_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
-    gen_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
+    if _is_apple_silicon:
+        gen_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     gen_parser.add_argument('--max-tokens', '-n', type=int, default=100, help='Max tokens to generate')
     gen_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
     gen_parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling threshold')
@@ -248,7 +252,8 @@ def main():
     # chat command
     chat_parser = subparsers.add_parser('chat', help='Interactive chat mode')
     chat_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
-    chat_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
+    if _is_apple_silicon:
+        chat_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     chat_parser.add_argument('--max-tokens', '-n', type=int, default=200, help='Max tokens per response')
     chat_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
     chat_parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling threshold')
@@ -258,7 +263,8 @@ def main():
     # benchmark command
     bench_parser = subparsers.add_parser('benchmark', help='Run performance benchmark')
     bench_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
-    bench_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
+    if _is_apple_silicon:
+        bench_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     bench_parser.add_argument('--tokens', '-n', type=int, default=20, help='Tokens to generate')
     bench_parser.set_defaults(func=cmd_benchmark)
 
