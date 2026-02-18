@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import platform
 import os
-import warnings
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 from torch.utils.cpp_extension import load
@@ -1434,8 +1433,9 @@ def load_ternary_model(model_key: str, num_threads: int = None, mode: str = 'neo
         model: Loaded model with appropriate kernels
         tokenizer: HuggingFace tokenizer
     """
+    import transformers
     from transformers import AutoTokenizer, LlamaTokenizer
-    warnings.filterwarnings("ignore", message="You are using a model of type")
+    transformers.logging.set_verbosity_error()
 
     if model_key not in AVAILABLE_MODELS:
         raise ValueError(f"Unknown model: {model_key}. Available: {list(AVAILABLE_MODELS.keys())}")
