@@ -1356,7 +1356,7 @@ class BitNet(nn.Module):
         model = cls(config, num_threads)
 
         # Download and load safetensors
-        print("Downloading model weights...")
+        print("Loading model weights...")
         model_path = hf_hub_download(model_name, 'model.safetensors')
 
         print("Converting weights to ternary format...")
