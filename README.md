@@ -126,12 +126,6 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 ## Installation
 
 ```bash
-pip install litespark-inference
-```
-
-Or install from source:
-
-```bash
 git clone https://github.com/Mindbeam-AI/Litespark-Inference.git
 cd Litespark-Inference
 pip install -e .
