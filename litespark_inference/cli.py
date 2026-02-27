@@ -27,7 +27,13 @@ def cmd_generate(args):
     print(f"\nPrompt: {args.prompt}")
     print("-" * 50)
 
-    input_ids = tokenizer.encode(args.prompt, return_tensors='pt')
+    system_prompt = "You are a helpful, harmless, and honest AI assistant. You answer questions accurately and concisely. If you are unsure about something, say so. Do not provide harmful, unethical, or misleading information."
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": args.prompt},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    input_ids = tokenizer.encode(prompt, return_tensors='pt')
 
     start = time.perf_counter()
     with torch.no_grad():
@@ -40,7 +46,7 @@ def cmd_generate(args):
         )
     elapsed = time.perf_counter() - start
 
-    output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    output = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
     print(output)
     print("-" * 50)
     print(f"Generated in {elapsed:.2f}s")
@@ -57,8 +63,8 @@ def cmd_chat(args):
     print("Type 'quit' or 'exit' to end the conversation")
     print("-" * 50)
 
-    system_prompt = "You are a helpful AI assistant."
-    conversation = []
+    system_prompt = "You are a helpful, harmless, and honest AI assistant. You answer questions accurately and concisely. If you are unsure about something, say so. Do not provide harmful, unethical, or misleading information."
+    messages = [{"role": "system", "content": system_prompt}]
 
     while True:
         try:
@@ -74,11 +80,10 @@ def cmd_chat(args):
         if not user_input:
             continue
 
-        # Build chat prompt (simple format)
-        conversation.append(f"User: {user_input}")
-        prompt = f"{system_prompt}\n\n" + "\n".join(conversation) + "\nAssistant:"
+        messages.append({"role": "user", "content": user_input})
 
-        # Generate response
+        # Build prompt using the tokenizer's chat template
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         input_ids = tokenizer.encode(prompt, return_tensors='pt')
 
         print("\nAssistant: ", end="", flush=True)
@@ -96,7 +101,7 @@ def cmd_chat(args):
         response = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
         print(response)
 
-        conversation.append(f"Assistant: {response}")
+        messages.append({"role": "assistant", "content": response})
 
 
 def cmd_benchmark(args):

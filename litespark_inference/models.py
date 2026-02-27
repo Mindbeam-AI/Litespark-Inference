@@ -1269,9 +1269,17 @@ class BitNet(nn.Module):
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 0.9,
-        do_sample: bool = False
+        do_sample: bool = None,
+        no_repeat_ngram_size: int = 3,
+        eos_token_id: int = 128009,
     ) -> torch.Tensor:
         """Generate tokens with KV cache for efficient inference."""
+        # Clamp temperature to minimum 0.1 — greedy decoding degenerates with this model
+        if temperature < 0.1:
+            temperature = 0.1
+        if do_sample is None:
+            do_sample = True
+
         generated = input_ids.clone()
         past_key_values = None
 
@@ -1291,6 +1299,18 @@ class BitNet(nn.Module):
 
             # Get logits for last token
             next_logits = logits[:, -1, :]
+
+            # Block repeated n-grams to prevent phrase-level repetition
+            if no_repeat_ngram_size > 0 and generated.shape[1] >= no_repeat_ngram_size:
+                gen_tokens = generated[0].tolist()
+                ngram_len = no_repeat_ngram_size - 1
+                # Get the last (n-1) tokens as the current context
+                context = tuple(gen_tokens[-ngram_len:])
+                # Find all previous n-grams matching this context
+                for i in range(len(gen_tokens) - ngram_len):
+                    if tuple(gen_tokens[i:i + ngram_len]) == context:
+                        # Ban the token that would complete a repeated n-gram
+                        next_logits[0, gen_tokens[i + ngram_len]] = float('-inf')
 
             # Apply temperature
             if temperature != 1.0:
@@ -1321,8 +1341,8 @@ class BitNet(nn.Module):
 
             generated = torch.cat([generated, next_token], dim=1)
 
-            # Stop on EOS (optional - BitNet uses token 128001 as EOS)
-            if next_token.item() == 128001:
+            # Stop on EOS — BitNet uses <|eot_id|> (128009) as end-of-turn
+            if next_token.item() == eos_token_id:
                 break
 
         return generated
