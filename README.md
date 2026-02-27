@@ -131,7 +131,7 @@ pip install litespark-inference
 
 **Requirements:**
 - Python 3.9+
-- PyTorch 2.0+
+- PyTorch 2.4+
 
 **macOS (recommended):**
 ```bash

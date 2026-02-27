@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.0.0",
+    "torch>=2.4.0",
     "transformers>=4.30.0",
     "safetensors>=0.3.0",
     "huggingface_hub>=0.16.0",
