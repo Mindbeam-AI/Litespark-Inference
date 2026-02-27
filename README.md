@@ -126,15 +126,18 @@ We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their
 ## Installation
 
 ```bash
-git clone https://github.com/Mindbeam-AI/Litespark-Inference.git
-cd Litespark-Inference
-pip install -e .
+pip install litespark-inference
 ```
 
 **Requirements:**
 - Python 3.9+
 - PyTorch 2.0+
-- macOS: `brew install libomp` (for OpenMP support)
+
+**macOS (recommended):**
+```bash
+brew install libomp
+```
+OpenMP enables multi-threaded kernel execution. Without it, inference will run single-threaded.
 
 ## Usage
 
