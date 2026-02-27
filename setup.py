@@ -7,6 +7,7 @@ setup(
     install_requires=[
         "torch",
         "numpy",
+        "ninja",
     ],
     python_requires=">=3.8",
 )
