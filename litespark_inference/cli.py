@@ -233,7 +233,7 @@ def main():
         prog='litespark-inference',
         description='Litespark-Inference - Efficient inference for BitNet 1.58-bit models'
     )
-    parser.add_argument('--version', action='version', version='%(prog)s 0.1.0')
+    parser.add_argument('--version', action='version', version='%(prog)s 0.1.1')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
