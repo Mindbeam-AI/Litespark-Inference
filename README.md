@@ -232,4 +232,4 @@ If you use Litespark-Inference in your research, please cite:
 
 ## License
 
-MIT
+Apache License 2.0. See [LICENSE](LICENSE) for details.
