@@ -1349,8 +1349,7 @@ class BitNet(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_name: str, num_threads: int = None):
-        """Load from safetensors (Microsoft BitNet bf16 format)."""
-        from safetensors import safe_open
+        """Load from safetensors (Microsoft BitNet bf16 format) with ternary cache."""
         from huggingface_hub import hf_hub_download
         import json
 
@@ -1375,12 +1374,24 @@ class BitNet(nn.Module):
 
         model = cls(config, num_threads)
 
-        # Download and load safetensors
-        print("Loading model weights...")
-        model_path = hf_hub_download(model_name, 'model.safetensors')
+        # Check for cached ternary weights
+        cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'litespark')
+        model_slug = model_name.replace('/', '_')
+        cache_path = os.path.join(cache_dir, f'{model_slug}_ternary.pt')
 
-        print("Converting weights to ternary format...")
-        model._load_safetensors_weights(model_path)
+        if os.path.exists(cache_path):
+            print("Loading cached ternary weights...")
+            model._load_cached_weights(cache_path)
+        else:
+            print("Loading model weights...")
+            model_path = hf_hub_download(model_name, 'model.safetensors')
+
+            print("Converting weights to ternary format...")
+            model._load_safetensors_weights(model_path)
+
+            print("Caching ternary weights for faster loading next time...")
+            os.makedirs(cache_dir, exist_ok=True)
+            model._save_cached_weights(cache_path)
 
         return model
 
@@ -1420,6 +1431,54 @@ class BitNet(nn.Module):
             # Final norm
             self.norm.weight.data = f.get_tensor('model.norm.weight').float()
             # lm_head is tied to embed_tokens, no separate weight
+
+    def _save_cached_weights(self, cache_path: str):
+        """Save quantized ternary weights to disk for fast reloading."""
+        state = {
+            'embed_tokens': self.embed_tokens.weight.data,
+            'norm': self.norm.weight.data,
+            'layers': [],
+        }
+        for layer in self.layers:
+            layer_state = {
+                'q_proj': (layer.attn.q_proj.w_int8, layer.attn.q_proj.w_sum, layer.attn.q_proj.scale),
+                'k_proj': (layer.attn.k_proj.w_int8, layer.attn.k_proj.w_sum, layer.attn.k_proj.scale),
+                'v_proj': (layer.attn.v_proj.w_int8, layer.attn.v_proj.w_sum, layer.attn.v_proj.scale),
+                'o_proj': (layer.attn.o_proj.w_int8, layer.attn.o_proj.w_sum, layer.attn.o_proj.scale),
+                'attn_sub_norm': layer.attn.attn_sub_norm.weight.data,
+                'gate_proj': (layer.mlp.gate_proj.w_int8, layer.mlp.gate_proj.w_sum, layer.mlp.gate_proj.scale),
+                'up_proj': (layer.mlp.up_proj.w_int8, layer.mlp.up_proj.w_sum, layer.mlp.up_proj.scale),
+                'down_proj': (layer.mlp.down_proj.w_int8, layer.mlp.down_proj.w_sum, layer.mlp.down_proj.scale),
+                'ffn_sub_norm': layer.mlp.ffn_sub_norm.weight.data,
+                'input_norm': layer.input_norm.weight.data,
+                'post_attn_norm': layer.post_attn_norm.weight.data,
+            }
+            state['layers'].append(layer_state)
+        torch.save(state, cache_path)
+
+    def _load_cached_weights(self, cache_path: str):
+        """Load pre-quantized ternary weights from cache."""
+        state = torch.load(cache_path, weights_only=True)
+
+        self.embed_tokens.weight.data = state['embed_tokens']
+        self.norm.weight.data = state['norm']
+
+        for i, layer in enumerate(self.layers):
+            ls = state['layers'][i]
+            # Attention projections
+            layer.attn.q_proj.w_int8, layer.attn.q_proj.w_sum, layer.attn.q_proj.scale = ls['q_proj']
+            layer.attn.k_proj.w_int8, layer.attn.k_proj.w_sum, layer.attn.k_proj.scale = ls['k_proj']
+            layer.attn.v_proj.w_int8, layer.attn.v_proj.w_sum, layer.attn.v_proj.scale = ls['v_proj']
+            layer.attn.o_proj.w_int8, layer.attn.o_proj.w_sum, layer.attn.o_proj.scale = ls['o_proj']
+            layer.attn.attn_sub_norm.weight.data = ls['attn_sub_norm']
+            # MLP projections
+            layer.mlp.gate_proj.w_int8, layer.mlp.gate_proj.w_sum, layer.mlp.gate_proj.scale = ls['gate_proj']
+            layer.mlp.up_proj.w_int8, layer.mlp.up_proj.w_sum, layer.mlp.up_proj.scale = ls['up_proj']
+            layer.mlp.down_proj.w_int8, layer.mlp.down_proj.w_sum, layer.mlp.down_proj.scale = ls['down_proj']
+            layer.mlp.ffn_sub_norm.weight.data = ls['ffn_sub_norm']
+            # Norms
+            layer.input_norm.weight.data = ls['input_norm']
+            layer.post_attn_norm.weight.data = ls['post_attn_norm']
 
 
 # ============================================================================
