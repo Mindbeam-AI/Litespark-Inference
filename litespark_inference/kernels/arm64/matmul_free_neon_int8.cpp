@@ -180,7 +180,9 @@ void matmul_free_neon_sdot_simple(
 
     const int K_padded = ((K + 15) / 16) * 16;
 
+    #ifndef DISABLE_OPENMP
     omp_set_num_threads(num_threads);
+    #endif
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -246,7 +248,9 @@ void matmul_free_neon_sdot_v2(
 
     const int K_padded = ((K + 15) / 16) * 16;
 
+    #ifndef DISABLE_OPENMP
     omp_set_num_threads(num_threads);
+    #endif
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -348,7 +352,9 @@ void matmul_free_neon_sdot_v3(
 
     const int K_padded = ((K + 15) / 16) * 16;
 
+    #ifndef DISABLE_OPENMP
     omp_set_num_threads(num_threads);
+    #endif
 
     // Parallelize over M rows (simple, minimal overhead)
     #pragma omp parallel for schedule(static)
@@ -479,7 +485,9 @@ void matmul_free_neon_sdot_v4(
     const int K_padded = ((K + 15) / 16) * 16;
     constexpr int N_BLOCK_8 = 8;
 
+    #ifndef DISABLE_OPENMP
     omp_set_num_threads(num_threads);
+    #endif
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -1590,7 +1598,9 @@ void lm_head_neon(
     float* weight = weight_tensor.data_ptr<float>();
     float* output = output_tensor.data_ptr<float>();
 
+    #ifndef DISABLE_OPENMP
     omp_set_num_threads(num_threads);
+    #endif
 
     for (int b = 0; b < batch; b++) {
         const float* x = input + b * hidden_size;

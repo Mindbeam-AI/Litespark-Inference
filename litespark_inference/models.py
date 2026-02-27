@@ -204,7 +204,30 @@ def get_kernel():
                             libomp_path = p
                             break
 
-                    if libomp_path:
+                    # Fallback: use libomp bundled with PyTorch
+                    if libomp_path is None:
+                        try:
+                            import torch as _torch
+                            torch_dir = Path(_torch.__path__[0])
+                            torch_omp_h = torch_dir / 'include' / 'omp.h'
+                            torch_libomp = torch_dir / 'lib' / 'libomp.dylib'
+                            if torch_omp_h.exists() and torch_libomp.exists():
+                                libomp_path = '__torch__'  # sentinel
+                        except ImportError:
+                            pass
+
+                    if libomp_path == '__torch__':
+                        extra_cflags = [
+                            '-O3', '-march=native',
+                            '-Xclang', '-fopenmp',
+                            f'-I{torch_dir / "include"}',
+                        ]
+                        extra_ldflags = [
+                            f'-L{torch_dir / "lib"}',
+                            '-lomp',
+                            '-framework', 'Accelerate',
+                        ]
+                    elif libomp_path:
                         extra_cflags = [
                             '-O3', '-march=native',
                             '-Xclang', '-fopenmp',
