@@ -23,6 +23,39 @@ from typing import Dict, Tuple, Optional, List
 from torch.utils.cpp_extension import load
 from dataclasses import dataclass
 import json
+import sys
+
+
+class TextStreamer:
+    """Streams generated tokens to stdout, decoding them incrementally."""
+
+    def __init__(self, tokenizer, skip_special_tokens=True):
+        self.tokenizer = tokenizer
+        self.skip_special_tokens = skip_special_tokens
+        self.token_cache = []
+        self.print_len = 0
+
+    def put(self, token_ids: torch.Tensor):
+        """Decode and print new token(s) incrementally."""
+        self.token_cache.extend(token_ids[0].tolist())
+        text = self.tokenizer.decode(self.token_cache, skip_special_tokens=self.skip_special_tokens)
+        # Only print new characters (handles multi-byte/BPE boundary issues)
+        printable = text[self.print_len:]
+        if printable:
+            sys.stdout.write(printable)
+            sys.stdout.flush()
+            self.print_len = len(text)
+
+    def end(self):
+        """Flush any remaining text."""
+        if self.token_cache:
+            text = self.tokenizer.decode(self.token_cache, skip_special_tokens=self.skip_special_tokens)
+            remaining = text[self.print_len:]
+            if remaining:
+                sys.stdout.write(remaining)
+                sys.stdout.flush()
+        self.token_cache = []
+        self.print_len = 0
 
 
 # ============================================================================
@@ -1295,6 +1328,7 @@ class BitNet(nn.Module):
         do_sample: bool = None,
         no_repeat_ngram_size: int = 3,
         eos_token_id: int = 128009,
+        streamer=None,
     ) -> torch.Tensor:
         """Generate tokens with KV cache for efficient inference."""
         # Clamp temperature to minimum 0.1 — greedy decoding degenerates with this model
@@ -1364,9 +1398,15 @@ class BitNet(nn.Module):
 
             generated = torch.cat([generated, next_token], dim=1)
 
+            if streamer is not None:
+                streamer.put(next_token)
+
             # Stop on EOS — BitNet uses <|eot_id|> (128009) as end-of-turn
             if next_token.item() == eos_token_id:
                 break
+
+        if streamer is not None:
+            streamer.end()
 
         return generated
 

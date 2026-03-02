@@ -19,7 +19,7 @@ _is_apple_silicon = platform.machine() in ('arm64', 'aarch64') and platform.syst
 
 def cmd_generate(args):
     """Generate text from a prompt."""
-    from .models import load_ternary_model
+    from .models import load_ternary_model, TextStreamer
     import torch
 
     model, tokenizer = load_ternary_model(args.model, mode=getattr(args, 'mode', 'neon'))
@@ -35,6 +35,8 @@ def cmd_generate(args):
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     input_ids = tokenizer.encode(prompt, return_tensors='pt')
 
+    streamer = TextStreamer(tokenizer)
+
     start = time.perf_counter()
     with torch.no_grad():
         output_ids = model.generate(
@@ -43,18 +45,18 @@ def cmd_generate(args):
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            streamer=streamer,
         )
     elapsed = time.perf_counter() - start
 
-    output = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-    print(output)
-    print("-" * 50)
-    print(f"Generated in {elapsed:.2f}s")
+    num_tokens = output_ids.shape[1] - input_ids.shape[1]
+    print(f"\n{'-' * 50}")
+    print(f"Generated {num_tokens} tokens in {elapsed:.2f}s ({num_tokens/elapsed:.1f} tok/s)")
 
 
 def cmd_chat(args):
     """Interactive chat mode."""
-    from .models import load_ternary_model
+    from .models import load_ternary_model, TextStreamer
     import torch
 
     model, tokenizer = load_ternary_model(args.model, mode=getattr(args, 'mode', 'neon'))
@@ -88,6 +90,8 @@ def cmd_chat(args):
 
         print("\nAssistant: ", end="", flush=True)
 
+        streamer = TextStreamer(tokenizer)
+
         with torch.no_grad():
             output_ids = model.generate(
                 input_ids,
@@ -95,11 +99,12 @@ def cmd_chat(args):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                streamer=streamer,
             )
 
-        # Extract just the new response
+        # Extract just the new response for conversation history
         response = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-        print(response)
+        print()  # newline after streamed output
 
         messages.append({"role": "assistant", "content": response})
 
