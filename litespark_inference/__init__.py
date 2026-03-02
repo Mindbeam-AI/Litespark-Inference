@@ -14,7 +14,7 @@ Usage:
     print(tokenizer.decode(output[0]))
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 from .models import (
     load_ternary_model as load_model,
