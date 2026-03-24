@@ -223,53 +223,43 @@ def get_kernel():
                 # Apple Silicon or other ARM64 with NEON SDOT
                 kernel_path = Path(__file__).parent / 'kernels/arm64/matmul_free_neon_int8.cpp'
 
-                # macOS with Apple Clang needs special OpenMP flags
+                # macOS with Apple Clang needs special OpenMP flags.
+                # Always prefer PyTorch's bundled libomp to avoid duplicate
+                # runtime crashes (two copies of libomp in one process segfault).
                 if platform.system() == 'Darwin':
-                    # Use homebrew libomp on macOS
-                    # Try common homebrew paths
-                    libomp_paths = [
-                        '/opt/homebrew/opt/libomp',  # Apple Silicon homebrew
-                        '/usr/local/opt/libomp',     # Intel Mac homebrew
-                    ]
-                    libomp_path = None
-                    for p in libomp_paths:
-                        if os.path.exists(p):
-                            libomp_path = p
-                            break
+                    omp_include = None
+                    omp_lib = None
 
-                    # Fallback: use libomp bundled with PyTorch
-                    if libomp_path is None:
-                        try:
-                            import torch as _torch
-                            torch_dir = Path(_torch.__path__[0])
-                            torch_omp_h = torch_dir / 'include' / 'omp.h'
-                            torch_libomp = torch_dir / 'lib' / 'libomp.dylib'
-                            if torch_omp_h.exists() and torch_libomp.exists():
-                                libomp_path = '__torch__'  # sentinel
-                        except ImportError:
-                            pass
+                    # First choice: PyTorch's bundled libomp (avoids duplicate)
+                    try:
+                        import torch as _torch
+                        torch_dir = Path(_torch.__path__[0])
+                        torch_omp_h = torch_dir / 'include' / 'omp.h'
+                        torch_libomp = torch_dir / 'lib' / 'libomp.dylib'
+                        if torch_omp_h.exists() and torch_libomp.exists():
+                            omp_include = str(torch_dir / 'include')
+                            omp_lib = str(torch_dir / 'lib')
+                    except ImportError:
+                        pass
 
-                    if libomp_path == '__torch__':
+                    # Fallback: homebrew libomp
+                    if omp_include is None:
+                        for p in ['/opt/homebrew/opt/libomp', '/usr/local/opt/libomp']:
+                            if os.path.exists(p):
+                                omp_include = f'{p}/include'
+                                omp_lib = f'{p}/lib'
+                                break
+
+                    if omp_include:
                         extra_cflags = [
                             '-O3', '-march=native',
                             '-Xclang', '-fopenmp',
-                            f'-I{torch_dir / "include"}',
+                            f'-I{omp_include}',
                         ]
                         extra_ldflags = [
-                            f'-L{torch_dir / "lib"}',
+                            f'-L{omp_lib}',
                             '-lomp',
                             '-framework', 'Accelerate',
-                        ]
-                    elif libomp_path:
-                        extra_cflags = [
-                            '-O3', '-march=native',
-                            '-Xclang', '-fopenmp',
-                            f'-I{libomp_path}/include',
-                        ]
-                        extra_ldflags = [
-                            f'-L{libomp_path}/lib',
-                            '-lomp',
-                            '-framework', 'Accelerate',  # Apple Accelerate (AMX)
                         ]
                     else:
                         # No OpenMP available, compile without it (single-threaded)
