@@ -27,7 +27,7 @@ def cmd_generate(args):
     print(f"\nPrompt: {args.prompt}")
     print("-" * 50)
 
-    system_prompt = "You are a helpful, harmless, and honest AI assistant. You answer questions accurately and concisely. If you are unsure about something, say so. Do not provide harmful, unethical, or misleading information."
+    system_prompt = "You are Litespark, a helpful AI assistant running locally. Provide accurate, concise, and practical answers. If a request is ambiguous, ask a brief clarifying question. If you do not know something, say so plainly."
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": args.prompt},
@@ -65,7 +65,7 @@ def cmd_chat(args):
     print("Type 'quit' or 'exit' to end the conversation")
     print("-" * 50)
 
-    system_prompt = "You are a helpful, harmless, and honest AI assistant. You answer questions accurately and concisely. If you are unsure about something, say so. Do not provide harmful, unethical, or misleading information."
+    system_prompt = "You are Litespark, a helpful AI assistant running locally. Provide accurate, concise, and practical answers. If a request is ambiguous, ask a brief clarifying question. If you do not know something, say so plainly."
     messages = [{"role": "system", "content": system_prompt}]
 
     while True:
