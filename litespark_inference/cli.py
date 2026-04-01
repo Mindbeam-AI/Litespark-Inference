@@ -17,6 +17,32 @@ import time
 _is_apple_silicon = platform.machine() in ('arm64', 'aarch64') and platform.system() == 'Darwin'
 
 
+def _build_prompt(tokenizer, messages):
+    """Build a prompt, using chat templates when the tokenizer provides one."""
+    chat_template = getattr(tokenizer, 'chat_template', None)
+    if chat_template:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    system_messages = [m['content'] for m in messages if m['role'] == 'system']
+    user_messages = [m['content'] for m in messages if m['role'] == 'user']
+    assistant_messages = [m['content'] for m in messages if m['role'] == 'assistant']
+
+    instruction = system_messages[-1] if system_messages else ""
+    latest_user = user_messages[-1] if user_messages else ""
+
+    if assistant_messages:
+        history_lines = []
+        for user_text, assistant_text in zip(user_messages[:-1], assistant_messages):
+            history_lines.append(f"Question: {user_text}")
+            history_lines.append(f"Answer: {assistant_text}")
+        if latest_user:
+            history_lines.append(f"Question: {latest_user}")
+        history = "\n".join(history_lines)
+        return f"{instruction}\n\n{history}\nAnswer:".strip()
+
+    return f"{instruction}\n\nQuestion: {latest_user}\nAnswer:".strip()
+
+
 def cmd_generate(args):
     """Generate text from a prompt."""
     from .models import load_ternary_model, TextStreamer
@@ -32,7 +58,7 @@ def cmd_generate(args):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": args.prompt},
     ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = _build_prompt(tokenizer, messages)
     input_ids = tokenizer.encode(prompt, return_tensors='pt')
 
     streamer = TextStreamer(tokenizer)
@@ -85,7 +111,7 @@ def cmd_chat(args):
         messages.append({"role": "user", "content": user_input})
 
         # Build prompt using the tokenizer's chat template
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = _build_prompt(tokenizer, messages)
         input_ids = tokenizer.encode(prompt, return_tensors='pt')
 
         print("\nAssistant: ", end="", flush=True)

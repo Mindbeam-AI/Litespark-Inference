@@ -3,9 +3,7 @@
 Ternary Model Loaders
 
 Supports loading pre-trained ternary models:
-1. MatMul-free LM (ridger/MMfreeLM-370M, 1.3B, 2.7B)
-2. BitNet b1.58 (1bitLLM/bitnet_b1_58-3B, microsoft/bitnet-b1.58-2B-4T)
-3. HGRN-Bit (same as MatMul-free LM architecture)
+1. BitNet b1.58 (1bitLLM/bitnet_b1_58-3B, microsoft/bitnet-b1.58-2B-4T)
 
 Supported architectures:
 - x86_64 with AVX-512 VNNI (Intel Ice Lake+, AMD Zen4+)
@@ -172,6 +170,57 @@ def get_arch_info() -> Dict:
 _kernel = None
 _kernel_type = None
 
+
+def _get_litespark_cache_dir() -> Path:
+    """Resolve the cache directory for quantized weights."""
+    cache_override = os.environ.get('LITESPARK_CACHE_DIR')
+    if cache_override:
+        return Path(cache_override).expanduser()
+
+    if platform.system() == 'Darwin':
+        return Path.home() / 'Library' / 'Caches' / 'litespark'
+
+    xdg_cache_home = os.environ.get('XDG_CACHE_HOME')
+    if xdg_cache_home:
+        return Path(xdg_cache_home).expanduser() / 'litespark'
+
+    return Path.home() / '.cache' / 'litespark'
+
+
+def _find_macos_openmp_paths() -> Tuple[Optional[str], Optional[str]]:
+    """Find OpenMP headers and libraries on macOS."""
+    candidate_prefixes = []
+    for env_var in ('LITESPARK_LIBOMP_PREFIX', 'LIBOMP_PREFIX'):
+        prefix = os.environ.get(env_var)
+        if prefix:
+            candidate_prefixes.append(Path(prefix).expanduser())
+
+    # Next choice: PyTorch's bundled libomp (avoids duplicate runtime).
+    try:
+        import torch as _torch
+
+        torch_dir = Path(_torch.__path__[0])
+        candidate_prefixes.append(torch_dir)
+    except ImportError:
+        pass
+
+    homebrew_prefix = os.environ.get('HOMEBREW_PREFIX')
+    if homebrew_prefix:
+        candidate_prefixes.append(Path(homebrew_prefix) / 'opt' / 'libomp')
+
+    candidate_prefixes.extend([
+        Path('/opt/homebrew/opt/libomp'),
+        Path('/usr/local/opt/libomp'),
+    ])
+
+    for prefix in candidate_prefixes:
+        omp_include = prefix / 'include' / 'omp.h'
+        omp_library = prefix / 'lib' / 'libomp.dylib'
+        if omp_include.exists() and omp_library.exists():
+            return str(prefix / 'include'), str(prefix / 'lib')
+
+    return None, None
+
 def get_kernel():
     """Load the appropriate kernel for this architecture (cached)."""
     global _kernel, _kernel_type
@@ -227,28 +276,7 @@ def get_kernel():
                 # Always prefer PyTorch's bundled libomp to avoid duplicate
                 # runtime crashes (two copies of libomp in one process segfault).
                 if platform.system() == 'Darwin':
-                    omp_include = None
-                    omp_lib = None
-
-                    # First choice: PyTorch's bundled libomp (avoids duplicate)
-                    try:
-                        import torch as _torch
-                        torch_dir = Path(_torch.__path__[0])
-                        torch_omp_h = torch_dir / 'include' / 'omp.h'
-                        torch_libomp = torch_dir / 'lib' / 'libomp.dylib'
-                        if torch_omp_h.exists() and torch_libomp.exists():
-                            omp_include = str(torch_dir / 'include')
-                            omp_lib = str(torch_dir / 'lib')
-                    except ImportError:
-                        pass
-
-                    # Fallback: homebrew libomp
-                    if omp_include is None:
-                        for p in ['/opt/homebrew/opt/libomp', '/usr/local/opt/libomp']:
-                            if os.path.exists(p):
-                                omp_include = f'{p}/include'
-                                omp_lib = f'{p}/lib'
-                                break
+                    omp_include, omp_lib = _find_macos_openmp_paths()
 
                     if omp_include:
                         extra_cflags = [
@@ -587,165 +615,6 @@ class TernaryLinear(nn.Module):
         # Reshape back
         output_shape = original_shape[:-1] + (self.out_features,)
         return y.view(output_shape)
-
-
-# ============================================================================
-# MatMul-free LM Loader
-# ============================================================================
-
-@dataclass
-class MMFreeLMConfig:
-    """Configuration for MatMul-free LM."""
-    hidden_size: int = 2048
-    num_layers: int = 24
-    num_heads: int = 1  # HGRN uses single head
-    intermediate_size: int = 5632  # ~2.75x hidden
-    vocab_size: int = 32000
-    max_position_embeddings: int = 2048
-    rms_norm_eps: float = 1e-6
-
-
-class MMFreeLMAttention(nn.Module):
-    """HGRN-style attention for MatMul-free LM."""
-
-    def __init__(self, config: MMFreeLMConfig, num_threads: int):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_threads = num_threads
-
-        # HGRN uses i, f, g, o projections
-        self.i_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.f_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.g_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-        self.o_proj = TernaryLinear(config.hidden_size, config.hidden_size, num_threads=num_threads)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # HGRN recurrence (simplified)
-        i = torch.sigmoid(self.i_proj(x))
-        f = torch.sigmoid(self.f_proj(x))
-        g = self.g_proj(x)
-        o = torch.sigmoid(self.o_proj(x))
-
-        # Simple gated output (actual HGRN has recurrence)
-        return o * torch.tanh(g * i)
-
-
-class MMFreeLMMLP(nn.Module):
-    """MLP for MatMul-free LM."""
-
-    def __init__(self, config: MMFreeLMConfig, num_threads: int):
-        super().__init__()
-        self.gate_proj = TernaryLinear(config.hidden_size, config.intermediate_size, num_threads=num_threads)
-        self.up_proj = TernaryLinear(config.hidden_size, config.intermediate_size, num_threads=num_threads)
-        self.down_proj = TernaryLinear(config.intermediate_size, config.hidden_size, num_threads=num_threads)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = F.silu(self.gate_proj(x))
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
-
-
-class MMFreeLMBlock(nn.Module):
-    """Single block of MatMul-free LM."""
-
-    def __init__(self, config: MMFreeLMConfig, num_threads: int):
-        super().__init__()
-        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = MMFreeLMAttention(config, num_threads)
-        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = MMFreeLMMLP(config, num_threads)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
-        return x
-
-
-class MMFreeLM(nn.Module):
-    """MatMul-free Language Model with VNNI kernels."""
-
-    def __init__(self, config: MMFreeLMConfig, num_threads: int = None):
-        super().__init__()
-        self.config = config
-        self.num_threads = num_threads or os.cpu_count()
-
-        # Embeddings (kept as float)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-
-        # Transformer blocks
-        self.layers = nn.ModuleList([
-            MMFreeLMBlock(config, self.num_threads)
-            for _ in range(config.num_layers)
-        ])
-
-        # Output
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens(input_ids)
-
-        for layer in self.layers:
-            x = layer(x)
-
-        x = self.norm(x)
-        return self.lm_head(x)
-
-    @classmethod
-    def from_pretrained(cls, model_name: str, num_threads: int = None):
-        """Load from HuggingFace."""
-        from transformers import AutoModelForCausalLM, AutoConfig
-
-        print(f"Loading {model_name}...")
-        hf_model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
-        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-
-        # Map HF config to our config
-        config = MMFreeLMConfig(
-            hidden_size=hf_config.hidden_size,
-            num_layers=hf_config.num_hidden_layers,
-            intermediate_size=getattr(hf_config, 'intermediate_size', hf_config.hidden_size * 4),
-            vocab_size=hf_config.vocab_size,
-            rms_norm_eps=getattr(hf_config, 'rms_norm_eps', 1e-6),
-        )
-
-        model = cls(config, num_threads)
-
-        # Copy weights
-        print("Converting weights to ternary format...")
-        model._load_hf_weights(hf_model)
-
-        return model
-
-    def _load_hf_weights(self, hf_model):
-        """Load weights from HuggingFace model."""
-        # Embeddings
-        self.embed_tokens.weight.data = hf_model.model.embed_tokens.weight.data.clone()
-
-        # Layers
-        for i, layer in enumerate(self.layers):
-            hf_layer = hf_model.model.layers[i]
-
-            # Attention
-            if hasattr(hf_layer, 'attn'):
-                layer.attn.i_proj.load_from_weight(hf_layer.attn.i_proj.weight.data)
-                layer.attn.f_proj.load_from_weight(hf_layer.attn.f_proj.weight.data)
-                layer.attn.g_proj.load_from_weight(hf_layer.attn.g_proj.weight.data)
-                layer.attn.o_proj.load_from_weight(hf_layer.attn.o_proj.weight.data)
-
-            # MLP
-            if hasattr(hf_layer, 'mlp'):
-                layer.mlp.gate_proj.load_from_weight(hf_layer.mlp.gate_proj.weight.data)
-                layer.mlp.up_proj.load_from_weight(hf_layer.mlp.up_proj.weight.data)
-                layer.mlp.down_proj.load_from_weight(hf_layer.mlp.down_proj.weight.data)
-
-            # Norms
-            layer.attn_norm.weight.data = hf_layer.attn_norm.weight.data.clone()
-            layer.mlp_norm.weight.data = hf_layer.mlp_norm.weight.data.clone()
-
-        # Final norm and head
-        self.norm.weight.data = hf_model.model.norm.weight.data.clone()
-        self.lm_head.weight.data = hf_model.lm_head.weight.data.clone()
 
 
 # ============================================================================
@@ -1428,13 +1297,13 @@ class BitNet(nn.Module):
         model = cls(config, num_threads)
 
         # Check for cached ternary weights
-        cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'litespark')
+        cache_dir = _get_litespark_cache_dir()
         model_slug = model_name.replace('/', '_')
-        cache_path = os.path.join(cache_dir, f'{model_slug}_ternary.pt')
+        cache_path = cache_dir / f'{model_slug}_ternary.pt'
 
-        if os.path.exists(cache_path):
+        if cache_path.exists():
             print("Loading cached ternary weights...")
-            model._load_cached_weights(cache_path)
+            model._load_cached_weights(str(cache_path))
         else:
             print("Loading model weights...")
             model_path = hf_hub_download(model_name, 'model.safetensors')
@@ -1443,8 +1312,8 @@ class BitNet(nn.Module):
             model._load_safetensors_weights(model_path)
 
             print("Caching ternary weights for faster loading next time...")
-            os.makedirs(cache_dir, exist_ok=True)
-            model._save_cached_weights(cache_path)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            model._save_cached_weights(str(cache_path))
 
         return model
 
@@ -1539,11 +1408,6 @@ class BitNet(nn.Module):
 # ============================================================================
 
 AVAILABLE_MODELS = {
-    # MatMul-free LM
-    'mmfreelm-370m': ('ridger/MMfreeLM-370M', MMFreeLM),
-    'mmfreelm-1.3b': ('ridger/MMfreeLM-1.3B', MMFreeLM),
-    'mmfreelm-2.7b': ('ridger/MMfreeLM-2.7B', MMFreeLM),
-
     # Microsoft BitNet (official release, bf16 weights)
     'bitnet-2b': ('microsoft/bitnet-b1.58-2B-4T-bf16', BitNet),
 }
