@@ -319,7 +319,7 @@ def run_thread_scaling_benchmark(thread_counts: List[int] = None, num_runs: int 
     return results
 
 
-def run_inference_benchmark(num_threads: int = 4, num_tokens: int = 128) -> Dict:
+def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4, num_tokens: int = 128) -> Dict:
     """
     Run end-to-end inference benchmark (pp128 + tg128 style).
     """
@@ -331,8 +331,8 @@ def run_inference_benchmark(num_threads: int = 4, num_tokens: int = 128) -> Dict
     print(f"{'='*70}\n")
 
     # Load model
-    print("Loading model: bitnet-2b")
-    model, tokenizer = load_ternary_model('bitnet-2b', num_threads=num_threads, mode='neon')
+    print(f"Loading model: {model_name}")
+    model, tokenizer = load_ternary_model(model_name, num_threads=num_threads, mode='neon')
     gc.collect()
 
     kernel_type = get_kernel_type()
@@ -384,7 +384,7 @@ def run_inference_benchmark(num_threads: int = 4, num_tokens: int = 128) -> Dict
     print(f"  Throughput: {tg_throughput:.2f} tokens/sec")
 
     results = {
-        'model': 'bitnet-2b',
+        'model': model_name,
         'kernel': kernel_type,
         'threads': num_threads,
         'prompt_processing': {
@@ -418,6 +418,8 @@ def main():
                         help='Run all benchmarks')
     parser.add_argument('--output', '-o', type=str,
                         help='Output JSON file for results')
+    parser.add_argument('--model', '-m', type=str, default='bitnet-2b',
+                        help='Model name for inference benchmark (default: bitnet-2b)')
 
     args = parser.parse_args()
 
@@ -453,7 +455,7 @@ def main():
 
     # Run inference benchmark if requested
     if args.inference or args.all:
-        inference_results = run_inference_benchmark(num_threads=args.threads)
+        inference_results = run_inference_benchmark(model_name=args.model, num_threads=args.threads)
         all_results['benchmarks']['inference'] = inference_results
 
     # Save results if output file specified

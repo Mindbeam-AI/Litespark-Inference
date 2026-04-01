@@ -31,7 +31,7 @@ def time_function(name):
         return wrapper
     return decorator
 
-def profile_inference(num_threads=4, num_tokens=32):
+def profile_inference(model_name='bitnet-2b', num_threads=4, num_tokens=32):
     """Profile token generation with detailed timing."""
     from litespark_inference.models import load_ternary_model, get_kernel, get_kernel_type
     import gc
@@ -61,7 +61,7 @@ def profile_inference(num_threads=4, num_tokens=32):
 
     # Load model
     print("\nLoading model...")
-    model, tokenizer = load_ternary_model('bitnet-2b', num_threads=num_threads, mode='neon')
+    model, tokenizer = load_ternary_model(model_name, num_threads=num_threads, mode='neon')
     kernel_type = get_kernel_type()
     print(f"Kernel: {kernel_type}")
     gc.collect()
@@ -156,6 +156,7 @@ def profile_inference(num_threads=4, num_tokens=32):
 
     results = {
         'platform': cpu_name,
+        'model': model_name,
         'kernel_type': kernel_type,
         'num_threads': num_threads,
         'num_tokens': num_tokens,
@@ -228,8 +229,9 @@ def profile_inference(num_threads=4, num_tokens=32):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument('--model', '-m', type=str, default='bitnet-2b')
     parser.add_argument('--threads', '-t', type=int, default=4)
     parser.add_argument('--tokens', '-n', type=int, default=32)
     args = parser.parse_args()
 
-    profile_inference(num_threads=args.threads, num_tokens=args.tokens)
+    profile_inference(model_name=args.model, num_threads=args.threads, num_tokens=args.tokens)
