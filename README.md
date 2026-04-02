@@ -130,7 +130,7 @@ pip install litespark-inference
 ```
 
 **Requirements:**
-- Python 3.9+
+- Python 3.10+
 - PyTorch 2.4+
 
 **macOS (recommended):**
@@ -141,14 +141,25 @@ OpenMP enables multi-threaded kernel execution. Without it, inference will run s
 
 ## Usage
 
+### Supported Models
+
+- `bitnet-2b`
+- `falcon-edge-1b`
+- `falcon-edge-1b-instruct`
+- `falcon-edge-3b`
+- `falcon-edge-3b-instruct`
+
 ### Command Line
 
 ```bash
-# Generate text
+# Generate text with the default BitNet model
 litespark-inference generate "The meaning of life is"
 
-# Interactive chat
-litespark-inference chat
+# Generate text with Falcon Edge instruct
+litespark-inference generate "What is the capital of France?" --model falcon-edge-1b-instruct
+
+# Interactive chat with Falcon Edge instruct
+litespark-inference chat --model falcon-edge-1b-instruct
 
 # Run benchmark on your hardware
 litespark-inference benchmark
@@ -162,13 +173,16 @@ litespark-inference info
 ```python
 from litespark_inference import load_model
 
-# Load the BitNet 2B model (auto-downloads from HuggingFace)
+# Load the default BitNet 2B model (auto-downloads from Hugging Face)
 model, tokenizer = load_model("bitnet-2b")
 
 # Generate text
 input_ids = tokenizer.encode("Hello, world!", return_tensors="pt")
 output = model.generate(input_ids, max_new_tokens=100)
 print(tokenizer.decode(output[0]))
+
+# Load a Falcon Edge instruct model
+falcon_model, falcon_tokenizer = load_model("falcon-edge-1b-instruct")
 ```
 
 ### Kernel Modes (Apple Silicon)

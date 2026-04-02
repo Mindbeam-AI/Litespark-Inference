@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "litespark-inference"
 version = "0.1.5"
-description = "Efficient CPU inference for BitNet 1.58-bit models"
+description = "Efficient CPU inference for ternary language models"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"

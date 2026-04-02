@@ -1,10 +1,11 @@
 """
-Litespark-Inference - Efficient CPU inference for BitNet 1.58-bit models
+Litespark-Inference - Efficient CPU inference for ternary language models
 
 Supports:
 - Apple Silicon (M1/M2/M3/M4) with NEON SDOT
 - Intel/AMD x86_64 with AVX-512 VNNI
 - Intel Core Ultra with AVX-VNNI (256-bit)
+- BitNet and Falcon Edge model families
 
 Usage:
     from litespark_inference import load_model

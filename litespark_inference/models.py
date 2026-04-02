@@ -668,6 +668,22 @@ class BitNetLinear(nn.Module):
         if bias is not None:
             self.bias_tensor = bias.clone()
 
+    def load_from_ternary_weight(self, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
+        """Load from a raw ternary weight tensor with values in {-1, 0, +1}."""
+        N, K = weight.shape
+        k_pad = get_k_padding()
+        K_padded = ((K + k_pad - 1) // k_pad) * k_pad
+
+        w_int8 = torch.zeros(N, K_padded, dtype=torch.int8)
+        w_int8[:, :K] = weight.to(torch.int8)
+
+        self.w_int8 = w_int8.contiguous()
+        self.w_sum = self.w_int8.sum(dim=1, dtype=torch.int32).contiguous()
+        self.scale = 1.0
+
+        if bias is not None:
+            self.bias_tensor = bias.clone()
+
     def _get_output_buffer(self, M: int) -> torch.Tensor:
         """Get or create pre-allocated output buffer."""
         key = (M, self.out_features)
@@ -1407,9 +1423,17 @@ class BitNet(nn.Module):
 # Model Registry
 # ============================================================================
 
+from .falcon_edge import LlamaTernary
+
+
 AVAILABLE_MODELS = {
     # Microsoft BitNet (official release, bf16 weights)
     'bitnet-2b': ('microsoft/bitnet-b1.58-2B-4T-bf16', BitNet),
+    # Falcon Edge (TII)
+    'falcon-edge-1b': ('tiiuae/Falcon-E-1B-Base', LlamaTernary),
+    'falcon-edge-1b-instruct': ('tiiuae/Falcon-E-1B-Instruct', LlamaTernary),
+    'falcon-edge-3b': ('tiiuae/Falcon-E-3B-Base', LlamaTernary),
+    'falcon-edge-3b-instruct': ('tiiuae/Falcon-E-3B-Instruct', LlamaTernary),
 }
 
 

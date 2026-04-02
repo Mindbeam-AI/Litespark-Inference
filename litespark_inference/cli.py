@@ -16,6 +16,16 @@ import time
 
 _is_apple_silicon = platform.machine() in ('arm64', 'aarch64') and platform.system() == 'Darwin'
 
+_MODEL_CHOICES_HELP = (
+    'bitnet-2b, falcon-edge-1b, falcon-edge-1b-instruct, '
+    'falcon-edge-3b, falcon-edge-3b-instruct'
+)
+
+_CHAT_UNSUPPORTED_MODELS = {
+    'falcon-edge-1b',
+    'falcon-edge-3b',
+}
+
 
 def _build_prompt(tokenizer, messages):
     """Build a prompt, using chat templates when the tokenizer provides one."""
@@ -84,6 +94,13 @@ def cmd_chat(args):
     """Interactive chat mode."""
     from .models import load_ternary_model, TextStreamer
     import torch
+
+    if args.model in _CHAT_UNSUPPORTED_MODELS:
+        raise SystemExit(
+            f"Model '{args.model}' is generate-only. "
+            "Use an instruct model for chat, such as "
+            "'falcon-edge-1b-instruct' or 'falcon-edge-3b-instruct'."
+        )
 
     model, tokenizer = load_ternary_model(args.model, mode=getattr(args, 'mode', 'neon'))
 
@@ -262,12 +279,16 @@ def cmd_info(args):
 
     print("\nAvailable Models:")
     print("  bitnet-2b: BitNet b1.58 2B parameters, 4T tokens trained (~556 MB)")
+    print("  falcon-edge-1b: Falcon Edge 1B base model")
+    print("  falcon-edge-1b-instruct: Falcon Edge 1B instruct model")
+    print("  falcon-edge-3b: Falcon Edge 3B base model")
+    print("  falcon-edge-3b-instruct: Falcon Edge 3B instruct model")
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog='litespark-inference',
-        description='Litespark-Inference - Efficient inference for BitNet 1.58-bit models'
+        description='Litespark-Inference - Efficient CPU inference for ternary language models'
     )
     parser.add_argument('--version', action='version', version='%(prog)s 0.1.5')
 
@@ -276,7 +297,7 @@ def main():
     # generate command
     gen_parser = subparsers.add_parser('generate', help='Generate text from a prompt')
     gen_parser.add_argument('prompt', type=str, help='Input prompt')
-    gen_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
+    gen_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help=f'Model name (available: {_MODEL_CHOICES_HELP})')
     if _is_apple_silicon:
         gen_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     gen_parser.add_argument('--max-tokens', '-n', type=int, default=100, help='Max tokens to generate')
@@ -287,7 +308,7 @@ def main():
 
     # chat command
     chat_parser = subparsers.add_parser('chat', help='Interactive chat mode')
-    chat_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
+    chat_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help=f'Model name (available: {_MODEL_CHOICES_HELP})')
     if _is_apple_silicon:
         chat_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     chat_parser.add_argument('--max-tokens', '-n', type=int, default=200, help='Max tokens per response')
@@ -298,7 +319,7 @@ def main():
 
     # benchmark command
     bench_parser = subparsers.add_parser('benchmark', help='Run performance benchmark')
-    bench_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help='Model name (available: bitnet-2b)')
+    bench_parser.add_argument('--model', '-m', type=str, default='bitnet-2b', help=f'Model name (available: {_MODEL_CHOICES_HELP})')
     if _is_apple_silicon:
         bench_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     bench_parser.add_argument('--tokens', '-n', type=int, default=20, help='Tokens to generate')
