@@ -87,6 +87,33 @@ def get_simd_features() -> Dict:
     return features
 
 
+def get_current_rss_mb() -> float:
+    """Get current process RSS (resident set size) in MB."""
+    system = platform.system()
+    if system == 'Darwin':
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['ps', '-o', 'rss=', '-p', str(os.getpid())],
+                capture_output=True, text=True, timeout=5,
+            )
+            return int(result.stdout.strip()) / 1024
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+    elif system == 'Linux':
+        try:
+            with open('/proc/self/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return int(line.split()[1]) / 1024
+        except FileNotFoundError:
+            pass
+    import resource
+    if system == 'Darwin':
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
 def load_kernel():
     """Load the appropriate kernel."""
     from litespark_inference.models import get_kernel, get_kernel_type
@@ -142,8 +169,18 @@ def benchmark_matmul(kernel, kernel_type: str, M: int, K: int, N: int,
         kernel_fn = kernel.matmul_free_vnni_v4_large_n
     elif kernel_type == 'avx_vnni':
         kernel_fn = kernel.matmul_free_avx_vnni_v4_large_n
-    else:
-        # For NEON, use fused kernel with float input
+    elif kernel_type in ('neon', 'graviton', 'neon_i8mm', 'sve', 'sme2'):
+        # ARM kernels: use fused kernel with float input
+        _prefix = {
+            'neon': 'matmul_free_neon_sdot',
+            'graviton': 'matmul_free_neon_sdot',
+            'neon_i8mm': 'matmul_free_neon_i8mm',
+            'sve': 'matmul_free_sve',
+            'sme2': 'matmul_free_sme2',
+        }[kernel_type]
+        fused_suffix = 'v4_fused_wp' if (M <= 4 and num_threads > 1) else 'v4_fused'
+        fused_fn = getattr(kernel, f'{_prefix}_{fused_suffix}')
+
         x_float = torch.randn(M, K, dtype=torch.float32)
         y_float = torch.zeros(M, N, dtype=torch.float32)
         bias = torch.Tensor()
@@ -151,7 +188,7 @@ def benchmark_matmul(kernel, kernel_type: str, M: int, K: int, N: int,
 
         # Warmup
         for _ in range(num_warmup):
-            kernel.matmul_free_neon_sdot_v4_fused(
+            fused_fn(
                 x_float.contiguous(), w_int8, w_sum, y_float, bias, scale,
                 M, N, K, num_threads
             )
@@ -161,11 +198,10 @@ def benchmark_matmul(kernel, kernel_type: str, M: int, K: int, N: int,
         for _ in range(num_runs):
             y_float.zero_()
             start = time.perf_counter()
-            kernel.matmul_free_neon_sdot_v4_fused(
+            fused_fn(
                 x_float.contiguous(), w_int8, w_sum, y_float, bias, scale,
                 M, N, K, num_threads
             )
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
             times.append((time.perf_counter() - start) * 1000)
 
         mean_ms = statistics.mean(times)
@@ -332,8 +368,14 @@ def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4,
 
     # Load model
     print(f"Loading model: {model_name}")
+    gc.collect()
+    mem_before = get_current_rss_mb()
     model, tokenizer = load_ternary_model(model_name, num_threads=num_threads, mode='neon')
     gc.collect()
+    mem_after = get_current_rss_mb()
+    memory_mb_rss = mem_after - mem_before
+    memory_mb_params = sum(p.nbytes for p in model.parameters()) / (1024 * 1024)
+    memory_mb = memory_mb_rss if memory_mb_rss > memory_mb_params else memory_mb_params
 
     kernel_type = get_kernel_type()
 
@@ -344,6 +386,7 @@ def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4,
 
     print(f"Kernel: {kernel_type}")
     print(f"Threads: {num_threads}")
+    print(f"Memory: {memory_mb:.0f} MB")
     print(f"Prompt tokens: {actual_prompt_tokens}")
     print(f"Generate tokens: {num_tokens}")
 
@@ -387,6 +430,7 @@ def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4,
         'model': model_name,
         'kernel': kernel_type,
         'threads': num_threads,
+        'memory_mb': memory_mb,
         'prompt_processing': {
             'tokens': actual_prompt_tokens,
             'mean_ms': pp_mean,
@@ -401,7 +445,175 @@ def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4,
         }
     }
 
+    del model, tokenizer
+    gc.collect()
+
     return results
+
+
+def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
+                         num_tokens: int = 128, max_gen_tokens: int = 32) -> Dict:
+    """
+    Run PyTorch baseline inference benchmark for comparison.
+
+    Uses standard HuggingFace AutoModelForCausalLM with the model's native
+    dtype.  Generation is capped at max_gen_tokens to keep runtime reasonable.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import transformers
+    import gc
+
+    transformers.logging.set_verbosity_error()
+
+    # Map model keys to original HuggingFace repo names for the PyTorch
+    # baseline.  We can't use AVAILABLE_MODELS because dev may resolve
+    # bitnet-2b to a local converted checkpoint that AutoModelForCausalLM
+    # can't load.
+    _PYTORCH_HF_REPOS = {
+        'bitnet-2b': 'microsoft/bitnet-b1.58-2B-4T-bf16',
+        'falcon-edge-1b': 'tiiuae/Falcon-E-1B-Base',
+        'falcon-edge-1b-instruct': 'tiiuae/Falcon-E-1B-Instruct',
+        'falcon-edge-3b': 'tiiuae/Falcon-E-3B-Base',
+        'falcon-edge-3b-instruct': 'tiiuae/Falcon-E-3B-Instruct',
+    }
+
+    hf_name = _PYTORCH_HF_REPOS.get(model_name)
+    if hf_name is None:
+        print(f"No PyTorch baseline available for model: {model_name}")
+        return None
+
+    print(f"\n{'='*70}")
+    print("PYTORCH BASELINE BENCHMARK")
+    print(f"{'='*70}\n")
+
+    print(f"Model: {model_name} ({hf_name})")
+    print(f"Threads: {num_threads}")
+
+    torch.set_num_threads(num_threads)
+
+    # Load model in its native dtype and measure memory
+    print("\nLoading PyTorch model...")
+    gc.collect()
+    mem_before = get_current_rss_mb()
+
+    try:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_name, trust_remote_code=True
+            )
+        except (ValueError, OSError, EnvironmentError):
+            from transformers import LlamaForCausalLM
+            model = LlamaForCausalLM.from_pretrained(hf_name)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(hf_name, trust_remote_code=True)
+    except Exception as e:
+        print(f"  Failed to load PyTorch model: {e}")
+        print("  Skipping PyTorch baseline.")
+        return None
+
+    gc.collect()
+    mem_after = get_current_rss_mb()
+    memory_mb_rss = mem_after - mem_before
+    memory_mb_params = sum(p.nbytes for p in model.parameters()) / (1024 * 1024)
+    memory_mb = memory_mb_rss if memory_mb_rss > memory_mb_params else memory_mb_params
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"Memory: {memory_mb:.0f} MB")
+
+    # Prepare input (same prompt as litespark benchmark)
+    prompt = "The quick brown fox jumps over the lazy dog. " * 20
+    input_ids = tokenizer.encode(prompt, return_tensors='pt', max_length=128, truncation=True)
+    attention_mask = torch.ones_like(input_ids)
+    actual_prompt_tokens = input_ids.shape[1]
+    gen_tokens = min(num_tokens, max_gen_tokens)
+
+    print(f"Prompt tokens: {actual_prompt_tokens}")
+    print(f"Generate tokens: {gen_tokens}")
+
+    # Prompt processing (TTFT) benchmark — no warmup, measuring cold-start
+    # latency which is what a user actually experiences on first inference.
+    print("\nPrompt Processing (TTFT):")
+    pp_times = []
+    with torch.no_grad():
+        for _ in range(3):
+            start = time.perf_counter()
+            _ = model(input_ids, attention_mask=attention_mask)
+            pp_times.append((time.perf_counter() - start) * 1000)
+
+    pp_mean = statistics.mean(pp_times)
+    pp_std = statistics.stdev(pp_times) if len(pp_times) > 1 else 0.0
+    pp_throughput = actual_prompt_tokens / (pp_mean / 1000)
+    print(f"  Time: {pp_mean:.2f}±{pp_std:.2f} ms")
+    print(f"  Throughput: {pp_throughput:.2f} tokens/sec")
+
+    # Token generation benchmark
+    print(f"\nToken Generation (tg{gen_tokens}):")
+    tg_times = []
+    with torch.no_grad():
+        start = time.perf_counter()
+        _ = model.generate(
+            input_ids, attention_mask=attention_mask,
+            max_new_tokens=gen_tokens, do_sample=False,
+        )
+        tg_times.append(time.perf_counter() - start)
+
+    tg_mean = statistics.mean(tg_times)
+    tg_throughput = gen_tokens / tg_mean
+    print(f"  Time: {tg_mean*1000:.2f} ms")
+    print(f"  Throughput: {tg_throughput:.2f} tokens/sec")
+
+    results = {
+        'model': model_name,
+        'hf_name': hf_name,
+        'threads': num_threads,
+        'memory_mb': memory_mb,
+        'prompt_processing': {
+            'tokens': actual_prompt_tokens,
+            'mean_ms': pp_mean,
+            'std_ms': pp_std,
+            'throughput_tps': pp_throughput,
+        },
+        'token_generation': {
+            'tokens': gen_tokens,
+            'mean_ms': tg_mean * 1000,
+            'throughput_tps': tg_throughput,
+        }
+    }
+
+    del model, tokenizer
+    gc.collect()
+
+    return results
+
+
+def print_comparison_table(litespark_results: Dict, pytorch_results: Dict) -> None:
+    """Print a side-by-side comparison table of Litespark vs PyTorch."""
+    ls = litespark_results
+    pt = pytorch_results
+
+    ls_mem = ls['memory_mb']
+    pt_mem = pt['memory_mb']
+    ls_ttft = ls['prompt_processing']['mean_ms']
+    pt_ttft = pt['prompt_processing']['mean_ms']
+    ls_tps = ls['token_generation']['throughput_tps']
+    pt_tps = pt['token_generation']['throughput_tps']
+
+    mem_speedup = pt_mem / ls_mem if ls_mem > 0 else 0
+    ttft_speedup = pt_ttft / ls_ttft if ls_ttft > 0 else 0
+    tps_speedup = ls_tps / pt_tps if pt_tps > 0 else 0
+
+    print(f"\n{'='*70}")
+    print("COMPARISON: Litespark vs PyTorch")
+    print(f"{'='*70}\n")
+
+    print(f"{'Metric':<22} {'PyTorch':>12} {'Litespark':>12} {'Speedup':>10}")
+    print("-" * 58)
+    print(f"{'Memory (MB)':<22} {pt_mem:>12,.0f} {ls_mem:>12,.0f} {mem_speedup:>9.1f}x")
+    print(f"{'TTFT (ms)':<22} {pt_ttft:>12,.1f} {ls_ttft:>12,.1f} {ttft_speedup:>9.1f}x")
+    print(f"{'Throughput (tok/s)':<22} {pt_tps:>12.2f} {ls_tps:>12.2f} {tps_speedup:>9.1f}x")
+    print("-" * 58)
 
 
 def main():
@@ -420,6 +632,8 @@ def main():
                         help='Output JSON file for results')
     parser.add_argument('--model', '-m', type=str, default='bitnet-2b',
                         help='Model name for inference benchmark (default: bitnet-2b)')
+    parser.add_argument('--pytorch', action='store_true',
+                        help='Include PyTorch baseline comparison (requires extra RAM, slow)')
 
     args = parser.parse_args()
 
@@ -453,10 +667,26 @@ def main():
         scaling_results = run_thread_scaling_benchmark(thread_counts, num_runs=args.runs)
         all_results['benchmarks']['thread_scaling'] = scaling_results
 
-    # Run inference benchmark if requested
+    # Run inference benchmark if requested.
+    # When --pytorch is set, run PyTorch first so it doesn't benefit from
+    # warm caches left behind by the Litespark benchmark.
     if args.inference or args.all:
+        pytorch_results = None
+        if args.pytorch:
+            pytorch_results = run_pytorch_baseline(
+                model_name=args.model, num_threads=args.threads
+            )
+            if pytorch_results is not None:
+                all_results['benchmarks']['pytorch_baseline'] = pytorch_results
+
         inference_results = run_inference_benchmark(model_name=args.model, num_threads=args.threads)
         all_results['benchmarks']['inference'] = inference_results
+
+        if pytorch_results is not None:
+            print_comparison_table(inference_results, pytorch_results)
+
+    elif args.pytorch:
+        print("Warning: --pytorch requires --inference or --all to run.")
 
     # Save results if output file specified
     if args.output:
