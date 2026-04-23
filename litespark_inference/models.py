@@ -901,6 +901,9 @@ class BitNetLinearAccelerate(nn.Module):
         y = torch.zeros(M, self.out_features, dtype=torch.float32)
         bias = self.bias_tensor if self.bias_tensor is not None else torch.Tensor()
 
+        if self.w_float32 is None:
+            raise RuntimeError("BitNetLinearAccelerate needs float32 weights, which are not loaded. ")
+
         kernel.matmul_free_accelerate_f32(
             x,
             self.w_float32,
@@ -1314,10 +1317,13 @@ class BitNet(nn.Module):
 
         # Check for cached ternary weights
         cache_dir = _get_litespark_cache_dir()
+        is_ternary_cache = not any(isinstance(module, BitNetLinearAccelerate) for module in model.modules())
+        if not cache_dir.is_absolute():
+            cache_dir = cache_dir.absolute()
         model_slug = model_name.replace('/', '_')
         cache_path = cache_dir / f'{model_slug}_ternary.pt'
 
-        if cache_path.exists():
+        if cache_path.exists() and is_ternary_cache:
             print("Loading cached ternary weights...")
             model._load_cached_weights(str(cache_path))
         else:
@@ -1327,9 +1333,10 @@ class BitNet(nn.Module):
             print("Converting weights to ternary format...")
             model._load_safetensors_weights(model_path)
 
-            print("Caching ternary weights for faster loading next time...")
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            model._save_cached_weights(str(cache_path))
+            if is_ternary_cache:
+                print("Caching ternary weights for faster loading next time...")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                model._save_cached_weights(str(cache_path))
 
         return model
 
