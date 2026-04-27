@@ -10,7 +10,6 @@ from __future__ import annotations
 import ctypes
 import gc
 import json
-import os
 import platform
 from pathlib import Path
 
@@ -70,21 +69,17 @@ _TERNARY_KEYS = (
 
 
 def _resolve_hf_snapshot(repo: str) -> tuple[Path, Path]:
-    """Locate a cached HF snapshot. Returns (config.json path, model.safetensors path)."""
-    root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
-    repo_dir = root / ("models--" + repo.replace("/", "--"))
-    snapshots = repo_dir / "snapshots"
-    if not snapshots.exists():
-        raise FileNotFoundError(
-            f"{repo} not found under {snapshots}. Download it first via "
-            f"`huggingface-cli download {repo}` or let the torch-based loader "
-            f"prime the cache."
-        )
-    # Pick first snapshot (there's typically one)
-    (snap,) = list(snapshots.iterdir())[:1] or (None,)
-    if snap is None:
-        raise FileNotFoundError(f"{repo}: no snapshots in {snapshots}")
-    return snap / "config.json", snap / "model.safetensors"
+    """Resolve (config.json, model.safetensors) for `repo`, downloading on cache miss.
+
+    `hf_hub_download` is idempotent: it returns the cached blob path when the
+    file is already present and downloads it on first use otherwise. It also
+    honors HF_HOME / HF_HUB_OFFLINE so behaviour stays consistent with the
+    rest of the HF ecosystem.
+    """
+    from huggingface_hub import hf_hub_download
+    config_path = Path(hf_hub_download(repo, "config.json"))
+    model_path = Path(hf_hub_download(repo, "model.safetensors"))
+    return config_path, model_path
 
 
 def _load_proj(sf, prefix: str, suffix: str) -> PackedProjection:

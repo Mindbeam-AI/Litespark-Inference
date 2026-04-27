@@ -10,7 +10,6 @@ used by the torch-backed CLI.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -20,22 +19,19 @@ _DEFAULT_HF_REPO = "microsoft/bitnet-b1.58-2B-4T-bf16"
 
 
 def _resolve_tokenizer_path(repo: str = _DEFAULT_HF_REPO) -> tuple[Path, Path]:
-    """Return (tokenizer.json, tokenizer_config.json) paths from the HF cache."""
-    root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
-    snapshots = root / ("models--" + repo.replace("/", "--")) / "snapshots"
-    if not snapshots.exists():
-        raise FileNotFoundError(
-            f"{repo} not found under {snapshots}. Download it first with "
-            f"`huggingface-cli download {repo}` or let the torch-based "
-            f"loader prime the cache."
-        )
-    (snap,) = list(snapshots.iterdir())[:1] or (None,)
-    if snap is None:
-        raise FileNotFoundError(f"{repo}: no snapshots in {snapshots}")
-    tok_json = snap / "tokenizer.json"
-    tok_cfg = snap / "tokenizer_config.json"
-    if not tok_json.exists():
-        raise FileNotFoundError(f"tokenizer.json missing at {tok_json}")
+    """Resolve (tokenizer.json, tokenizer_config.json), downloading on cache miss.
+
+    tokenizer_config.json is optional — load_tokenizer below already handles
+    its absence gracefully — so we don't fail the whole load if that file is
+    missing from the repo.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
+    tok_json = Path(hf_hub_download(repo, "tokenizer.json"))
+    try:
+        tok_cfg = Path(hf_hub_download(repo, "tokenizer_config.json"))
+    except EntryNotFoundError:
+        tok_cfg = tok_json.parent / "tokenizer_config.json"
     return tok_json, tok_cfg
 
 
