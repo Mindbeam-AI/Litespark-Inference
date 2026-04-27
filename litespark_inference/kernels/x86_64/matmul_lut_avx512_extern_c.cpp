@@ -26,6 +26,21 @@
 #include <omp.h>
 #endif
 
+// MSVC accepts `__restrict` (no trailing underscores) but not the GCC/Clang
+// `__restrict__` form. Map down so the function signatures parse on both.
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define __restrict__ __restrict
+#endif
+
+// Export every entry point for ctypes loading. On ELF (Linux/macOS) gcc/clang
+// expose all extern "C" symbols by default; on Windows MSVC hides them
+// unless dllexport is set. Default visibility is fine for ELF.
+#if defined(_WIN32)
+#  define LSPK_API __declspec(dllexport)
+#else
+#  define LSPK_API
+#endif
+
 
 // Horizontal sum of an AVX-512 int32 register.
 static inline int32_t hsum_i32_x16(__m512i v) {
@@ -37,59 +52,41 @@ static inline float hsum_f32_x16(__m512 v) {
     return _mm512_reduce_add_ps(v);
 }
 
-// Decode 16 packed bytes (64 ternary weights) into a 64-lane int8 register
-// in natural order. Each byte encodes 4 ternary weights as 2 bits each:
-//   w_i = ((b >> (2*i)) & 0x3) - 1   in {-1, 0, +1}
+// Decode 16 packed bytes (64 ternary weights) as UNSIGNED nibbles in [0, 2]
+// (the raw on-disk encoding before the canonical -1 bias). The VNNI matmul
+// uses this and applies the -1 bias on the output side via a single
+// sum(x) subtraction per row -- VPDPBUSD is unsigned*signed, so feeding
+// it the unbiased nibbles keeps the operand types matching.
 //
-// Reads packed[0..15] and writes 64 int8 lanes in [0..63].
-static inline __m512i unpack_64_ternary(__m128i packed16) {
-    // Broadcast each of the 16 input bytes into 4 consecutive output lanes,
-    // then shift+mask to extract the 4 nibble-pairs from each byte. The
-    // simplest correct implementation uses a shuffle to spread bytes:
-    //   out = shuffle([b0,b0,b0,b0, b1,b1,b1,b1, ..., b15,b15,b15,b15])
-    // then per-lane right-shift by [0,2,4,6, 0,2,4,6, ...] and mask 0x3.
+// Reads packed[0..15] and returns 64 u8 lanes in natural [w0..w63] order.
+static inline __m512i unpack_64_unsigned(__m128i packed16) {
     static const __m512i spread = _mm512_set_epi8(
         15,15,15,15, 14,14,14,14, 13,13,13,13, 12,12,12,12,
         11,11,11,11, 10,10,10,10,  9, 9, 9, 9,  8, 8, 8, 8,
          7, 7, 7, 7,  6, 6, 6, 6,  5, 5, 5, 5,  4, 4, 4, 4,
          3, 3, 3, 3,  2, 2, 2, 2,  1, 1, 1, 1,  0, 0, 0, 0
     );
-    static const __m512i shifts = _mm512_set1_epi32(0x06040200);  // bytes [0,2,4,6]
     static const __m512i mask03 = _mm512_set1_epi8(0x03);
-    static const __m512i one    = _mm512_set1_epi8(1);
+    static const __m512i pattern0 = _mm512_set1_epi32(0x000000FF);
+    static const __m512i pattern1 = _mm512_set1_epi32(0x0000FF00);
+    static const __m512i pattern2 = _mm512_set1_epi32(0x00FF0000);
+    static const __m512i pattern3 = _mm512_set1_epi32(0xFF000000);
 
-    const __m512i broadcast = _mm512_broadcast_i32x4(_mm512_castsi512_si128(_mm512_castsi128_si512(packed16)));
-    // Spread bytes: each input byte appears 4 times in a row.
+    const __m512i broadcast = _mm512_broadcast_i32x4(
+        _mm512_castsi512_si128(_mm512_castsi128_si512(packed16)));
     const __m512i spread_bytes = _mm512_shuffle_epi8(broadcast, spread);
-    // Shift each lane right by the appropriate amount. AVX-512 has a
-    // per-element variable shift for 32-bit lanes (vpsrlvd) but we want
-    // per-byte. Use the fact that 4 consecutive bytes map to shifts
-    // {0,2,4,6}: pack into a 32-bit lane and use vpsrlvd with broadcast.
-    //
-    // Easier path: do it in two halves with vpmultishiftqb (AVX-512VBMI),
-    // but we're avoiding VBMI to keep the ISA bar at AVX-512F+BW+VNNI.
-    // So we do four parallel shifts via blend/and/or:
-    const __m512i s0 =                                  spread_bytes;
     const __m512i s1 = _mm512_srli_epi16(spread_bytes, 2);
     const __m512i s2 = _mm512_srli_epi16(spread_bytes, 4);
     const __m512i s3 = _mm512_srli_epi16(spread_bytes, 6);
 
-    // Select among s0..s3 per-byte based on lane index mod 4.
-    // Build a mask: lane i takes shift_i = (i & 3).
-    // Easiest: do 4 separate AND+OR with mask patterns.
-    static const __m512i pattern0 = _mm512_set1_epi32(0x000000FF);  // lanes 0
-    static const __m512i pattern1 = _mm512_set1_epi32(0x0000FF00);  // lanes 1
-    static const __m512i pattern2 = _mm512_set1_epi32(0x00FF0000);  // lanes 2
-    static const __m512i pattern3 = _mm512_set1_epi32(0xFF000000);  // lanes 3
+    const __m512i p0 = _mm512_and_si512(spread_bytes, pattern0);
+    const __m512i p1 = _mm512_and_si512(s1,           pattern1);
+    const __m512i p2 = _mm512_and_si512(s2,           pattern2);
+    const __m512i p3 = _mm512_and_si512(s3,           pattern3);
+    const __m512i merged = _mm512_or_si512(
+        _mm512_or_si512(p0, p1), _mm512_or_si512(p2, p3));
 
-    const __m512i p0 = _mm512_and_si512(s0, pattern0);
-    const __m512i p1 = _mm512_and_si512(s1, pattern1);
-    const __m512i p2 = _mm512_and_si512(s2, pattern2);
-    const __m512i p3 = _mm512_and_si512(s3, pattern3);
-    const __m512i merged = _mm512_or_si512(_mm512_or_si512(p0, p1), _mm512_or_si512(p2, p3));
-
-    // Mask to 2 bits, then subtract 1 to get signed {-1, 0, +1}.
-    return _mm512_sub_epi8(_mm512_and_si512(merged, mask03), one);
+    return _mm512_and_si512(merged, mask03);
 }
 
 
@@ -99,12 +96,17 @@ extern "C" {
 //
 // Same contract as matmul_lut_neon_m1 in arm64/matmul_lut_neon_extern_c.cpp.
 //
+// VNNI fast path: VPDPBUSD takes (uint8, int8) -> int32. Our packed nibbles
+// are uint8 in [0, 2] (the unbiased encoding) and our activations are int8.
+// We compute sum_k n_k * x_k via VPDPBUSD and then subtract sum_k x_k once
+// per row to recover sum_k (n_k - 1) * x_k = sum_k w_k * x_k.
+//
 // x:        int8 [K]
 // packed_w: uint8 [N, K/4]  (K must be a multiple of 4)
 // w_scale:  fp32 scalar (per-tensor)
 // x_scale:  fp32 scalar
 // y:        fp32 [N]  (output, caller-allocated)
-void matmul_lut_avx512_m1(
+LSPK_API void matmul_lut_avx512_m1(
     const int8_t*  __restrict__ x,
     const uint8_t* __restrict__ packed_w,
     float w_scale,
@@ -116,58 +118,56 @@ void matmul_lut_avx512_m1(
     const int Kb = K >> 2;  // K / 4 (packed bytes per row)
     const float out_scale = x_scale * w_scale;
 
+    // Compute sum(x) once via VPDPBUSD with a vector of unsigned ones.
+    // Used to undo the +1 bias on the unsigned-nibble dot product below.
+    const __m512i ones_u8 = _mm512_set1_epi8(1);
+    __m512i sx_v = _mm512_setzero_si512();
+    int k = 0;
+    for (; k + 64 <= K; k += 64) {
+        const __m512i x64 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + k));
+        sx_v = _mm512_dpbusd_epi32(sx_v, ones_u8, x64);
+    }
+    int32_t sum_x = _mm512_reduce_add_epi32(sx_v);
+    for (; k < K; ++k) sum_x += static_cast<int32_t>(x[k]);
+
 #pragma omp parallel for if(N >= 64) schedule(static)
     for (int n = 0; n < N; ++n) {
         const uint8_t* row = packed_w + static_cast<ptrdiff_t>(n) * Kb;
         __m512i acc = _mm512_setzero_si512();
 
         int kb = 0;
-        // Fast path: 16 packed bytes -> 64 ternary weights -> one VNNI dot.
+        // Fast path: 16 packed bytes -> 64 unsigned nibbles -> one VPDPBUSD.
+        // VPDPBUSD: src + dot4(uint8, int8) per int32 lane. 64 i8 lanes ->
+        // 16 int32 lanes, each accumulating 4 products. Inner loop is
+        // load + unpack + load + 1 VNNI = ~6 instructions for 64 MACs.
         for (; kb + 16 <= Kb; kb += 16) {
             const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + kb));
-            const __m512i w64 = unpack_64_ternary(packed);
+            const __m512i n64 = unpack_64_unsigned(packed);
             const __m512i x64 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + (kb << 2)));
-            // VPDPBUSD: a is unsigned i8, b is signed i8. Our weights are
-            // already signed; activations are signed too. Bias the weights
-            // up by +1 (range [0,2]) to use VPDPBUSD safely, then subtract
-            // sum(x) at the end. Cleaner alternative: use VPDPBSSD if
-            // AVX-VNNI-INT8 is available; here we stick to baseline VNNI.
-            //
-            // Simpler correctness-first impl: widen w64 to int16, then
-            // multiply-accumulate with widened x. ~2x slower than VNNI but
-            // we'll tune in phase 2.
-            const __m256i w_lo = _mm512_extracti64x4_epi64(w64, 0);
-            const __m256i w_hi = _mm512_extracti64x4_epi64(w64, 1);
-            const __m256i x_lo = _mm512_extracti64x4_epi64(x64, 0);
-            const __m256i x_hi = _mm512_extracti64x4_epi64(x64, 1);
-            // Promote int8 -> int16 (signed).
-            const __m512i w16_lo = _mm512_cvtepi8_epi16(w_lo);
-            const __m512i w16_hi = _mm512_cvtepi8_epi16(w_hi);
-            const __m512i x16_lo = _mm512_cvtepi8_epi16(x_lo);
-            const __m512i x16_hi = _mm512_cvtepi8_epi16(x_hi);
-            // 16-bit multiply-add into int32 accumulator (VPMADDWD).
-            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(w16_lo, x16_lo));
-            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(w16_hi, x16_hi));
+            acc = _mm512_dpbusd_epi32(acc, n64, x64);
         }
 
-        int32_t sum = hsum_i32_x16(acc);
+        // Both the fast loop and the tail accumulate sum_k n_k * x_k with
+        // n in [0, 2]. We subtract the full sum_x at the end to convert
+        // to sum_k (n_k - 1) * x_k = sum_k w_k * x_k.
+        int32_t sum = _mm512_reduce_add_epi32(acc);
 
-        // Tail: byte at a time.
+        // Tail: byte at a time, unbiased (n in [0, 2], no -1 here).
         for (; kb < Kb; ++kb) {
             const uint8_t b = row[kb];
-            const int k = kb << 2;
-            sum += (static_cast<int32_t>((b >> 0) & 0x3) - 1) * static_cast<int32_t>(x[k + 0]);
-            sum += (static_cast<int32_t>((b >> 2) & 0x3) - 1) * static_cast<int32_t>(x[k + 1]);
-            sum += (static_cast<int32_t>((b >> 4) & 0x3) - 1) * static_cast<int32_t>(x[k + 2]);
-            sum += (static_cast<int32_t>((b >> 6) & 0x3) - 1) * static_cast<int32_t>(x[k + 3]);
+            const int kk = kb << 2;
+            sum += static_cast<int32_t>((b >> 0) & 0x3) * static_cast<int32_t>(x[kk + 0]);
+            sum += static_cast<int32_t>((b >> 2) & 0x3) * static_cast<int32_t>(x[kk + 1]);
+            sum += static_cast<int32_t>((b >> 4) & 0x3) * static_cast<int32_t>(x[kk + 2]);
+            sum += static_cast<int32_t>((b >> 6) & 0x3) * static_cast<int32_t>(x[kk + 3]);
         }
 
-        y[n] = static_cast<float>(sum) * out_scale;
+        y[n] = static_cast<float>(sum - sum_x) * out_scale;
     }
 }
 
 // Per-tensor absmax quantization of an fp32 activation vector to int8.
-float quantize_activation_avx512(
+LSPK_API float quantize_activation_avx512(
     const float* __restrict__ x_fp32,
     int8_t*      __restrict__ x_int8_out,
     int K
@@ -212,7 +212,7 @@ float quantize_activation_avx512(
 
 // LM head matmul: logits[v] = sum_h bf16_to_fp32(emb[v, h]) * x[h]
 // emb is uint16-viewed bf16. bf16 -> fp32 = shift bits into upper half.
-void lm_head_bf16_fp32_avx512(
+LSPK_API void lm_head_bf16_fp32_avx512(
     const uint16_t* __restrict__ emb,
     const float*    __restrict__ x,
     float*          __restrict__ logits,
@@ -243,7 +243,7 @@ void lm_head_bf16_fp32_avx512(
 }
 
 // LM head matmul with per-row int8 quantized embeddings.
-void lm_head_int8_fp32_avx512(
+LSPK_API void lm_head_int8_fp32_avx512(
     const int8_t* __restrict__ emb,
     const float*  __restrict__ emb_scale,
     const float*  __restrict__ x,
@@ -270,7 +270,14 @@ void lm_head_int8_fp32_avx512(
 }
 
 // LM head matmul with per-row int4 quantized embeddings (2 nibbles/byte).
-void lm_head_int4_fp32_avx512(
+//
+// Inner loop: 16 packed bytes -> 32 signed nibbles -> 32 fp32 -> 2 FMA-16s.
+// Sign-extend each nibble via the XOR-bias trick:
+//   nib_unsigned in [0, 15];
+//   nib_signed   = (nib XOR 8) - 8     (operates per-byte, 8-bit lanes)
+// Maps {0..7, 8..15} -> {0..7, -8..-1}, which is the standard 4-bit two's
+// complement decode and matches our packed encoding (q & 0x0F, q in [-7,+7]).
+LSPK_API void lm_head_int4_fp32_avx512(
     const uint8_t* __restrict__ emb,
     const float*   __restrict__ emb_scale,
     const float*   __restrict__ x,
@@ -281,33 +288,37 @@ void lm_head_int4_fp32_avx512(
     for (int v = 0; v < V; ++v) {
         const uint8_t* row = emb + static_cast<ptrdiff_t>(v) * (H / 2);
         __m512 acc = _mm512_setzero_ps();
+
+        const __m128i mask_lo = _mm_set1_epi8(0x0F);
+        const __m128i bias    = _mm_set1_epi8(0x08);
+
         int h = 0;
-        // Inner loop: 8 packed bytes -> 16 int4 -> 16 fp32 -> 16 FMAs.
-        for (; h + 16 <= H; h += 16) {
-            // Load 8 packed bytes into the low half of a 128-bit reg.
-            const __m128i p8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + (h >> 1)));
-            // Sign-extend low nibble: (b << 4) >> 4 (arithmetic).
-            const __m128i lo = _mm_srai_epi16(_mm_slli_epi16(p8, 12), 12);  // 16-bit lanes
-            // Sign-extend high nibble: b >> 4 (arithmetic).
-            const __m128i hi = _mm_srai_epi16(p8, 4);
-            // Above is wrong-resolution: int4 is byte-level. Re-do at byte:
-            // We want each byte b -> two signed int8s: lo = (b<<4)>>4 (signed),
-            // hi = b>>4 (signed). SSE doesn't have a byte-arith-shift, so
-            // emulate via word arithmetic and mask.
-            // Cleaner: process via 16-bit math, see scalar tail for the
-            // canonical formula. Phase 2: vectorize this block properly.
-            (void)lo; (void)hi;
-            float partial = 0.0f;
-            for (int j = 0; j < 16; j += 2) {
-                const uint8_t b = row[(h + j) >> 1];
-                const int8_t  lo_s = static_cast<int8_t>(static_cast<int8_t>(b << 4) >> 4);
-                const int8_t  hi_s = static_cast<int8_t>(b) >> 4;
-                partial += static_cast<float>(lo_s) * x[h + j];
-                partial += static_cast<float>(hi_s) * x[h + j + 1];
-            }
-            // Fold partial into acc as a single-element add (cheap).
-            acc = _mm512_add_ps(acc, _mm512_set_ps(0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,partial));
+        for (; h + 32 <= H; h += 32) {
+            // Load 16 packed bytes (32 nibbles).
+            const __m128i p16 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(row + (h >> 1)));
+
+            // Low nibble of each byte -> position 2i, high nibble -> 2i+1.
+            // For high nibbles, srli_epi16 by 4 then per-byte mask cleans
+            // up the cross-byte bleed.
+            const __m128i low_nib  = _mm_and_si128(p16, mask_lo);
+            const __m128i high_nib = _mm_and_si128(_mm_srli_epi16(p16, 4), mask_lo);
+
+            // Sign-extend nibbles in [0,15] -> int8 in [-8, 7].
+            const __m128i low_s  = _mm_sub_epi8(_mm_xor_si128(low_nib,  bias), bias);
+            const __m128i high_s = _mm_sub_epi8(_mm_xor_si128(high_nib, bias), bias);
+
+            // Interleave to natural order [l0,h0, l1,h1, ..., l15,h15].
+            const __m128i first16  = _mm_unpacklo_epi8(low_s, high_s);
+            const __m128i second16 = _mm_unpackhi_epi8(low_s, high_s);
+
+            // Widen int8 -> int32 -> fp32, FMA against x.
+            const __m512 w_a = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(first16));
+            const __m512 w_b = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(second16));
+            acc = _mm512_fmadd_ps(w_a, _mm512_loadu_ps(x + h),      acc);
+            acc = _mm512_fmadd_ps(w_b, _mm512_loadu_ps(x + h + 16), acc);
         }
+        // Tail: 2 nibbles at a time.
         float tail = 0.0f;
         for (; h < H; h += 2) {
             const uint8_t b = row[h >> 1];
@@ -321,7 +332,7 @@ void lm_head_int4_fp32_avx512(
 }
 
 // RMSNorm with bf16 gamma.
-void rmsnorm_bf16gamma_fp32_avx512(
+LSPK_API void rmsnorm_bf16gamma_fp32_avx512(
     const float*    __restrict__ x,
     const uint16_t* __restrict__ gamma,
     float*          __restrict__ out,
@@ -356,7 +367,7 @@ void rmsnorm_bf16gamma_fp32_avx512(
 }
 
 // RMSNorm with fp32 gamma.
-void rmsnorm_fp32gamma_fp32_avx512(
+LSPK_API void rmsnorm_fp32gamma_fp32_avx512(
     const float* __restrict__ x,
     const float* __restrict__ gamma,
     float*       __restrict__ out,
@@ -384,7 +395,7 @@ void rmsnorm_fp32gamma_fp32_avx512(
 }
 
 // Fused BitNet MLP gate: out = max(gate, 0)^2 * up.
-void relu2_mul_fp32_avx512(
+LSPK_API void relu2_mul_fp32_avx512(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     float*       __restrict__ out,
@@ -404,7 +415,7 @@ void relu2_mul_fp32_avx512(
 }
 
 // In-place add: a += b.
-void add_inplace_fp32_avx512(
+LSPK_API void add_inplace_fp32_avx512(
     float*       __restrict__ a,
     const float* __restrict__ b,
     int K
@@ -417,7 +428,7 @@ void add_inplace_fp32_avx512(
 }
 
 // Informational probes (mirror the NEON ones).
-int matmul_lut_avx512_has_omp(void) {
+LSPK_API int matmul_lut_avx512_has_omp(void) {
 #if defined(_OPENMP)
     return 1;
 #else
@@ -425,7 +436,7 @@ int matmul_lut_avx512_has_omp(void) {
 #endif
 }
 
-int matmul_lut_avx512_max_threads(void) {
+LSPK_API int matmul_lut_avx512_max_threads(void) {
 #if defined(_OPENMP)
     return omp_get_max_threads();
 #else
@@ -434,3 +445,23 @@ int matmul_lut_avx512_max_threads(void) {
 }
 
 }  // extern "C"
+
+// MSVC's link.exe insists on a `PyInit_<module>` export when building a .pyd.
+// We don't actually use the .pyd as a Python C extension -- it's loaded via
+// ctypes from kernel.py -- but we need to satisfy the linker. The stub
+// returns a minimal empty module so `import` would technically work too.
+//
+// Linux/clang doesn't require this and the symbol is harmless if exported.
+#if defined(_WIN32)
+#include <Python.h>
+extern "C" {
+PyMODINIT_FUNC PyInit__matmul_lut_avx512(void) {
+    static PyMethodDef methods[] = { {NULL, NULL, 0, NULL} };
+    static PyModuleDef def = {
+        PyModuleDef_HEAD_INIT, "_matmul_lut_avx512", NULL, -1, methods,
+        NULL, NULL, NULL, NULL,
+    };
+    return PyModule_Create(&def);
+}
+}  // extern "C"
+#endif

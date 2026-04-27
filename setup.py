@@ -53,37 +53,55 @@ def _torchless_ext_name() -> str:
     return "litespark_inference.torchless._matmul_lut_unknown"
 
 
-def _platform_compile_args() -> tuple[list[str], list[str]]:
-    """Return (extra_compile_args, extra_link_args) for the current platform.
+def _platform_compile_args(compiler_type: str) -> tuple[list[str], list[str]]:
+    """Return (extra_compile_args, extra_link_args) for current arch + compiler.
 
-    Apple Silicon: -mcpu=native (covers NEON SDOT on M-series). For OpenMP
-    we link Homebrew's libomp explicitly because Apple's toolchain doesn't
-    ship one.
+    `compiler_type` is setuptools' compiler family name: 'unix' (gcc/clang/
+    Apple clang), 'msvc' (cl.exe), or 'mingw32'. The flag dialects are
+    different enough that we branch.
 
-    Linux ARM64: -march=armv8.2-a+dotprod (Graviton 2/3/4 et al). OpenMP
-    is the system libomp / libgomp, picked up by -fopenmp on the linker
-    line.
+    Apple Silicon (unix): -mcpu=native (covers NEON SDOT on M-series). For
+    OpenMP we link Homebrew's libomp explicitly because Apple's toolchain
+    doesn't ship one.
 
-    x86_64 (Linux/Windows/Mac-Intel): require AVX-512F + BW + VNNI. Hosts
-    without VNNI (e.g. Skylake-X) will fail at compile time -- those
-    should use the torch-backed path (LITESPARK_FORCE_TORCH=1).
+    Linux ARM64 (unix): -march=armv8.2-a+dotprod (Graviton 2/3/4 et al).
+    OpenMP via system libomp / libgomp.
+
+    x86_64 unix (Linux/Mac-Intel): -mavx512f/bw/dq/vnni + -mfma.
+    x86_64 msvc (Windows): /arch:AVX512 enables F+CD+BW+DQ+VL on Skylake-X+.
+    VNNI/FMA intrinsics work without explicit flags under MSVC (they're
+    gated by header guards, not arch flags).
     """
     sys_name = platform.system()
     machine = platform.machine().lower()
-    compile_args = ["-O3", "-std=c++17", "-Wall", "-Wno-unused-function"]
+    is_msvc = compiler_type == "msvc"
+    compile_args: list[str] = []
     link_args: list[str] = []
 
-    # Architecture
+    # Baseline warning + optimization flags
+    if is_msvc:
+        compile_args += ["/O2", "/std:c++17", "/EHsc"]
+    else:
+        compile_args += ["-O3", "-std=c++17", "-Wall", "-Wno-unused-function"]
+
+    # Architecture-specific ISA flags
     if machine in ("arm64", "aarch64"):
-        if sys_name == "Darwin":
+        if is_msvc:
+            # Windows-on-ARM via MSVC isn't a target for the torchless
+            # path today; the kernel uses GCC/Clang NEON intrinsics.
+            pass
+        elif sys_name == "Darwin":
             compile_args += ["-mcpu=native"]
         else:
             compile_args += ["-march=armv8.2-a+dotprod"]
     elif machine in ("x86_64", "amd64"):
-        compile_args += [
-            "-mavx512f", "-mavx512bw", "-mavx512dq",
-            "-mavx512vnni", "-mfma",
-        ]
+        if is_msvc:
+            compile_args += ["/arch:AVX512"]
+        else:
+            compile_args += [
+                "-mavx512f", "-mavx512bw", "-mavx512dq",
+                "-mavx512vnni", "-mfma",
+            ]
 
     # OpenMP
     if sys_name == "Darwin":
@@ -114,8 +132,7 @@ def _platform_compile_args() -> tuple[list[str], list[str]]:
     elif sys_name == "Linux":
         compile_args += ["-fopenmp"]
         link_args += ["-fopenmp"]
-    elif sys_name == "Windows":
-        # MSVC OpenMP. Phase 1 hasn't been validated on Windows.
+    elif sys_name == "Windows" and is_msvc:
         compile_args += ["/openmp"]
 
     return compile_args, link_args
@@ -125,7 +142,7 @@ class _TorchlessExtensionBuild(build_ext):
     """Per-platform compile/link flags applied at build time."""
 
     def build_extension(self, ext: Extension) -> None:
-        compile_args, link_args = _platform_compile_args()
+        compile_args, link_args = _platform_compile_args(self.compiler.compiler_type)
         ext.extra_compile_args = list(ext.extra_compile_args or []) + compile_args
         ext.extra_link_args = list(ext.extra_link_args or []) + link_args
         super().build_extension(ext)
