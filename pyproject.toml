@@ -44,6 +44,7 @@ dependencies = [
     # 5.x does not, so we have to declare it explicitly here. Cross-platform
     # pure-Python wheel on PyPI, available on macOS/Linux/Windows.
     "accelerate>=0.26.0",
+    "ninja>=1.11.0",
 ]
 
 [project.optional-dependencies]
