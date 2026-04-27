@@ -38,6 +38,12 @@ dependencies = [
     # under [project.optional-dependencies] torch-backend.
     "torch>=2.4.0",
     "transformers>=4.30.0",
+    # transformers >= 5.x's BitNet loader hard-requires accelerate at
+    # `from_pretrained` time, even for the bf16 (non-quantized) checkpoint.
+    # Earlier transformers versions pulled accelerate in transitively;
+    # 5.x does not, so we have to declare it explicitly here. Cross-platform
+    # pure-Python wheel on PyPI, available on macOS/Linux/Windows.
+    "accelerate>=0.26.0",
 ]
 
 [project.optional-dependencies]
