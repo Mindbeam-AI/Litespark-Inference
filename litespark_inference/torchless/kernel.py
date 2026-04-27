@@ -1,17 +1,22 @@
 """
-ctypes bindings for the torchless extern "C" NEON kernel.
+ctypes bindings for the torchless extern "C" matmul kernel.
 
-Build path (preferred): the C++ source under
-litespark_inference/kernels/arm64/matmul_lut_neon_extern_c.cpp is compiled
-at install time by setup.py into a Python-extension-shaped shared library
-that lands next to this file. We locate it by globbing for any
-`_matmul_lut_neon*.{so,dylib}` artefact.
+Build path (preferred): the per-arch C++ source under
+  litespark_inference/kernels/arm64/matmul_lut_neon_extern_c.cpp     (NEON)
+  litespark_inference/kernels/x86_64/matmul_lut_avx512_extern_c.cpp  (AVX-512)
+is compiled at install time by setup.py into a Python-extension-shaped
+shared library that lands next to this file. We locate it by globbing
+for any `_matmul_lut_{neon,avx512}*.{so,dylib}` artefact.
 
 Fallback: if the shared library is missing (e.g. someone cloned the repo
 without `pip install`-ing it, or copied just the package directory), we
 JIT-compile via clang and write the dylib next to this file. The JIT path
 is purely a developer convenience -- a `pip install` produces the
 extension during install and never invokes the JIT.
+
+The C-side symbols are arch-suffixed (`*_neon` / `*_avx512`) so an
+accidental cross-arch load surfaces immediately. The Python-side wrappers
+below expose arch-neutral names that runtime.py imports.
 
 Deliberately does not import torch.
 """
@@ -30,7 +35,22 @@ import numpy as np
 
 
 _HERE = Path(__file__).resolve().parent
-_SRC = _HERE.parent / "kernels" / "arm64" / "matmul_lut_neon_extern_c.cpp"
+
+_MACHINE = platform.machine().lower()
+_IS_ARM = _MACHINE in ("arm64", "aarch64")
+_IS_X86 = _MACHINE in ("x86_64", "amd64")
+
+if _IS_ARM:
+    _ARCH_TAG = "neon"
+    _SRC = _HERE.parent / "kernels" / "arm64" / "matmul_lut_neon_extern_c.cpp"
+elif _IS_X86:
+    _ARCH_TAG = "avx512"
+    _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx512_extern_c.cpp"
+else:
+    _ARCH_TAG = "unknown"
+    _SRC = _HERE  # nonexistent; load() will fail gracefully
+
+_LIB_PREFIX = f"_matmul_lut_{_ARCH_TAG}"
 
 _lib: Optional[ctypes.CDLL] = None
 
@@ -44,12 +64,12 @@ def _find_built_extension() -> Optional[Path]:
 
     setuptools writes the artefact with a Python ABI tag, e.g.
     `_matmul_lut_neon.cpython-311-darwin.so` or
-    `_matmul_lut_neon.cpython-311-aarch64-linux-gnu.so`. We accept any
-    file matching the prefix, falling back to the legacy bare-name dylib
-    that the JIT path produces.
+    `_matmul_lut_avx512.cpython-311-x86_64-linux-gnu.so`. We accept any
+    file matching the per-arch prefix, falling back to a legacy bare-name
+    dylib that the JIT path produces.
     """
     candidates: list[Path] = []
-    for pattern in ("_matmul_lut_neon*.so", "_matmul_lut_neon*.dylib"):
+    for pattern in (f"{_LIB_PREFIX}*.so", f"{_LIB_PREFIX}*.dylib", f"{_LIB_PREFIX}*.pyd"):
         candidates.extend(_HERE.glob(pattern))
     if not candidates:
         return None
@@ -59,10 +79,12 @@ def _find_built_extension() -> Optional[Path]:
     return candidates[0]
 
 
-_LIB_SUFFIX = {"Darwin": ".dylib", "Linux": ".so"}.get(platform.system(), ".so")
+_LIB_SUFFIX = {"Darwin": ".dylib", "Linux": ".so", "Windows": ".dll"}.get(
+    platform.system(), ".so"
+)
 # Path the JIT fallback writes to. The pip-installed extension will have a
 # different (ABI-tagged) name and will be preferred by _find_built_extension.
-_LIB_PATH = _HERE / f"_matmul_lut_neon{_LIB_SUFFIX}"
+_LIB_PATH = _HERE / f"{_LIB_PREFIX}{_LIB_SUFFIX}"
 
 
 _HOMEBREW_LIBOMP = Path("/opt/homebrew/opt/libomp")
@@ -92,7 +114,7 @@ def _omp_flags() -> list[str]:
 
 
 def _compile() -> None:
-    """Compile the extern "C" kernel into a shared library via clang."""
+    """Compile the extern "C" kernel into a shared library via clang/gcc."""
     compiler = os.environ.get("CXX", "clang++")
     base = [
         compiler,
@@ -103,12 +125,15 @@ def _compile() -> None:
         "-Wall",
         "-Wno-unused-function",
     ]
-    if platform.machine() in ("arm64", "aarch64"):
+    if _IS_ARM:
         # Apple clang accepts -mcpu=native; Linux clang/gcc want -march.
         # NEON + SDOT ("dotprod") are required by the SIMD path.
         base += ["-mcpu=native"] if platform.system() == "Darwin" else [
             "-march=armv8.2-a+dotprod",
         ]
+    elif _IS_X86:
+        # Match setup.py: AVX-512F + BW + VNNI + FMA.
+        base += ["-mavx512f", "-mavx512bw", "-mavx512vnni", "-mfma"]
 
     omp = _omp_flags()
     cmd_omp = base + omp + [str(_SRC), "-o", str(_LIB_PATH)]
@@ -152,100 +177,85 @@ def _load() -> ctypes.CDLL:
         _compile()
         lib_path = _LIB_PATH
     lib = ctypes.CDLL(str(lib_path))
-    lib.matmul_lut_neon_m1.argtypes = [
-        ctypes.POINTER(ctypes.c_int8),
-        ctypes.POINTER(ctypes.c_uint8),
+
+    # Resolve arch-tagged C symbols and re-attach under arch-neutral names.
+    # The .cpp file exports e.g. matmul_lut_neon_m1 / matmul_lut_avx512_m1;
+    # the Python wrappers below call lib.matmul_lut_m1.
+    def _alias(neutral_name: str, c_name: str, argtypes, restype):
+        fn = getattr(lib, c_name)
+        fn.argtypes = argtypes
+        fn.restype = restype
+        setattr(lib, neutral_name, fn)
+
+    T = _ARCH_TAG
+    _alias(
+        "matmul_lut_m1", f"matmul_lut_{T}_m1",
+        [ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_uint8),
+         ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_float),
+         ctypes.c_int, ctypes.c_int],
+        None,
+    )
+    _alias(
+        "quantize_activation", f"quantize_activation_{T}",
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int8), ctypes.c_int],
         ctypes.c_float,
-        ctypes.c_float,
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-        ctypes.c_int,
-    ]
-    lib.matmul_lut_neon_m1.restype = None
-    # NEON activation quantize
-    lib.quantize_activation_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_int8),
-        ctypes.c_int,
-    ]
-    lib.quantize_activation_neon.restype = ctypes.c_float
-    # Tied LM head matmul with bf16 weights (no fp32 cache needed).
-    lib.lm_head_bf16_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_uint16),  # emb [V, H] bf16 as u16
-        ctypes.POINTER(ctypes.c_float),   # x [H]
-        ctypes.POINTER(ctypes.c_float),   # logits [V]
-        ctypes.c_int,                     # V
-        ctypes.c_int,                     # H
-    ]
-    lib.lm_head_bf16_fp32_neon.restype = None
-    # Tied LM head matmul with int8 per-row-quantized embeddings.
-    lib.lm_head_int8_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_int8),    # emb [V, H] int8
-        ctypes.POINTER(ctypes.c_float),   # emb_scale [V]
-        ctypes.POINTER(ctypes.c_float),   # x [H]
-        ctypes.POINTER(ctypes.c_float),   # logits [V]
-        ctypes.c_int,                     # V
-        ctypes.c_int,                     # H
-    ]
-    lib.lm_head_int8_fp32_neon.restype = None
-    # Tied LM head matmul with int4 per-row-quantized embeddings (2 nibbles/byte).
-    lib.lm_head_int4_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_uint8),   # emb [V, H/2] packed int4
-        ctypes.POINTER(ctypes.c_float),   # emb_scale [V]
-        ctypes.POINTER(ctypes.c_float),   # x [H]
-        ctypes.POINTER(ctypes.c_float),   # logits [V]
-        ctypes.c_int,                     # V
-        ctypes.c_int,                     # H
-    ]
-    lib.lm_head_int4_fp32_neon.restype = None
-    # RMSNorm with bf16 gamma.
-    lib.rmsnorm_bf16gamma_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),   # x [K]
-        ctypes.POINTER(ctypes.c_uint16),  # gamma [K] bf16
-        ctypes.POINTER(ctypes.c_float),   # out [K]
-        ctypes.c_int,                     # K
-        ctypes.c_float,                   # eps
-    ]
-    lib.rmsnorm_bf16gamma_fp32_neon.restype = None
-    # RMSNorm with fp32 gamma.
-    lib.rmsnorm_fp32gamma_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-        ctypes.c_float,
-    ]
-    lib.rmsnorm_fp32gamma_fp32_neon.restype = None
-    # Fused relu2(gate) * up.
-    lib.relu2_mul_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-    ]
-    lib.relu2_mul_fp32_neon.restype = None
-    # In-place fp32 vector add.
-    lib.add_inplace_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-    ]
-    lib.add_inplace_fp32_neon.restype = None
-    # Informational probes
-    lib.matmul_lut_neon_has_omp.argtypes = []
-    lib.matmul_lut_neon_has_omp.restype = ctypes.c_int
-    lib.matmul_lut_neon_max_threads.argtypes = []
-    lib.matmul_lut_neon_max_threads.restype = ctypes.c_int
+    )
+    _alias(
+        "lm_head_bf16_fp32", f"lm_head_bf16_fp32_{T}",
+        [ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_float),
+         ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int],
+        None,
+    )
+    _alias(
+        "lm_head_int8_fp32", f"lm_head_int8_fp32_{T}",
+        [ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_float),
+         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+         ctypes.c_int, ctypes.c_int],
+        None,
+    )
+    _alias(
+        "lm_head_int4_fp32", f"lm_head_int4_fp32_{T}",
+        [ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
+         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+         ctypes.c_int, ctypes.c_int],
+        None,
+    )
+    _alias(
+        "rmsnorm_bf16gamma_fp32", f"rmsnorm_bf16gamma_fp32_{T}",
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16),
+         ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float],
+        None,
+    )
+    _alias(
+        "rmsnorm_fp32gamma_fp32", f"rmsnorm_fp32gamma_fp32_{T}",
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+         ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float],
+        None,
+    )
+    _alias(
+        "relu2_mul_fp32", f"relu2_mul_fp32_{T}",
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+         ctypes.POINTER(ctypes.c_float), ctypes.c_int],
+        None,
+    )
+    _alias(
+        "add_inplace_fp32", f"add_inplace_fp32_{T}",
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_int],
+        None,
+    )
+    _alias("has_omp_probe", f"matmul_lut_{T}_has_omp", [], ctypes.c_int)
+    _alias("max_threads_probe", f"matmul_lut_{T}_max_threads", [], ctypes.c_int)
+
     _lib = lib
     return lib
 
 
 def has_omp() -> bool:
-    return bool(_load().matmul_lut_neon_has_omp())
+    return bool(_load().has_omp_probe())
 
 
 def max_threads() -> int:
-    return int(_load().matmul_lut_neon_max_threads())
+    return int(_load().max_threads_probe())
 
 
 def lm_head_int4(
@@ -275,7 +285,7 @@ def lm_head_int4(
     assert x_fp32.shape[0] == H
     assert out_fp32.shape[0] == V
     lib = _load()
-    lib.lm_head_int4_fp32_neon(
+    lib.lm_head_int4_fp32(
         emb_packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         emb_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -309,7 +319,7 @@ def lm_head_int8(
     assert x_fp32.shape[0] == H
     assert out_fp32.shape[0] == V
     lib = _load()
-    lib.lm_head_int8_fp32_neon(
+    lib.lm_head_int8_fp32(
         emb_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
         emb_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -339,7 +349,7 @@ def lm_head_bf16(
     assert x_fp32.shape[0] == H
     assert out_fp32.shape[0] == V
     lib = _load()
-    lib.lm_head_bf16_fp32_neon(
+    lib.lm_head_bf16_fp32(
         emb_u16.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
         x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -365,14 +375,14 @@ def rmsnorm_into(
     assert out_fp32.shape[0] == K and gamma.shape[0] == K
     lib = _load()
     if gamma.dtype == np.uint16:
-        lib.rmsnorm_bf16gamma_fp32_neon(
+        lib.rmsnorm_bf16gamma_fp32(
             x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             gamma.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
             out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             ctypes.c_int(K), ctypes.c_float(eps),
         )
     elif gamma.dtype == np.float32:
-        lib.rmsnorm_fp32gamma_fp32_neon(
+        lib.rmsnorm_fp32gamma_fp32(
             x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             gamma.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -394,7 +404,7 @@ def relu2_mul_into(
     assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
     K = int(gate_fp32.shape[0])
     assert up_fp32.shape[0] == K and out_fp32.shape[0] == K
-    _load().relu2_mul_fp32_neon(
+    _load().relu2_mul_fp32(
         gate_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         up_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -409,7 +419,7 @@ def add_inplace(a_fp32: np.ndarray, b_fp32: np.ndarray) -> np.ndarray:
     assert b_fp32.dtype == np.float32 and b_fp32.ndim == 1
     K = int(a_fp32.shape[0])
     assert b_fp32.shape[0] == K
-    _load().add_inplace_fp32_neon(
+    _load().add_inplace_fp32(
         a_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         b_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         ctypes.c_int(K),
@@ -433,7 +443,7 @@ def quantize_activation(
     assert out_int8.dtype == np.int8 and out_int8.ndim == 1
     assert out_int8.shape[0] >= x_fp32.shape[0]
     lib = _load()
-    return float(lib.quantize_activation_neon(
+    return float(lib.quantize_activation(
         x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         out_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
         ctypes.c_int(int(x_fp32.shape[0])),
@@ -479,7 +489,7 @@ def matmul_packed_m1(
         out = np.ascontiguousarray(out)
 
     lib = _load()
-    lib.matmul_lut_neon_m1(
+    lib.matmul_lut_m1(
         x_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
         packed_w.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         ctypes.c_float(w_scale),
