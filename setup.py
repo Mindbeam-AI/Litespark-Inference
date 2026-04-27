@@ -81,7 +81,8 @@ def _platform_compile_args() -> tuple[list[str], list[str]]:
             compile_args += ["-march=armv8.2-a+dotprod"]
     elif machine in ("x86_64", "amd64"):
         compile_args += [
-            "-mavx512f", "-mavx512bw", "-mavx512vnni", "-mfma",
+            "-mavx512f", "-mavx512bw", "-mavx512dq",
+            "-mavx512vnni", "-mfma",
         ]
 
     # OpenMP

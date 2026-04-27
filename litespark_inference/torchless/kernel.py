@@ -132,8 +132,11 @@ def _compile() -> None:
             "-march=armv8.2-a+dotprod",
         ]
     elif _IS_X86:
-        # Match setup.py: AVX-512F + BW + VNNI + FMA.
-        base += ["-mavx512f", "-mavx512bw", "-mavx512vnni", "-mfma"]
+        # Match setup.py: AVX-512F + BW + DQ + VNNI + FMA.
+        base += [
+            "-mavx512f", "-mavx512bw", "-mavx512dq",
+            "-mavx512vnni", "-mfma",
+        ]
 
     omp = _omp_flags()
     cmd_omp = base + omp + [str(_SRC), "-o", str(_LIB_PATH)]
