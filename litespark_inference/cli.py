@@ -26,6 +26,25 @@ _CHAT_UNSUPPORTED_MODELS = {
     'falcon-edge-3b',
 }
 
+# Models the torchless runtime can handle today. Extend as new families are
+# ported. Anything outside this set silently falls back to the torch-backed
+# path so existing Falcon Edge workflows keep working unchanged.
+_TORCHLESS_SUPPORTED_MODELS = {'bitnet-2b'}
+
+
+def _should_use_torchless(args) -> bool:
+    """Route to torchless when the target model is supported there.
+
+    Torchless currently does greedy decoding only; sampling args
+    (`--temperature`/`--top-p`/`--top-k`) are accepted for compatibility
+    with the torch-backed CLI but quietly ignored. Set LITESPARK_FORCE_TORCH=1
+    if you need sampling-based decoding on a torchless-supported model.
+    """
+    import os
+    if os.environ.get('LITESPARK_FORCE_TORCH'):
+        return False
+    return getattr(args, 'model', None) in _TORCHLESS_SUPPORTED_MODELS
+
 
 def _build_prompt(tokenizer, messages):
     """Build a prompt, using chat templates when the tokenizer provides one."""
@@ -55,6 +74,21 @@ def _build_prompt(tokenizer, messages):
 
 def cmd_generate(args):
     """Generate text from a prompt."""
+    if _should_use_torchless(args):
+        from .torchless.__main__ import cmd_generate as _cmd_generate_torchless
+        # torchless cmd_generate expects: prompt, max_tokens, raw, ignore_eos
+        class _A: pass
+        tl_args = _A()
+        tl_args.prompt = args.prompt
+        tl_args.max_tokens = args.max_tokens
+        tl_args.raw = False   # use the chat-format wrapper, like the torch path does
+        tl_args.ignore_eos = False
+        print(f"[litespark-inference] torchless runtime (model={args.model}).")
+        if getattr(args, 'temperature', 0.0) and args.temperature > 0.0:
+            print(f"  note: --temperature/--top-p/--top-k ignored (torchless is "
+                  f"greedy-only today; set LITESPARK_FORCE_TORCH=1 for sampling).")
+        return _cmd_generate_torchless(tl_args)
+
     from .models import load_ternary_model, TextStreamer
     import torch
 
@@ -92,6 +126,16 @@ def cmd_generate(args):
 
 def cmd_chat(args):
     """Interactive chat mode."""
+    if _should_use_torchless(args):
+        from .torchless.__main__ import cmd_chat as _cmd_chat_torchless
+        class _A: pass
+        tl_args = _A()
+        tl_args.model = args.model
+        tl_args.max_tokens = args.max_tokens
+        tl_args.embed_dtype = 'int4'
+        print(f"[litespark-inference] routing to torchless runtime for '{args.model}'.")
+        return _cmd_chat_torchless(tl_args)
+
     from .models import load_ternary_model, TextStreamer
     import torch
 
@@ -154,6 +198,16 @@ def cmd_chat(args):
 
 def cmd_benchmark(args):
     """Run performance benchmark."""
+    if _should_use_torchless(args):
+        from .torchless.__main__ import cmd_benchmark as _cmd_benchmark_torchless
+        class _A: pass
+        tl_args = _A()
+        tl_args.model = args.model
+        tl_args.tokens = args.tokens
+        tl_args.embed_dtype = 'int4'
+        print(f"[litespark-inference] routing to torchless runtime for '{args.model}'.")
+        return _cmd_benchmark_torchless(tl_args)
+
     from .models import load_ternary_model, get_arch_info, get_kernel_type
     import torch
     import gc

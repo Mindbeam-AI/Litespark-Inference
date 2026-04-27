@@ -6,7 +6,16 @@ Reproduces the benchmark format from Microsoft BitNet src/README.md
 Tests raw kernel performance on specific matrix sizes with timing statistics.
 """
 
-import torch
+# NOTE: do NOT `import torch` at module level. Importing torch on Apple
+# Silicon initialises its bundled libomp, which then conflicts with the
+# torchless dylib's own libomp the first time we run a parallel region
+# inside our kernel -- segfault, even with KMP_DUPLICATE_LIB_OK=TRUE.
+# All torch usage is wrapped in `_lazy_torch()` so the torchless code
+# path can run without ever touching torch.
+def _lazy_torch():
+    import torch  # noqa: F401
+    return torch
+
 import time
 import platform
 import os
@@ -140,6 +149,8 @@ def benchmark_matmul(kernel, kernel_type: str, M: int, K: int, N: int,
     Returns:
         BenchmarkResult with timing statistics
     """
+    torch = _lazy_torch()  # this function uses torch tensors throughout
+
     # Determine padding based on kernel type
     if kernel_type == 'vnni':
         k_pad = 64
@@ -355,15 +366,308 @@ def run_thread_scaling_benchmark(thread_counts: List[int] = None, num_runs: int 
     return results
 
 
-def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4, num_tokens: int = 128) -> Dict:
+def _run_pytorch_baseline_in_subprocess(
+    model_name: str, num_threads: int, num_tokens: int,
+) -> "Dict | None":
+    """
+    Run run_pytorch_baseline() in a fresh Python subprocess.
+
+    The baseline needs to `import torch`, which loads torch's bundled
+    libomp.dylib. Our torchless dylib links its own libomp (Homebrew's)
+    and will already be loaded in the parent process if torchless
+    inference ran there. Two libomps in one process would trip OpenMP's
+    "duplicate runtime" guard and require KMP_DUPLICATE_LIB_OK=TRUE as
+    a workaround. Instead, we put torch in its own process: only the
+    torch libomp loads here, and the parent process stays torchless.
+    The subprocess writes its results dict as JSON to a temp file; we
+    read it back and keep the same return contract as the in-process
+    version.
+    """
+    import subprocess as _sp
+    import tempfile as _tf
+    import json as _json
+    import os as _os
+
+    print("\n[info] Running PyTorch baseline in an isolated subprocess "
+          "(keeps torch's libomp out of this process so no "
+          "KMP_DUPLICATE_LIB_OK workaround is needed).")
+    with _tf.NamedTemporaryFile(suffix=".json", delete=False) as _f:
+        out_path = _f.name
+    try:
+        code = (
+            "import sys, json\n"
+            f"sys.path.insert(0, {repr(_os.path.dirname(_os.path.abspath(__file__)))})\n"
+            "from benchmark_kernel import run_pytorch_baseline\n"
+            "r = run_pytorch_baseline(\n"
+            f"    model_name={model_name!r}, num_threads={num_threads!r},\n"
+            f"    num_tokens={num_tokens!r},\n"
+            ")\n"
+            f"json.dump(r if r is not None else {{}}, open({out_path!r}, 'w'))\n"
+        )
+        proc = _sp.run(
+            [sys.executable, "-u", "-c", code],
+            capture_output=True, text=True,
+        )
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            print(f"[warn] pytorch-baseline subprocess returned {proc.returncode}; "
+                  "continuing without baseline.")
+            return None
+        try:
+            with open(out_path) as f:
+                data = _json.load(f)
+        except Exception as e:
+            print(f"[warn] could not read pytorch-baseline JSON ({e}); "
+                  "continuing without baseline.")
+            return None
+        return data if data else None
+    finally:
+        try:
+            _os.unlink(out_path)
+        except OSError:
+            pass
+
+
+def _run_matrix_in_subprocess(args) -> "Dict | None":
+    """
+    Re-invoke this script in a fresh subprocess to run only the matrix
+    benchmark. Used when the parent process is going to load the torchless
+    dylib later; running both libomp instances in one process segfaults.
+
+    The subprocess writes its full results JSON to a temp file and prints
+    the human-readable matrix table to stdout, which we forward.
+    """
+    return _rerun_in_subprocess(
+        args,
+        extra_flags=[],                       # default invocation = matrix only
+        result_key="matrix",
+        info="Running matrix benchmark in an isolated subprocess "
+             "(keeps torch's libomp out of this process so the torchless "
+             "kernel can run later without OMP conflicts).",
+        failure_label="matrix",
+    )
+
+
+def _run_scaling_in_subprocess(args) -> "Dict | None":
+    """
+    Re-invoke this script in a fresh subprocess to run only the thread-
+    scaling benchmark. Same rationale as _run_matrix_in_subprocess: scaling
+    uses the torch-backed NEON extension which initialises torch's libomp,
+    and the parent process must stay torchless-pure so our dylib's libomp
+    is the only OpenMP runtime loaded there.
+    """
+    return _rerun_in_subprocess(
+        args,
+        extra_flags=["--scaling", "--no-matrix"],
+        result_key="thread_scaling",
+        info="Running thread-scaling benchmark in an isolated subprocess "
+             "(keeps torch's libomp out of this process so the torchless "
+             "kernel can run later without OMP conflicts).",
+        failure_label="scaling",
+    )
+
+
+def _rerun_in_subprocess(
+    args, *, extra_flags, result_key, info, failure_label,
+) -> "Dict | None":
+    """Shared helper for subprocess-isolating torch-backed sub-benchmarks."""
+    import subprocess as _sp
+    import tempfile as _tf
+    import json as _json
+    import os as _os
+
+    print(f"\n[info] {info}")
+    with _tf.NamedTemporaryFile(suffix=".json", delete=False) as _f:
+        out_path = _f.name
+    try:
+        cmd = [
+            sys.executable, "-u", _os.path.abspath(__file__),
+            "--threads", str(args.threads),
+            "--runs", str(args.runs),
+            "--output", out_path,
+            *extra_flags,
+            # Omit --inference / --pytorch / --backend so the subprocess does
+            # only the requested torch-backed kernel benchmark and exits.
+        ]
+        proc = _sp.run(cmd, capture_output=True, text=True)
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            print(f"[warn] {failure_label} subprocess returned {proc.returncode}; "
+                  f"continuing without {failure_label} results.")
+            return None
+        try:
+            with open(out_path) as f:
+                payload = _json.load(f)
+        except Exception as e:
+            print(f"[warn] could not read {failure_label} subprocess JSON ({e}); "
+                  f"continuing without {failure_label} results.")
+            return None
+        return payload.get("benchmarks", {}).get(result_key)
+    finally:
+        try:
+            _os.unlink(out_path)
+        except OSError:
+            pass
+
+
+def run_inference_benchmark(
+    model_name: str = 'bitnet-2b',
+    num_threads: int = 4,
+    num_tokens: int = 128,
+    *,
+    backend: str = 'torchless',
+    embed_dtype: str = 'int4',
+) -> Dict:
     """
     Run end-to-end inference benchmark (pp128 + tg128 style).
+
+    backend="torchless" (default) exercises litespark_inference.torchless,
+    the numpy + extern "C" NEON runtime (no torch at inference time).
+    backend="torch" falls back to the original torch-backed path via
+    litespark_inference.models.load_ternary_model; kept for regression
+    checks against the pre-branch numbers.
     """
+    if backend == 'torchless':
+        return _run_inference_benchmark_torchless(
+            model_name=model_name, num_threads=num_threads,
+            num_tokens=num_tokens, embed_dtype=embed_dtype,
+        )
+    elif backend == 'torch':
+        return _run_inference_benchmark_torch(
+            model_name=model_name, num_threads=num_threads,
+            num_tokens=num_tokens,
+        )
+    else:
+        raise ValueError(f"backend must be 'torchless' or 'torch', got {backend!r}")
+
+
+def _run_inference_benchmark_torchless(
+    model_name: str, num_threads: int, num_tokens: int, embed_dtype: str,
+) -> Dict:
+    """Torchless (numpy + extern "C" NEON) inference benchmark path."""
+    from litespark_inference.torchless import load_bitnet_2b, load_tokenizer
+    from litespark_inference.torchless.runtime import forward_one, generate, init_state
+    import gc
+
+    print(f"\n{'='*70}")
+    print(f"INFERENCE BENCHMARK (pp128 + tg{num_tokens}) -- torchless [{embed_dtype}]")
+    print(f"{'='*70}\n")
+
+    if model_name != 'bitnet-2b':
+        raise ValueError(
+            f"torchless backend only supports 'bitnet-2b' today, got {model_name!r}. "
+            f"Pass --backend torch for other model families."
+        )
+
+    print(f"Loading model: {model_name} (torchless, embed_dtype={embed_dtype})")
+    gc.collect()
+    mem_before = get_current_rss_mb()
+    model = load_bitnet_2b(embed_dtype=embed_dtype)
+    tokenizer = load_tokenizer()
+    gc.collect()
+    mem_after = get_current_rss_mb()
+    memory_mb_rss = mem_after - mem_before
+    tb = model.tensor_bytes()
+    MB = 1024 * 1024
+    memory_mb_tensors = tb['total_incl_embedding'] / MB
+    # Report whichever view is larger, but prefer the live RSS delta: it's the
+    # honest "what the process is costing" number. sum of tensor bytes is
+    # always 657 MB for bitnet-2b int4 regardless of runtime overhead.
+    memory_mb = max(memory_mb_rss, memory_mb_tensors)
+    print(f"  [MEM-DEBUG torchless] rss_before={mem_before:.1f} MB  "
+          f"rss_after={mem_after:.1f} MB  rss_delta={memory_mb_rss:.1f} MB  "
+          f"tensor_bytes={memory_mb_tensors:.1f} MB "
+          f"(packed={tb['packed_weights']/MB:.0f} embed={tb['embedding']/MB:.0f}) "
+          f"reported={memory_mb:.1f} MB")
+
+    prompt = "The quick brown fox jumps over the lazy dog. " * 20
+    input_ids = tokenizer.encode(prompt)[:128]
+    actual_prompt_tokens = len(input_ids)
+    t_max = actual_prompt_tokens + num_tokens + 4
+
+    print(f"Kernel: neon (torchless, extern \"C\" NEON SDOT + OMP)")
+    print(f"Threads: {num_threads}")
+    print(f"Memory: {memory_mb:.0f} MB")
+    print(f"Prompt tokens: {actual_prompt_tokens}")
+    print(f"Generate tokens: {num_tokens}")
+
+    # Warmup: a full prefill so the dylib, OMP threads and allocator pool
+    # are stable before timing.
+    print("\nWarming up...")
+    state = init_state(model, t_max=t_max)
+    for tid in input_ids:
+        _ = forward_one(model, state, int(tid))
+
+    # Prompt processing (pp): time a fresh prefill from scratch.
+    print("\nPrompt Processing (pp):")
+    pp_times = []
+    for _ in range(5):
+        state = init_state(model, t_max=t_max)
+        start = time.perf_counter()
+        for tid in input_ids:
+            _ = forward_one(model, state, int(tid))
+        pp_times.append((time.perf_counter() - start) * 1000)
+
+    pp_mean = statistics.mean(pp_times)
+    pp_std = statistics.stdev(pp_times) if len(pp_times) > 1 else 0.0
+    pp_throughput = actual_prompt_tokens / (pp_mean / 1000)
+    print(f"  Time: {pp_mean:.2f}±{pp_std:.2f} ms")
+    print(f"  Throughput: {pp_throughput:.2f} tokens/sec")
+
+    # Token generation (tg): greedy decode of num_tokens new tokens.
+    print(f"\nToken Generation (tg{num_tokens}):")
+    tg_times = []
+    for _ in range(3):
+        start = time.perf_counter()
+        _ = generate(model, input_ids, max_new_tokens=num_tokens)
+        tg_times.append(time.perf_counter() - start)
+
+    tg_mean = statistics.mean(tg_times)
+    tg_std = statistics.stdev(tg_times) if len(tg_times) > 1 else 0.0
+    tg_throughput = num_tokens / tg_mean
+    print(f"  Time: {tg_mean*1000:.2f}±{tg_std*1000:.2f} ms")
+    print(f"  Throughput: {tg_throughput:.2f} tokens/sec")
+
+    results = {
+        'model': model_name,
+        'kernel': 'neon-torchless',
+        'backend': 'torchless',
+        'embed_dtype': embed_dtype,
+        'threads': num_threads,
+        'memory_mb': memory_mb,
+        'prompt_processing': {
+            'tokens': actual_prompt_tokens,
+            'mean_ms': pp_mean,
+            'std_ms': pp_std,
+            'throughput_tps': pp_throughput,
+        },
+        'token_generation': {
+            'tokens': num_tokens,
+            'mean_ms': tg_mean * 1000,
+            'std_ms': tg_std * 1000,
+            'throughput_tps': tg_throughput,
+        },
+    }
+
+    del model, tokenizer
+    gc.collect()
+    return results
+
+
+def _run_inference_benchmark_torch(
+    model_name: str, num_threads: int, num_tokens: int,
+) -> Dict:
+    """Legacy torch-backed inference benchmark (original behavior)."""
+    torch = _lazy_torch()
     from litespark_inference.models import load_ternary_model, get_kernel_type
     import gc
 
     print(f"\n{'='*70}")
-    print("INFERENCE BENCHMARK (pp128 + tg128)")
+    print("INFERENCE BENCHMARK (pp128 + tg128) -- torch-backed")
     print(f"{'='*70}\n")
 
     # Load model
@@ -375,7 +679,12 @@ def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4,
     mem_after = get_current_rss_mb()
     memory_mb_rss = mem_after - mem_before
     memory_mb_params = sum(p.nbytes for p in model.parameters()) / (1024 * 1024)
+    memory_mb_buffers = sum(b.nbytes for b in model.buffers()) / (1024 * 1024)
     memory_mb = memory_mb_rss if memory_mb_rss > memory_mb_params else memory_mb_params
+    print(f"  [MEM-DEBUG litespark] rss_before={mem_before:.1f} MB  rss_after={mem_after:.1f} MB  "
+          f"rss_delta={memory_mb_rss:.1f} MB  params={memory_mb_params:.1f} MB  "
+          f"buffers={memory_mb_buffers:.1f} MB  reported={memory_mb:.1f} MB "
+          f"(source={'rss_delta' if memory_mb_rss > memory_mb_params else 'params'})")
 
     kernel_type = get_kernel_type()
 
@@ -429,6 +738,7 @@ def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4,
     results = {
         'model': model_name,
         'kernel': kernel_type,
+        'backend': 'torch',
         'threads': num_threads,
         'memory_mb': memory_mb,
         'prompt_processing': {
@@ -452,13 +762,15 @@ def run_inference_benchmark(model_name: str = 'bitnet-2b', num_threads: int = 4,
 
 
 def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
-                         num_tokens: int = 128, max_gen_tokens: int = 32) -> Dict:
+                         num_tokens: int = 128) -> Dict:
     """
     Run PyTorch baseline inference benchmark for comparison.
 
     Uses standard HuggingFace AutoModelForCausalLM with the model's native
-    dtype.  Generation is capped at max_gen_tokens to keep runtime reasonable.
+    dtype. Generation is matched to the same token count as the Litespark
+    inference benchmark.
     """
+    torch = _lazy_torch()
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import transformers
     import gc
@@ -515,7 +827,14 @@ def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
     mem_after = get_current_rss_mb()
     memory_mb_rss = mem_after - mem_before
     memory_mb_params = sum(p.nbytes for p in model.parameters()) / (1024 * 1024)
+    memory_mb_buffers = sum(b.nbytes for b in model.buffers()) / (1024 * 1024)
+    param_dtypes = sorted({str(p.dtype) for p in model.parameters()})
+    print("PyTorch param dtypes:", param_dtypes)
     memory_mb = memory_mb_rss if memory_mb_rss > memory_mb_params else memory_mb_params
+    print(f"  [MEM-DEBUG pytorch]   rss_before={mem_before:.1f} MB  rss_after={mem_after:.1f} MB  "
+          f"rss_delta={memory_mb_rss:.1f} MB  params={memory_mb_params:.1f} MB  "
+          f"buffers={memory_mb_buffers:.1f} MB  param_dtypes={param_dtypes}  "
+          f"reported={memory_mb:.1f} MB (source={'rss_delta' if memory_mb_rss > memory_mb_params else 'params'})")
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -527,7 +846,7 @@ def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
     input_ids = tokenizer.encode(prompt, return_tensors='pt', max_length=128, truncation=True)
     attention_mask = torch.ones_like(input_ids)
     actual_prompt_tokens = input_ids.shape[1]
-    gen_tokens = min(num_tokens, max_gen_tokens)
+    gen_tokens = num_tokens
 
     print(f"Prompt tokens: {actual_prompt_tokens}")
     print(f"Generate tokens: {gen_tokens}")
@@ -617,7 +936,35 @@ def print_comparison_table(litespark_results: Dict, pytorch_results: Dict) -> No
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Litespark-Inf Kernel Benchmark')
+    parser = argparse.ArgumentParser(
+        description=(
+            "Litespark-Inf Kernel Benchmark\n\n"
+            "Runtimes:\n"
+            "  torchless : Litespark numpy + extern \"C\" NEON runtime for BitNet-2B.\n"
+            "  torch     : Litespark torch-backed runtime used by the in-process flows.\n"
+            "  --pytorch : Standard HuggingFace/PyTorch baseline for comparison.\n\n"
+            "Modes:\n"
+            "  matrix/scaling : raw kernel benchmarks (torch-backed, run in a subprocess\n"
+            "                   whenever the parent process will later load the torchless dylib,\n"
+            "                   so each libomp runtime lives in its own process).\n"
+            "  --inference    : end-to-end Litespark benchmark (pp128 + tg128).\n"
+            "  --all          : full benchmark sweep (matrix + scaling + inference)."
+        ),
+        epilog=(
+            "Redirects / constraints:\n"
+            "  - --inference --pytorch --backend torchless is supported: the PyTorch baseline\n"
+            "    runs in an isolated subprocess.\n"
+            "  - --all --backend torchless runs matrix, scaling, and inference -- the two\n"
+            "    torch-backed kernel phases (matrix, scaling) live in isolated subprocesses\n"
+            "    so torch's libomp never coexists with our dylib's libomp in one process.\n\n"
+            "Examples:\n"
+            "  python benchmark_kernel.py --inference --no-matrix\n"
+            "  python benchmark_kernel.py --inference --backend torch --pytorch --no-matrix\n"
+            "  python benchmark_kernel.py --inference --backend torchless --pytorch\n"
+            "  python benchmark_kernel.py --all\n"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument('--threads', '-t', type=int, default=1,
                         help='Number of threads (default: 1)')
     parser.add_argument('--runs', '-r', type=int, default=20,
@@ -634,13 +981,53 @@ def main():
                         help='Model name for inference benchmark (default: bitnet-2b)')
     parser.add_argument('--pytorch', action='store_true',
                         help='Include PyTorch baseline comparison (requires extra RAM, slow)')
+    parser.add_argument('--backend', choices=['torchless', 'torch'], default='torchless',
+                        help='Which Litespark runtime to benchmark in --inference: '
+                             '"torchless" (default, numpy + extern "C" NEON, no torch) '
+                             'or "torch" (legacy torch-backed path).')
+    parser.add_argument('--embed-dtype', choices=['bf16', 'int8', 'int4'], default='int4',
+                        help='Embedding quantization for the torchless backend '
+                             '(default: int4). Ignored when --backend=torch.')
+    parser.add_argument('--no-matrix', action='store_true',
+                        help='Skip the matrix benchmark entirely. By default it runs '
+                             'in-process with --backend=torch and in a subprocess with '
+                             '--backend=torchless (to avoid torch+torchless libomp '
+                             'conflicts on macOS).')
 
+    argv = sys.argv[1:]
+    backend_explicit = any(arg == '--backend' or arg.startswith('--backend=') for arg in argv)
     args = parser.parse_args()
+
+    if (args.inference or args.all) and args.backend == 'torchless' and args.model != 'bitnet-2b':
+        if backend_explicit:
+            parser.error(
+                "The torchless backend only supports 'bitnet-2b', "
+                f"got {args.model!r}. Pass --backend torch for other model families."
+            )
+        print(
+            f"\n[info] {args.model} is not supported on the torchless backend. "
+            "Resolving the default backend to --backend torch."
+        )
+        args.backend = 'torch'
 
     all_results = {
         'system': {},
         'benchmarks': {}
     }
+    num_tokens = 128
+
+    # When the user asked for inference against the torchless backend the
+    # matrix benchmark cannot run in the same process: the matrix path
+    # loads the torch-backed NEON extension (which initialises torch's
+    # libomp) and our torchless dylib brings its own libomp. A parallel
+    # region in the second-loaded libomp segfaults on Apple Silicon.
+    # We run the matrix benchmark in a fresh subprocess instead, so each
+    # libomp lives in isolation. Pass --no-matrix to skip entirely.
+    isolate_matrix_subprocess = (
+        (args.inference or args.all)
+        and getattr(args, 'backend', 'torchless') == 'torchless'
+        and not getattr(args, 'no_matrix', False)
+    )
 
     # Get system info
     cpu_info = get_cpu_info()
@@ -652,12 +1039,34 @@ def main():
         'simd_features': simd_features,
     }
 
-    # Run matrix benchmark (always)
-    matrix_results = run_full_benchmark(num_threads=args.threads, num_runs=args.runs)
-    all_results['benchmarks']['matrix'] = matrix_results
+    # Run matrix benchmark. When the rest of this run will exercise the
+    # torchless dylib, run matrix in an isolated subprocess so the torch
+    # libomp instance never shares this process with our libomp.
+    if getattr(args, 'no_matrix', False) and (args.inference or args.all):
+        print("\n[info] Skipping matrix benchmark (--no-matrix).")
+    elif isolate_matrix_subprocess:
+        matrix_results = _run_matrix_in_subprocess(args)
+        if matrix_results is not None:
+            all_results['benchmarks']['matrix'] = matrix_results
+    else:
+        matrix_results = run_full_benchmark(num_threads=args.threads, num_runs=args.runs)
+        all_results['benchmarks']['matrix'] = matrix_results
 
-    # Run thread scaling if requested
-    if args.scaling or args.all:
+    # Run thread scaling if requested. When we'll later load torchless
+    # inference in this process we route scaling through a subprocess
+    # (symmetric with the matrix benchmark) so torch's libomp doesn't
+    # contaminate the parent.
+    scaling_requested = args.scaling or args.all
+    isolate_scaling_subprocess = (
+        scaling_requested
+        and (args.inference or args.all)
+        and args.backend == 'torchless'
+    )
+    if scaling_requested and isolate_scaling_subprocess:
+        scaling_results = _run_scaling_in_subprocess(args)
+        if scaling_results is not None:
+            all_results['benchmarks']['thread_scaling'] = scaling_results
+    elif scaling_requested:
         max_threads = min(os.cpu_count() or 8, 16)
         thread_counts = [1, 2, 4, 8]
         if max_threads > 8:
@@ -667,22 +1076,50 @@ def main():
         scaling_results = run_thread_scaling_benchmark(thread_counts, num_runs=args.runs)
         all_results['benchmarks']['thread_scaling'] = scaling_results
 
-    # Run inference benchmark if requested.
-    # When --pytorch is set, run PyTorch first so it doesn't benefit from
-    # warm caches left behind by the Litespark benchmark.
+    # Run inference benchmark if requested. With --backend=torchless and
+    # --pytorch, the PyTorch baseline must stay in a separate subprocess:
+    # torch imports its own libomp while the torchless dylib brings
+    # another, and mixing both runtimes in one process crashes on Apple
+    # Silicon. With --backend=torch, both paths are already on the
+    # torch-backed runtime, so running in-process is fine.
     if args.inference or args.all:
+        inference_results = None
         pytorch_results = None
-        if args.pytorch:
-            pytorch_results = run_pytorch_baseline(
-                model_name=args.model, num_threads=args.threads
+
+        if args.backend == 'torchless':
+            inference_results = run_inference_benchmark(
+                model_name=args.model, num_threads=args.threads,
+                num_tokens=num_tokens, backend='torchless',
+                embed_dtype=args.embed_dtype,
             )
-            if pytorch_results is not None:
-                all_results['benchmarks']['pytorch_baseline'] = pytorch_results
+            all_results['benchmarks']['inference'] = inference_results
+            if args.pytorch:
+                # Subprocess-isolate the baseline so torch's libomp never
+                # coexists with our dylib's libomp in the same process.
+                pytorch_results = _run_pytorch_baseline_in_subprocess(
+                    model_name=args.model, num_threads=args.threads,
+                    num_tokens=num_tokens,
+                )
+                if pytorch_results is not None:
+                    all_results['benchmarks']['pytorch_baseline'] = pytorch_results
+        else:  # --backend=torch
+            if args.pytorch:
+                # Already in a torch-imported process for --backend=torch,
+                # so running the baseline in-process is fine (single libomp).
+                pytorch_results = run_pytorch_baseline(
+                    model_name=args.model, num_threads=args.threads,
+                    num_tokens=num_tokens,
+                )
+                if pytorch_results is not None:
+                    all_results['benchmarks']['pytorch_baseline'] = pytorch_results
+            inference_results = run_inference_benchmark(
+                model_name=args.model, num_threads=args.threads,
+                num_tokens=num_tokens, backend='torch',
+                embed_dtype=args.embed_dtype,
+            )
+            all_results['benchmarks']['inference'] = inference_results
 
-        inference_results = run_inference_benchmark(model_name=args.model, num_threads=args.threads)
-        all_results['benchmarks']['inference'] = inference_results
-
-        if pytorch_results is not None:
+        if inference_results is not None and pytorch_results is not None:
             print_comparison_table(inference_results, pytorch_results)
 
     elif args.pytorch:

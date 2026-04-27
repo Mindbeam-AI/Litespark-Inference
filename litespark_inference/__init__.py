@@ -17,11 +17,24 @@ Usage:
 
 __version__ = "0.1.5"
 
-from .models import (
-    load_ternary_model as load_model,
-    get_arch_info,
-    get_kernel_type,
-)
+# Lazy top-level imports. `.models` pulls torch; we don't want to drag torch
+# into sibling subpackages like `.torchless` that must stay torch-free.
+_TORCH_BACKED = {
+    "load_model": ("litespark_inference.models", "load_ternary_model"),
+    "get_arch_info": ("litespark_inference.models", "get_arch_info"),
+    "get_kernel_type": ("litespark_inference.models", "get_kernel_type"),
+}
+
+
+def __getattr__(name):
+    if name in _TORCH_BACKED:
+        import importlib
+        mod_name, attr = _TORCH_BACKED[name]
+        value = getattr(importlib.import_module(mod_name), attr)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module 'litespark_inference' has no attribute {name!r}")
+
 
 __all__ = [
     "__version__",

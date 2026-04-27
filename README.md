@@ -139,6 +139,46 @@ brew install libomp
 ```
 OpenMP enables multi-threaded kernel execution. Without it, inference will run single-threaded.
 
+The torchless runtime ships as a setuptools extension and is built
+during `pip install`. No JIT compile happens at first inference; you
+do need a C++ compiler available at install time (Xcode CLT on macOS,
+`build-essential` on Linux).
+
+## Torchless Runtime (BitNet-2B)
+
+`litespark-inference` ships with a **torchless** runtime — a numpy +
+extern "C" NEON path that does **not** import `torch` at inference time.
+For BitNet-2B the CLI dispatches to it automatically:
+
+```bash
+litespark-inference generate "Hello, how are you?"
+# [litespark-inference] torchless runtime (model=bitnet-2b).
+```
+
+Or invoke the torchless CLI directly:
+
+```bash
+python -m litespark_inference.torchless generate "Hello, how are you?" --max-tokens 32 --raw
+python -m litespark_inference.torchless info
+```
+
+### Headline numbers vs the PyTorch baseline (Apple Silicon, bitnet-2b)
+
+Same prompt, same workload (pp128 + tg128), measured with
+`benchmark_kernel.py --inference --pytorch` on a single thread:
+
+| Metric | PyTorch bf16 | **Litespark torchless (int4)** | Speedup |
+|---|---|---|---|
+| Peak RSS | 4,602 MB | **657 MB** | **7.0×** |
+| TTFT (pp128) | 18.6 s | 4.2 s | **4.5×** |
+| Throughput (tg128) | 0.4 tok/s | **15.2 tok/s** | **33×** |
+
+Falcon Edge models still go through the legacy torch-backed path; only
+`bitnet-2b` has a torchless loader today. Set
+`LITESPARK_FORCE_TORCH=1` to force the torch-backed path on
+`bitnet-2b` if you need sampling-based decoding (the torchless path is
+greedy-only).
+
 ## Usage
 
 ### Supported Models
@@ -228,12 +268,40 @@ Run the built-in benchmark to measure performance on your hardware:
 litespark-inference benchmark
 ```
 
-Or use the benchmark scripts for detailed profiling:
+Repo-level benchmarks for detailed profiling:
 
 ```bash
-python benchmark_kernel.py      # Kernel-level benchmarks
-python benchmark_synthetic.py   # Synthetic workload benchmarks
+# Litespark (torchless by default for bitnet-2b) vs the PyTorch baseline,
+# pp128 + tg128, both runtimes' RSS captured. ~6 min total.
+python benchmark_kernel.py --inference --pytorch
+
+# Quick torchless-only inference benchmark, no PyTorch baseline.
+python benchmark_kernel.py --inference --no-matrix
+
+# Full sweep: matrix + thread-scaling + inference (each torch-backed
+# kernel phase runs in its own subprocess so torch's libomp never
+# coexists with our libomp).
+python benchmark_kernel.py --all
+
+# Raw kernel benchmarks (matrix shapes, scaling) standalone.
+python benchmark_kernel.py
 ```
+
+### ARM compatibility tests
+
+The `tests/arm_compat/` folder ships ARM's three validation scripts
+(`benchmark_litespark.py`, `benchmark_transformers.py`,
+`benchmark_repeat_v2.py`) plus their original instructions. After
+`pip install -e .` they run with no environment variables and no edits:
+
+```bash
+python tests/arm_compat/benchmark_repeat_v2.py
+```
+
+This produces the canonical ARM "transformers vs litespark" comparison
+under `/usr/bin/time` (Darwin or Linux), aggregated across 5 runs, with
+`.log` and `.csv` artefacts dropped in `benchmark_logs/`. See
+[`tests/arm_compat/README.md`](tests/arm_compat/README.md) for details.
 
 ## Citation
 

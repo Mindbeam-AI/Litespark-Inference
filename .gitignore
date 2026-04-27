@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.so
+*.dylib
 *.egg-info/
 dist/
 build/
@@ -22,7 +23,13 @@ env/
 # Cache
 .cache/
 hf_cache/
+# Stray draft markdown files at the root (notes, planning docs).
+# Documentation that should be tracked (README, vendored ARM instructions,
+# subpackage docs) is opted back in via specific !-rules below.
 *.md
 next_test.md
 paper_outline.md
 2025-12-22.md
+!README.md
+!tests/**/README.md
+!tests/arm_compat/litespark_test_instructions.md

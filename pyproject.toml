@@ -27,11 +27,17 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.4.0",
-    "transformers>=4.30.0",
+    # Torchless runtime
+    "numpy>=1.24",
+    "tokenizers>=0.14",
     "safetensors>=0.3.0",
     "huggingface_hub>=0.16.0",
-    "ninja",
+    # Torch-backed path (Falcon Edge models, the legacy CLI dispatcher,
+    # the PyTorch baseline in benchmark_kernel.py / tests/arm_compat).
+    # If/when the torchless runtime gets a Falcon loader these can move
+    # under [project.optional-dependencies] torch-backend.
+    "torch>=2.4.0",
+    "transformers>=4.30.0",
 ]
 
 [project.optional-dependencies]
