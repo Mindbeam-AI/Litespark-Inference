@@ -182,8 +182,16 @@ def _load() -> ctypes.CDLL:
     lib = ctypes.CDLL(str(lib_path))
 
     # Resolve arch-tagged C symbols and re-attach under arch-neutral names.
-    # The .cpp file exports e.g. matmul_lut_neon_m1 / matmul_lut_avx512_m1;
-    # the Python wrappers below call lib.matmul_lut_m1.
+    # Use numpy.ctypeslib.ndpointer for array args -- it lets callers pass
+    # numpy arrays directly (no per-call .ctypes.data_as allocation), and
+    # enforces dtype + C-contiguity at type-check time so wrappers can
+    # skip np.ascontiguousarray on the hot path.
+    from numpy import ctypeslib as _npct
+    _F32 = _npct.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")
+    _I8  = _npct.ndpointer(dtype=np.int8,    flags="C_CONTIGUOUS")
+    _U8  = _npct.ndpointer(dtype=np.uint8,   flags="C_CONTIGUOUS")
+    _U16 = _npct.ndpointer(dtype=np.uint16,  flags="C_CONTIGUOUS")
+
     def _alias(neutral_name: str, c_name: str, argtypes, restype):
         fn = getattr(lib, c_name)
         fn.argtypes = argtypes
@@ -191,61 +199,33 @@ def _load() -> ctypes.CDLL:
         setattr(lib, neutral_name, fn)
 
     T = _ARCH_TAG
-    _alias(
-        "matmul_lut_m1", f"matmul_lut_{T}_m1",
-        [ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_uint8),
-         ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_float),
-         ctypes.c_int, ctypes.c_int],
-        None,
-    )
-    _alias(
-        "quantize_activation", f"quantize_activation_{T}",
-        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int8), ctypes.c_int],
-        ctypes.c_float,
-    )
-    _alias(
-        "lm_head_bf16_fp32", f"lm_head_bf16_fp32_{T}",
-        [ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_float),
-         ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int],
-        None,
-    )
-    _alias(
-        "lm_head_int8_fp32", f"lm_head_int8_fp32_{T}",
-        [ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_float),
-         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-         ctypes.c_int, ctypes.c_int],
-        None,
-    )
-    _alias(
-        "lm_head_int4_fp32", f"lm_head_int4_fp32_{T}",
-        [ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
-         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-         ctypes.c_int, ctypes.c_int],
-        None,
-    )
-    _alias(
-        "rmsnorm_bf16gamma_fp32", f"rmsnorm_bf16gamma_fp32_{T}",
-        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16),
-         ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float],
-        None,
-    )
-    _alias(
-        "rmsnorm_fp32gamma_fp32", f"rmsnorm_fp32gamma_fp32_{T}",
-        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-         ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float],
-        None,
-    )
-    _alias(
-        "relu2_mul_fp32", f"relu2_mul_fp32_{T}",
-        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-         ctypes.POINTER(ctypes.c_float), ctypes.c_int],
-        None,
-    )
-    _alias(
-        "add_inplace_fp32", f"add_inplace_fp32_{T}",
-        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_int],
-        None,
-    )
+    _alias("matmul_lut_m1", f"matmul_lut_{T}_m1",
+           [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    _alias("quantize_activation", f"quantize_activation_{T}",
+           [_F32, _I8, ctypes.c_int],
+           ctypes.c_float)
+    _alias("lm_head_bf16_fp32", f"lm_head_bf16_fp32_{T}",
+           [_U16, _F32, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    _alias("lm_head_int8_fp32", f"lm_head_int8_fp32_{T}",
+           [_I8, _F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    _alias("lm_head_int4_fp32", f"lm_head_int4_fp32_{T}",
+           [_U8, _F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    _alias("rmsnorm_bf16gamma_fp32", f"rmsnorm_bf16gamma_fp32_{T}",
+           [_F32, _U16, _F32, ctypes.c_int, ctypes.c_float],
+           None)
+    _alias("rmsnorm_fp32gamma_fp32", f"rmsnorm_fp32gamma_fp32_{T}",
+           [_F32, _F32, _F32, ctypes.c_int, ctypes.c_float],
+           None)
+    _alias("relu2_mul_fp32", f"relu2_mul_fp32_{T}",
+           [_F32, _F32, _F32, ctypes.c_int],
+           None)
+    _alias("add_inplace_fp32", f"add_inplace_fp32_{T}",
+           [_F32, _F32, ctypes.c_int],
+           None)
     _alias("has_omp_probe", f"matmul_lut_{T}_has_omp", [], ctypes.c_int)
     _alias("max_threads_probe", f"matmul_lut_{T}_max_threads", [], ctypes.c_int)
 
@@ -261,6 +241,13 @@ def max_threads() -> int:
     return int(_load().max_threads_probe())
 
 
+# All wrappers below skip per-call dtype/shape asserts and just hand the
+# arrays to ctypes -- ndpointer-typed argtypes raise TypeError on mismatch
+# and enforce C-contiguity, so the ascontiguousarray + assert calls that
+# used to live in each wrapper are now redundant (and were measured at
+# ~5% of forward-pass time).
+
+
 def lm_head_int4(
     emb_packed: np.ndarray,
     emb_scale: np.ndarray,
@@ -268,34 +255,9 @@ def lm_head_int4(
     out_fp32: np.ndarray,
     H: int,
 ) -> np.ndarray:
-    """
-    Tied LM head via NEON int4xfp32 matmul (2 nibbles/byte).
-
-    emb_packed: [V, H/2] uint8, each byte = low_nibble | (high_nibble << 4),
-                nibbles are signed 4-bit in [-7, +7] per-row absmax-quant.
-    emb_scale:  [V] fp32 (= absmax / 7).
-    x_fp32:     [H] fp32 contiguous.
-    out_fp32:   [V] fp32 contiguous scratch.
-    H:          un-packed feature width (vocab rows are H/2 bytes wide).
-    """
-    assert emb_packed.dtype == np.uint8 and emb_packed.ndim == 2
-    assert emb_scale.dtype == np.float32 and emb_scale.ndim == 1
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
-    V, H_half = emb_packed.shape
-    assert H_half == H // 2
-    assert emb_scale.shape[0] == V
-    assert x_fp32.shape[0] == H
-    assert out_fp32.shape[0] == V
-    lib = _load()
-    lib.lm_head_int4_fp32(
-        emb_packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        emb_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(V),
-        ctypes.c_int(H),
-    )
+    """Tied LM head via int4xfp32 matmul (2 nibbles/byte; H must be even)."""
+    V = emb_packed.shape[0]
+    _load().lm_head_int4_fp32(emb_packed, emb_scale, x_fp32, out_fp32, V, H)
     return out_fp32
 
 
@@ -305,31 +267,9 @@ def lm_head_int8(
     x_fp32: np.ndarray,
     out_fp32: np.ndarray,
 ) -> np.ndarray:
-    """
-    Tied LM head via NEON int8xfp32 matmul with per-row fp32 scale.
-
-    emb_int8:  [V, H] int8 (per-row absmax quant of bf16 embedding).
-    emb_scale: [V]    fp32 dequant factor (typically absmax/127).
-    x_fp32:    [H]    fp32 contiguous.
-    out_fp32:  [V]    fp32 contiguous scratch.
-    """
-    assert emb_int8.dtype == np.int8 and emb_int8.ndim == 2
-    assert emb_scale.dtype == np.float32 and emb_scale.ndim == 1
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
+    """Tied LM head via int8xfp32 matmul with per-row fp32 scale."""
     V, H = emb_int8.shape
-    assert emb_scale.shape[0] == V
-    assert x_fp32.shape[0] == H
-    assert out_fp32.shape[0] == V
-    lib = _load()
-    lib.lm_head_int8_fp32(
-        emb_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        emb_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(V),
-        ctypes.c_int(H),
-    )
+    _load().lm_head_int8_fp32(emb_int8, emb_scale, x_fp32, out_fp32, V, H)
     return out_fp32
 
 
@@ -338,27 +278,9 @@ def lm_head_bf16(
     x_fp32: np.ndarray,
     out_fp32: np.ndarray,
 ) -> np.ndarray:
-    """
-    Tied LM head via NEON bf16xfp32 matmul.
-
-    emb_u16:   [V, H] uint16 (bf16 bits).
-    x_fp32:    [H] fp32 contiguous.
-    out_fp32:  [V] fp32 contiguous (caller-owned scratch to avoid alloc).
-    """
-    assert emb_u16.dtype == np.uint16 and emb_u16.ndim == 2
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
+    """Tied LM head via bf16xfp32 matmul (emb_u16 holds bf16 bits)."""
     V, H = emb_u16.shape
-    assert x_fp32.shape[0] == H
-    assert out_fp32.shape[0] == V
-    lib = _load()
-    lib.lm_head_bf16_fp32(
-        emb_u16.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(V),
-        ctypes.c_int(H),
-    )
+    _load().lm_head_bf16_fp32(emb_u16, x_fp32, out_fp32, V, H)
     return out_fp32
 
 
@@ -368,29 +290,13 @@ def rmsnorm_into(
     out_fp32: np.ndarray,
     eps: float = 1e-5,
 ) -> np.ndarray:
-    """
-    RMSNorm x -> out in-place (caller-owned out). Dispatches on gamma dtype:
-    uint16 (bf16 bits) or fp32 are both accepted.
-    """
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
-    K = int(x_fp32.shape[0])
-    assert out_fp32.shape[0] == K and gamma.shape[0] == K
+    """RMSNorm x -> out (caller-owned). gamma may be uint16 (bf16) or fp32."""
+    K = x_fp32.shape[0]
     lib = _load()
     if gamma.dtype == np.uint16:
-        lib.rmsnorm_bf16gamma_fp32(
-            x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            gamma.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.c_int(K), ctypes.c_float(eps),
-        )
+        lib.rmsnorm_bf16gamma_fp32(x_fp32, gamma, out_fp32, K, eps)
     elif gamma.dtype == np.float32:
-        lib.rmsnorm_fp32gamma_fp32(
-            x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            gamma.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.c_int(K), ctypes.c_float(eps),
-        )
+        lib.rmsnorm_fp32gamma_fp32(x_fp32, gamma, out_fp32, K, eps)
     else:
         raise TypeError(f"gamma dtype must be uint16 or float32, got {gamma.dtype}")
     return out_fp32
@@ -402,55 +308,19 @@ def relu2_mul_into(
     out_fp32: np.ndarray,
 ) -> np.ndarray:
     """out = max(gate, 0)^2 * up (caller-owned out)."""
-    assert gate_fp32.dtype == np.float32 and gate_fp32.ndim == 1
-    assert up_fp32.dtype == np.float32 and up_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
-    K = int(gate_fp32.shape[0])
-    assert up_fp32.shape[0] == K and out_fp32.shape[0] == K
-    _load().relu2_mul_fp32(
-        gate_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        up_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(K),
-    )
+    _load().relu2_mul_fp32(gate_fp32, up_fp32, out_fp32, gate_fp32.shape[0])
     return out_fp32
 
 
 def add_inplace(a_fp32: np.ndarray, b_fp32: np.ndarray) -> np.ndarray:
     """a += b in-place (both fp32 1-D)."""
-    assert a_fp32.dtype == np.float32 and a_fp32.ndim == 1
-    assert b_fp32.dtype == np.float32 and b_fp32.ndim == 1
-    K = int(a_fp32.shape[0])
-    assert b_fp32.shape[0] == K
-    _load().add_inplace_fp32(
-        a_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        b_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(K),
-    )
+    _load().add_inplace_fp32(a_fp32, b_fp32, a_fp32.shape[0])
     return a_fp32
 
 
-def quantize_activation(
-    x_fp32: np.ndarray,
-    out_int8: np.ndarray,
-) -> float:
-    """
-    Per-tensor absmax int8 quantization via NEON, in-place into `out_int8`.
-
-    x_fp32:   [K] contiguous float32.
-    out_int8: [K] contiguous int8 scratch buffer (must be preallocated).
-
-    Returns the scalar scale (dequantized = int8 * scale).
-    """
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_int8.dtype == np.int8 and out_int8.ndim == 1
-    assert out_int8.shape[0] >= x_fp32.shape[0]
-    lib = _load()
-    return float(lib.quantize_activation(
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        ctypes.c_int(int(x_fp32.shape[0])),
-    ))
+def quantize_activation(x_fp32: np.ndarray, out_int8: np.ndarray) -> float:
+    """Per-tensor absmax int8 quantization in-place. Returns the scale."""
+    return float(_load().quantize_activation(x_fp32, out_int8, x_fp32.shape[0]))
 
 
 def matmul_packed_m1(
@@ -473,34 +343,11 @@ def matmul_packed_m1(
     Returns:
         [N] float32 output.
     """
-    assert x_int8.dtype == np.int8 and x_int8.ndim == 1
-    assert packed_w.dtype == np.uint8 and packed_w.ndim == 2
-
-    x_int8 = np.ascontiguousarray(x_int8)
-    packed_w = np.ascontiguousarray(packed_w)
-
     N, Kb = packed_w.shape
     K = Kb * 4
-    if x_int8.shape[0] != K:
-        raise ValueError(f"x length {x_int8.shape[0]} != K={K} implied by packed_w")
-
     if out is None:
         out = np.empty(N, dtype=np.float32)
-    else:
-        if out.shape != (N,) or out.dtype != np.float32:
-            raise ValueError("out must be float32 [N]")
-        out = np.ascontiguousarray(out)
-
-    lib = _load()
-    lib.matmul_lut_m1(
-        x_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        packed_w.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        ctypes.c_float(w_scale),
-        ctypes.c_float(x_scale),
-        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(N),
-        ctypes.c_int(K),
-    )
+    _load().matmul_lut_m1(x_int8, packed_w, w_scale, x_scale, out, N, K)
     return out
 
 
