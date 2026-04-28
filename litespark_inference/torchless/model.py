@@ -29,12 +29,19 @@ class PackedProjection:
     BitNet b1.58 uses a single scalar scale (weight.abs().mean()) per matrix,
     not a per-row scale. w_sum is retained for potential future kernels that
     need offset correction; the current packed M=1 kernel does not use it.
+
+    w_unpacked is an optional pre-decoded view of w_packed: each ternary
+    weight expanded back to one uint8 byte in [0, 1, 2] (the unsigned form
+    -- the matmul kernel applies the -1 bias on the output side). 4x bigger
+    in memory but lets the matmul skip the entire port-5 unpack chain. Set
+    by the loader when LITESPARK_PREUNPACK=1; None otherwise.
     """
-    w_packed: np.ndarray   # uint8 [N, ceil(K/4)]
-    w_sum: np.ndarray      # int32 [N] (unused by the current M=1 kernel)
-    scale: float           # per-tensor absmean
+    w_packed: np.ndarray              # uint8 [N, ceil(K/4)]
+    w_sum: np.ndarray                 # int32 [N] (unused by the current M=1 kernel)
+    scale: float                      # per-tensor absmean
     in_features: int
     out_features: int
+    w_unpacked: "np.ndarray | None" = None   # uint8 [N, K] in [0, 1, 2]
 
 
 @dataclass

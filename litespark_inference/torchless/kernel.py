@@ -202,6 +202,11 @@ def _load() -> ctypes.CDLL:
     _alias("matmul_lut_m1", f"matmul_lut_{T}_m1",
            [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
            None)
+    # Pre-unpacked-weights matmul: x86 only today (no NEON variant yet).
+    if _IS_X86 and hasattr(lib, f"matmul_unpacked_{T}_m1"):
+        _alias("matmul_unpacked_m1", f"matmul_unpacked_{T}_m1",
+               [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
+               None)
     _alias("quantize_activation", f"quantize_activation_{T}",
            [_F32, _I8, ctypes.c_int],
            ctypes.c_float)
@@ -348,6 +353,39 @@ def matmul_packed_m1(
     if out is None:
         out = np.empty(N, dtype=np.float32)
     _load().matmul_lut_m1(x_int8, packed_w, w_scale, x_scale, out, N, K)
+    return out
+
+
+def has_unpacked_matmul() -> bool:
+    """Return True if the loaded kernel has a pre-unpacked-weights matmul.
+
+    Available on x86 builds today. Use this to gate
+    `LITESPARK_PREUNPACK=1` storage on whether the runtime can use it.
+    """
+    return hasattr(_load(), "matmul_unpacked_m1")
+
+
+def matmul_unpacked_m1(
+    x_int8: np.ndarray,
+    w_u8: np.ndarray,
+    w_scale: float,
+    x_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Ternary matmul for M=1 with PRE-UNPACKED weights.
+
+    Args:
+        x_int8:   [K] int8.
+        w_u8:     [N, K] uint8 in [0, 1, 2] (one byte per ternary weight).
+        w_scale:  scalar float (per-tensor absmean).
+        x_scale:  scalar activation scale.
+        out:      Optional [N] float32 buffer.
+    """
+    N, K = w_u8.shape
+    if out is None:
+        out = np.empty(N, dtype=np.float32)
+    _load().matmul_unpacked_m1(x_int8, w_u8, w_scale, x_scale, out, N, K)
     return out
 
 

@@ -235,6 +235,88 @@ LSPK_API void matmul_lut_avx512_m1(
     }
 }
 
+// Same matmul as above but consumes PRE-UNPACKED weights (one u8 per
+// weight in [0,1,2] -- the same encoding the packed format would expand
+// to but stored 4x bigger). Saves the entire port-5 unpack chain at the
+// cost of 4x weight memory. Useful on hosts with plenty of RAM where
+// compute, not bandwidth, is the bottleneck.
+//
+// Weights are unsigned ([0,1,2]); we recover the canonical (n-1) bias
+// the same way as the packed kernel: subtract sum_x once per row.
+//
+// x:        int8 [K]
+// w_u8:     uint8 [N, K]   (pre-unpacked, K must be a multiple of 64)
+// w_scale:  fp32 (per-tensor absmean)
+// x_scale:  fp32
+// y:        fp32 [N]       (caller-allocated)
+LSPK_API void matmul_unpacked_avx512_m1(
+    const int8_t*  __restrict__ x,
+    const uint8_t* __restrict__ w_u8,
+    float w_scale,
+    float x_scale,
+    float* __restrict__ y,
+    int N,
+    int K
+) {
+    const float out_scale = x_scale * w_scale;
+
+    // sum(x) once per matmul, used to undo the +1 unsigned bias on w.
+    const __m512i ones_u8 = _mm512_set1_epi8(1);
+    __m512i sx_v = _mm512_setzero_si512();
+    int k = 0;
+    for (; k + 64 <= K; k += 64) {
+        const __m512i x64 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + k));
+        sx_v = _mm512_dpbusd_epi32(sx_v, ones_u8, x64);
+    }
+    int32_t sum_x = _mm512_reduce_add_epi32(sx_v);
+    for (; k < K; ++k) sum_x += static_cast<int32_t>(x[k]);
+
+#pragma omp parallel for if(N >= 64) schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* row = w_u8 + static_cast<ptrdiff_t>(n) * K;
+        __m512i acc0 = _mm512_setzero_si512();
+        __m512i acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512();
+        __m512i acc3 = _mm512_setzero_si512();
+
+        int kk = 0;
+        // 4-way unrolled: 256 weights / 256 activations / 4 VPDPBUSDs per iter.
+        // No unpack -- just two loads per VPDPBUSD.
+        for (; kk + 256 <= K; kk += 256) {
+            const __m512i n0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(row + kk +   0));
+            const __m512i n1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(row + kk +  64));
+            const __m512i n2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(row + kk + 128));
+            const __m512i n3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(row + kk + 192));
+            const __m512i x0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kk +   0));
+            const __m512i x1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kk +  64));
+            const __m512i x2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kk + 128));
+            const __m512i x3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kk + 192));
+            acc0 = _mm512_dpbusd_epi32(acc0, n0, x0);
+            acc1 = _mm512_dpbusd_epi32(acc1, n1, x1);
+            acc2 = _mm512_dpbusd_epi32(acc2, n2, x2);
+            acc3 = _mm512_dpbusd_epi32(acc3, n3, x3);
+        }
+        // 64-byte tail
+        for (; kk + 64 <= K; kk += 64) {
+            const __m512i n0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(row + kk));
+            const __m512i x0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x   + kk));
+            acc0 = _mm512_dpbusd_epi32(acc0, n0, x0);
+        }
+        const __m512i acc = _mm512_add_epi32(
+            _mm512_add_epi32(acc0, acc1),
+            _mm512_add_epi32(acc2, acc3));
+        int32_t sum = _mm512_reduce_add_epi32(acc);
+
+        // Scalar tail (K % 64 != 0)
+        for (; kk < K; ++kk) {
+            sum += static_cast<int32_t>(row[kk]) * static_cast<int32_t>(x[kk]);
+        }
+
+        y[n] = static_cast<float>(sum - sum_x) * out_scale;
+    }
+}
+
+
 // Per-tensor absmax quantization of an fp32 activation vector to int8.
 LSPK_API float quantize_activation_avx512(
     const float* __restrict__ x_fp32,

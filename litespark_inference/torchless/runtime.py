@@ -103,7 +103,12 @@ def _call_matmul(
     x_int8: np.ndarray, x_scale: float, proj: PackedProjection,
     out: np.ndarray,
 ) -> np.ndarray:
-    """Pre-quantized matmul call into a caller-owned output buffer."""
+    """Pre-quantized matmul. Uses the unpacked-weights path when the loader
+    pre-decoded weights (LITESPARK_PREUNPACK=1) and the active kernel
+    supports it; otherwise falls back to the packed-weights matmul."""
+    if proj.w_unpacked is not None:
+        from .kernel import matmul_unpacked_m1
+        return matmul_unpacked_m1(x_int8, proj.w_unpacked, proj.scale, x_scale, out=out)
     return matmul_packed_m1(x_int8, proj.w_packed, proj.scale, x_scale, out=out)
 
 

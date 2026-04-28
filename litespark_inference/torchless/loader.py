@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import gc
 import json
+import os
 import platform
 from pathlib import Path
 
@@ -82,6 +83,9 @@ def _resolve_hf_snapshot(repo: str) -> tuple[Path, Path]:
     return config_path, model_path
 
 
+_PREUNPACK = os.environ.get("LITESPARK_PREUNPACK", "0") == "1"
+
+
 def _load_proj(sf, prefix: str, suffix: str) -> PackedProjection:
     w_u16, _ = sf.get(prefix + suffix)          # bf16 (uint16 view)
     N, K = w_u16.shape
@@ -91,10 +95,15 @@ def _load_proj(sf, prefix: str, suffix: str) -> PackedProjection:
     del w_u16
     w_sum = w_int8.sum(axis=1, dtype="int32")
     w_packed = pack_ternary_4_per_byte(w_int8)
+    # If LITESPARK_PREUNPACK=1, also keep an unpacked copy in [0,1,2]
+    # form (4x memory, but the matmul kernel skips the whole port-5
+    # unpack chain). Costs ~3 GB of RAM for BitNet-2B vs ~700 MB packed.
+    w_unpacked = (w_int8 + 1).astype(np.uint8) if _PREUNPACK else None
     del w_int8
     proj = PackedProjection(
         w_packed=w_packed, w_sum=w_sum, scale=scale,
         in_features=K, out_features=N,
+        w_unpacked=w_unpacked,
     )
     # Return freed transient blocks to the OS every projection, not just
     # every layer. ~210 pressure-relief calls is cheap and keeps peak
