@@ -59,6 +59,44 @@ static inline float hsum_f32_x16(__m512 v) {
 // it the unbiased nibbles keeps the operand types matching.
 //
 // Reads packed[0..15] and returns 64 u8 lanes in natural [w0..w63] order.
+//
+// Two implementations:
+//   * VBMI path (Cannon Lake+, Ice Lake+, Zen 4+, Sapphire Rapids+):
+//     vpmultishiftqb does all 4 nibble-pair shifts in one instruction
+//     and runs on port 5, leaving port 0 free for VPDPBUSD.
+//   * Fallback (AVX-512 BW only): 4 separate shifts + ANDs + ORs.
+//
+// Both end with a single mask to 2 bits.
+#if defined(__AVX512VBMI__)
+static inline __m512i unpack_64_unsigned(__m128i packed16) {
+    // Per-qword: each output byte i takes bits [shift_i+7 .. shift_i] from
+    // the qword. After spread, each qword contains [b0,b0,b0,b0,b1,b1,b1,b1]
+    // (two distinct input bytes, each replicated 4x). We want output:
+    //   byte 0 = b0 bits[1:0]   -> qword bits[1:0]   -> shift  0
+    //   byte 1 = b0 bits[3:2]   -> qword bits[3:2]   -> shift  2
+    //   byte 2 = b0 bits[5:4]   -> qword bits[5:4]   -> shift  4
+    //   byte 3 = b0 bits[7:6]   -> qword bits[7:6]   -> shift  6
+    //   byte 4 = b1 bits[1:0]   -> qword bits[33:32] -> shift 32
+    //   byte 5 = b1 bits[3:2]   -> qword bits[35:34] -> shift 34
+    //   byte 6 = b1 bits[5:4]   -> qword bits[37:36] -> shift 36
+    //   byte 7 = b1 bits[7:6]   -> qword bits[39:38] -> shift 38
+    // Mask 0x03 trims the upper 6 bits of each extracted byte.
+    static const __m512i spread = _mm512_set_epi8(
+        15,15,15,15, 14,14,14,14, 13,13,13,13, 12,12,12,12,
+        11,11,11,11, 10,10,10,10,  9, 9, 9, 9,  8, 8, 8, 8,
+         7, 7, 7, 7,  6, 6, 6, 6,  5, 5, 5, 5,  4, 4, 4, 4,
+         3, 3, 3, 3,  2, 2, 2, 2,  1, 1, 1, 1,  0, 0, 0, 0
+    );
+    static const __m512i shifts = _mm512_set1_epi64(0x2624222006040200ULL);
+    static const __m512i mask03 = _mm512_set1_epi8(0x03);
+
+    const __m512i broadcast = _mm512_broadcast_i32x4(
+        _mm512_castsi512_si128(_mm512_castsi128_si512(packed16)));
+    const __m512i spread_bytes = _mm512_shuffle_epi8(broadcast, spread);
+    const __m512i shifted = _mm512_multishift_epi64_epi8(shifts, spread_bytes);
+    return _mm512_and_si512(shifted, mask03);
+}
+#else
 static inline __m512i unpack_64_unsigned(__m128i packed16) {
     static const __m512i spread = _mm512_set_epi8(
         15,15,15,15, 14,14,14,14, 13,13,13,13, 12,12,12,12,
@@ -88,6 +126,7 @@ static inline __m512i unpack_64_unsigned(__m128i packed16) {
 
     return _mm512_and_si512(merged, mask03);
 }
+#endif
 
 
 extern "C" {
@@ -133,26 +172,54 @@ LSPK_API void matmul_lut_avx512_m1(
 #pragma omp parallel for if(N >= 64) schedule(static)
     for (int n = 0; n < N; ++n) {
         const uint8_t* row = packed_w + static_cast<ptrdiff_t>(n) * Kb;
-        __m512i acc = _mm512_setzero_si512();
+
+        // Four parallel accumulators so the OOO core can have multiple
+        // VPDPBUSDs in flight (~5 cycle latency, 1/cycle throughput on
+        // Ice Lake+; with one acc the dependency chain serializes them).
+        __m512i acc0 = _mm512_setzero_si512();
+        __m512i acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512();
+        __m512i acc3 = _mm512_setzero_si512();
 
         int kb = 0;
-        // Fast path: 16 packed bytes -> 64 unsigned nibbles -> one VPDPBUSD.
-        // VPDPBUSD: src + dot4(uint8, int8) per int32 lane. 64 i8 lanes ->
-        // 16 int32 lanes, each accumulating 4 products. Inner loop is
-        // load + unpack + load + 1 VNNI = ~6 instructions for 64 MACs.
+        // 4-way unrolled fast path: 64 packed bytes / 256 unsigned nibbles
+        // / 256 activations / 4 VPDPBUSDs per iter.
+        for (; kb + 64 <= Kb; kb += 64) {
+            const __m128i p0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + kb +  0));
+            const __m128i p1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + kb + 16));
+            const __m128i p2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + kb + 32));
+            const __m128i p3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + kb + 48));
+            const __m512i n0 = unpack_64_unsigned(p0);
+            const __m512i n1 = unpack_64_unsigned(p1);
+            const __m512i n2 = unpack_64_unsigned(p2);
+            const __m512i n3 = unpack_64_unsigned(p3);
+            const int kx = kb << 2;
+            const __m512i x0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kx +   0));
+            const __m512i x1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kx +  64));
+            const __m512i x2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kx + 128));
+            const __m512i x3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + kx + 192));
+            acc0 = _mm512_dpbusd_epi32(acc0, n0, x0);
+            acc1 = _mm512_dpbusd_epi32(acc1, n1, x1);
+            acc2 = _mm512_dpbusd_epi32(acc2, n2, x2);
+            acc3 = _mm512_dpbusd_epi32(acc3, n3, x3);
+        }
+        // 16-byte tail (Kb%64 != 0): keep using acc0.
         for (; kb + 16 <= Kb; kb += 16) {
             const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + kb));
             const __m512i n64 = unpack_64_unsigned(packed);
             const __m512i x64 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(x + (kb << 2)));
-            acc = _mm512_dpbusd_epi32(acc, n64, x64);
+            acc0 = _mm512_dpbusd_epi32(acc0, n64, x64);
         }
 
-        // Both the fast loop and the tail accumulate sum_k n_k * x_k with
-        // n in [0, 2]. We subtract the full sum_x at the end to convert
-        // to sum_k (n_k - 1) * x_k = sum_k w_k * x_k.
+        // Reduce four accumulators -> one int32. We subtract the full
+        // sum_x at the end to convert sum_k n_k*x_k (n in [0,2]) into
+        // sum_k (n_k - 1)*x_k = sum_k w_k*x_k.
+        const __m512i acc = _mm512_add_epi32(
+            _mm512_add_epi32(acc0, acc1),
+            _mm512_add_epi32(acc2, acc3));
         int32_t sum = _mm512_reduce_add_epi32(acc);
 
-        // Tail: byte at a time, unbiased (n in [0, 2], no -1 here).
+        // Byte tail: unbiased (n in [0, 2], no -1 here).
         for (; kb < Kb; ++kb) {
             const uint8_t b = row[kb];
             const int kk = kb << 2;

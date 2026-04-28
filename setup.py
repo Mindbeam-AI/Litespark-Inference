@@ -96,11 +96,20 @@ def _platform_compile_args(compiler_type: str) -> tuple[list[str], list[str]]:
             compile_args += ["-march=armv8.2-a+dotprod"]
     elif machine in ("x86_64", "amd64"):
         if is_msvc:
+            # /arch:AVX512 enables F+CD+BW+DQ+VL on Skylake-X+. MSVC's
+            # intrinsic headers gate VBMI2 / VNNI by their own __cpuid
+            # checks, so we don't need a separate flag for those.
             compile_args += ["/arch:AVX512"]
         else:
+            # AVX-512F + BW + DQ for the float/byte ops; VNNI for the
+            # ternary matmul VPDPBUSD; VBMI for vpmultishiftqb-based
+            # nibble unpack (~3x fewer ops than the F+BW fallback) and
+            # crucially runs on port 5, freeing port 0 for VPDPBUSD.
+            # All available on Ice Lake+, Sapphire Rapids+, AMD Zen 4+.
+            # Cascade Lake (no VBMI) falls back via the #ifdef in the kernel.
             compile_args += [
                 "-mavx512f", "-mavx512bw", "-mavx512dq",
-                "-mavx512vnni", "-mfma",
+                "-mavx512vnni", "-mavx512vbmi", "-mfma",
             ]
 
     # OpenMP
