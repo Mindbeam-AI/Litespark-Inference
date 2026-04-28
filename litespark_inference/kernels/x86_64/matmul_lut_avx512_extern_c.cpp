@@ -66,8 +66,10 @@ static inline float hsum_f32_x16(__m512 v) {
 //     and runs on port 5, leaving port 0 free for VPDPBUSD.
 //   * Fallback (AVX-512 BW only): 4 separate shifts + ANDs + ORs.
 //
-// Both end with a single mask to 2 bits.
-#if defined(__AVX512VBMI__)
+// Both end with a single mask to 2 bits. Selected by setup.py via
+// -DLITESPARK_USE_VBMI; we use an explicit macro because MSVC doesn't
+// predefine __AVX512VBMI__ even when /arch:AVX512 is set.
+#if defined(LITESPARK_USE_VBMI) || defined(__AVX512VBMI__)
 static inline __m512i unpack_64_unsigned(__m128i packed16) {
     // Per-qword: each output byte i takes bits [shift_i+7 .. shift_i] from
     // the qword. After spread, each qword contains [b0,b0,b0,b0,b1,b1,b1,b1]

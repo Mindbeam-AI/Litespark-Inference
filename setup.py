@@ -95,9 +95,13 @@ def _platform_compile_args(compiler_type: str) -> tuple[list[str], list[str]]:
         else:
             compile_args += ["-march=armv8.2-a+dotprod"]
     elif machine in ("x86_64", "amd64"):
+        # LITESPARK_USE_VBMI selects the vpmultishiftqb fast path in
+        # the kernel. Explicit macro because MSVC doesn't predefine
+        # __AVX512VBMI__ even when /arch:AVX512 is set.
+        compile_args += ["-DLITESPARK_USE_VBMI=1"] if is_msvc else []
         if is_msvc:
             # /arch:AVX512 enables F+CD+BW+DQ+VL on Skylake-X+. MSVC's
-            # intrinsic headers gate VBMI2 / VNNI by their own __cpuid
+            # intrinsic headers gate VBMI / VNNI by their own __cpuid
             # checks, so we don't need a separate flag for those.
             compile_args += ["/arch:AVX512"]
         else:
