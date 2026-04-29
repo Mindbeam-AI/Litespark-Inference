@@ -669,6 +669,62 @@ LSPK_API void relu2_mul_fp32_avx512(
     }
 }
 
+// Batched (T-token) versions of the per-row helpers used by prefill.
+// Each one processes T independent K-vectors in a single C call so the
+// ctypes round-trip and any thread-launch overhead amortize across T.
+
+LSPK_API void rmsnorm_bf16gamma_fp32_batched_avx512(
+    const float*    __restrict__ x,      // [T, K]
+    const uint16_t* __restrict__ gamma,  // [K]
+    float*          __restrict__ out,    // [T, K]
+    int T, int K, float eps
+) {
+#pragma omp parallel for if(T >= 2) schedule(static)
+    for (int t = 0; t < T; ++t) {
+        rmsnorm_bf16gamma_fp32_avx512(x + (ptrdiff_t)t * K, gamma, out + (ptrdiff_t)t * K, K, eps);
+    }
+}
+
+LSPK_API void rmsnorm_fp32gamma_fp32_batched_avx512(
+    const float* __restrict__ x,      // [T, K]
+    const float* __restrict__ gamma,  // [K]
+    float*       __restrict__ out,    // [T, K]
+    int T, int K, float eps
+) {
+#pragma omp parallel for if(T >= 2) schedule(static)
+    for (int t = 0; t < T; ++t) {
+        rmsnorm_fp32gamma_fp32_avx512(x + (ptrdiff_t)t * K, gamma, out + (ptrdiff_t)t * K, K, eps);
+    }
+}
+
+LSPK_API void quantize_activation_batched_avx512(
+    const float* __restrict__ x,         // [T, K]
+    int8_t*      __restrict__ x_int8,    // [T, K]
+    float*       __restrict__ out_scales,// [T]
+    int T, int K
+) {
+#pragma omp parallel for if(T >= 2) schedule(static)
+    for (int t = 0; t < T; ++t) {
+        out_scales[t] = quantize_activation_avx512(
+            x + (ptrdiff_t)t * K, x_int8 + (ptrdiff_t)t * K, K);
+    }
+}
+
+LSPK_API void relu2_mul_fp32_batched_avx512(
+    const float* __restrict__ gate, // [T, K]
+    const float* __restrict__ up,   // [T, K]
+    float*       __restrict__ out,  // [T, K]
+    int T, int K
+) {
+#pragma omp parallel for if(T >= 2) schedule(static)
+    for (int t = 0; t < T; ++t) {
+        relu2_mul_fp32_avx512(
+            gate + (ptrdiff_t)t * K, up + (ptrdiff_t)t * K,
+            out + (ptrdiff_t)t * K, K);
+    }
+}
+
+
 // In-place add: a += b.
 LSPK_API void add_inplace_fp32_avx512(
     float*       __restrict__ a,

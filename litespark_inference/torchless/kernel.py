@@ -213,6 +213,21 @@ def _load() -> ctypes.CDLL:
                [_I8, _F32, _U8, ctypes.c_float, _F32,
                 ctypes.c_int, ctypes.c_int, ctypes.c_int],
                None)
+    # Batched per-row helpers (rmsnorm, quantize, relu2_mul) that fold
+    # the prefill's T-loop into a single C call. x86 only today.
+    if _IS_X86 and hasattr(lib, f"rmsnorm_bf16gamma_fp32_batched_{T}"):
+        _alias("rmsnorm_bf16gamma_fp32_batched", f"rmsnorm_bf16gamma_fp32_batched_{T}",
+               [_F32, _U16, _F32, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+               None)
+        _alias("rmsnorm_fp32gamma_fp32_batched", f"rmsnorm_fp32gamma_fp32_batched_{T}",
+               [_F32, _F32, _F32, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+               None)
+        _alias("quantize_activation_batched", f"quantize_activation_batched_{T}",
+               [_F32, _I8, _F32, ctypes.c_int, ctypes.c_int],
+               None)
+        _alias("relu2_mul_fp32_batched", f"relu2_mul_fp32_batched_{T}",
+               [_F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+               None)
     _alias("quantize_activation", f"quantize_activation_{T}",
            [_F32, _I8, ctypes.c_int],
            ctypes.c_float)
@@ -374,6 +389,48 @@ def has_unpacked_matmul() -> bool:
 def has_batched_matmul() -> bool:
     """Return True if the kernel has the M>T (batched-prefill) matmul."""
     return hasattr(_load(), "matmul_lut_mT")
+
+
+def has_batched_helpers() -> bool:
+    """True if rmsnorm/quantize/relu2_mul have batched (T-folded) versions."""
+    return hasattr(_load(), "rmsnorm_bf16gamma_fp32_batched")
+
+
+def rmsnorm_into_batched(
+    x_fp32: np.ndarray,    # [T, K]
+    gamma: np.ndarray,
+    out_fp32: np.ndarray,  # [T, K]
+    eps: float = 1e-5,
+) -> np.ndarray:
+    T, K = x_fp32.shape
+    lib = _load()
+    if gamma.dtype == np.uint16:
+        lib.rmsnorm_bf16gamma_fp32_batched(x_fp32, gamma, out_fp32, T, K, eps)
+    elif gamma.dtype == np.float32:
+        lib.rmsnorm_fp32gamma_fp32_batched(x_fp32, gamma, out_fp32, T, K, eps)
+    else:
+        raise TypeError(f"gamma dtype must be uint16 or float32, got {gamma.dtype}")
+    return out_fp32
+
+
+def quantize_activation_batched(
+    x_fp32: np.ndarray,   # [T, K]
+    out_int8: np.ndarray, # [T, K]
+    out_scales: np.ndarray,  # [T]
+) -> np.ndarray:
+    T, K = x_fp32.shape
+    _load().quantize_activation_batched(x_fp32, out_int8, out_scales, T, K)
+    return out_scales
+
+
+def relu2_mul_into_batched(
+    gate_fp32: np.ndarray,  # [T, K]
+    up_fp32: np.ndarray,    # [T, K]
+    out_fp32: np.ndarray,   # [T, K]
+) -> np.ndarray:
+    T, K = gate_fp32.shape
+    _load().relu2_mul_fp32_batched(gate_fp32, up_fp32, out_fp32, T, K)
+    return out_fp32
 
 
 def matmul_packed_mT(

@@ -25,13 +25,19 @@ import numpy as np
 
 from .kernel import (
     add_inplace as _add_inplace,
+    has_batched_helpers as _has_batched_helpers,
+    has_batched_matmul as _has_batched_matmul,
     lm_head_bf16 as _lm_head_bf16,
     lm_head_int4 as _lm_head_int4,
     lm_head_int8 as _lm_head_int8,
     matmul_packed_m1,
+    matmul_packed_mT as _matmul_packed_mT,
     quantize_activation as _quant_neon,
+    quantize_activation_batched as _quant_batched,
     relu2_mul_into as _relu2_mul,
+    relu2_mul_into_batched as _relu2_mul_batched,
     rmsnorm_into as _rmsnorm_neon,
+    rmsnorm_into_batched as _rmsnorm_batched,
 )
 from .model import PackedBitNetModel, PackedProjection
 from .ops import (
@@ -239,6 +245,134 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
     return logits
 
 
+def forward_prefill(
+    model: PackedBitNetModel, state: InferState, token_ids: list[int],
+) -> np.ndarray:
+    """
+    Run a forward pass for T prompt tokens at once and return the final-
+    position logits (the only thing decode needs from prefill).
+
+    Each projection is one batched M=T matmul kernel call instead of T
+    M=1 calls; per-token weight reads are amortized and the unpack
+    happens once per row regardless of T. Attention is still computed
+    per token to keep the causal-mask logic simple -- the matmul
+    savings are the dominant win.
+
+    Falls back to the M=1 forward_one loop on platforms without the
+    batched kernel (e.g. ARM NEON build today).
+    """
+    T = len(token_ids)
+    if T == 0:
+        raise ValueError("token_ids must be non-empty")
+    if T == 1 or not _has_batched_matmul():
+        logits = None
+        for tid in token_ids:
+            logits = forward_one(model, state, int(tid))
+        return logits  # type: ignore[return-value]
+
+    c = model.config
+    H = c.hidden_size
+    I_dim = c.intermediate_size
+    D = H // c.num_heads
+    Q = c.num_heads
+    KV = c.num_kv_heads
+    GQA = Q // KV
+    inv_sqrt_d = 1.0 / float(np.sqrt(D))
+
+    if state.pos + T > state.t_max:
+        raise RuntimeError(
+            f"prefill would exceed t_max: pos={state.pos} T={T} t_max={state.t_max}"
+        )
+
+    # Build [T, H] residual stream from the embedding lookup.
+    x = np.empty((T, H), dtype=np.float32)
+    for t, tid in enumerate(token_ids):
+        x[t] = _embed_lookup(model, int(tid))
+
+    # Per-T scratch (sized once; reused across layers).
+    h_fp     = np.empty((T, H),     dtype=np.float32)
+    h_i8     = np.empty((T, H),     dtype=np.int8)
+    h_scales = np.empty(T,          dtype=np.float32)
+    i_fp     = np.empty((T, I_dim), dtype=np.float32)
+    i_i8     = np.empty((T, I_dim), dtype=np.int8)
+    i_scales = np.empty(T,          dtype=np.float32)
+    attn_out = np.empty((T, H),     dtype=np.float32)
+    inter    = np.empty((T, I_dim), dtype=np.float32)
+
+    base_pos = state.pos
+    use_batched_helpers = _has_batched_helpers()
+
+    def _rmsq(src, gamma, fp_out, i8_out, scales_out):
+        """RMSNorm + per-token absmax int8 quantize over the T-batch."""
+        if use_batched_helpers:
+            _rmsnorm_batched(src, gamma, fp_out, eps=c.rms_norm_eps)
+            _quant_batched(fp_out, i8_out, scales_out)
+        else:
+            for t in range(T):
+                _rmsnorm_neon(src[t], gamma, fp_out[t], eps=c.rms_norm_eps)
+                scales_out[t] = _quant_neon(fp_out[t], i8_out[t])
+
+    for li, layer in enumerate(model.layers):
+        # ---- Attention block ----
+        _rmsq(x, layer.input_norm, h_fp, h_i8, h_scales)
+
+        q_all = _matmul_packed_mT(h_i8, h_scales, layer.q_proj.w_packed, layer.q_proj.scale)
+        k_all = _matmul_packed_mT(h_i8, h_scales, layer.k_proj.w_packed, layer.k_proj.scale)
+        v_all = _matmul_packed_mT(h_i8, h_scales, layer.v_proj.w_packed, layer.v_proj.scale)
+
+        # Apply RoPE per token, write KV cache.
+        for t in range(T):
+            pos = base_pos + t
+            cos_row = state.rope_cos[pos]
+            sin_row = state.rope_sin[pos]
+            q_t = apply_rope(q_all[t].reshape(Q, D), cos_row, sin_row)
+            k_t = apply_rope(k_all[t].reshape(KV, D), cos_row, sin_row)
+            q_all[t] = q_t.reshape(-1)
+            state.cache_k[li, pos] = k_t
+            state.cache_v[li, pos] = v_all[t].reshape(KV, D)
+
+        # Causal attention, per token.
+        for t in range(T):
+            pos = base_pos + t
+            q = q_all[t].reshape(Q, D)
+            k_hist = state.cache_k[li, :pos + 1]   # [pos+1, KV, D]
+            v_hist = state.cache_v[li, :pos + 1]
+            q_grouped = q.reshape(KV, GQA, D)
+            k_perm = k_hist.transpose(1, 0, 2)
+            scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))
+            scores *= inv_sqrt_d
+            weights = softmax(scores, axis=-1)
+            v_perm = v_hist.transpose(1, 0, 2)
+            attn = np.matmul(weights, v_perm)
+            attn_out[t] = np.ascontiguousarray(attn.reshape(Q * D))
+
+        _rmsq(attn_out, layer.attn_sub_norm, h_fp, h_i8, h_scales)
+        o_all = _matmul_packed_mT(h_i8, h_scales, layer.o_proj.w_packed, layer.o_proj.scale)
+        x += o_all                                  # residual: x[T, H] += o[T, H]
+
+        # ---- MLP block ----
+        _rmsq(x, layer.post_attn_norm, h_fp, h_i8, h_scales)
+        gate_all = _matmul_packed_mT(h_i8, h_scales, layer.gate_proj.w_packed, layer.gate_proj.scale)
+        up_all   = _matmul_packed_mT(h_i8, h_scales, layer.up_proj.w_packed,   layer.up_proj.scale)
+
+        if use_batched_helpers:
+            _relu2_mul_batched(gate_all, up_all, inter)
+        else:
+            for t in range(T):
+                _relu2_mul(gate_all[t], up_all[t], inter[t])
+        _rmsq(inter, layer.ffn_sub_norm, i_fp, i_i8, i_scales)
+        down_all = _matmul_packed_mT(i_i8, i_scales, layer.down_proj.w_packed, layer.down_proj.scale)
+        x += down_all                               # residual
+
+    state.pos = base_pos + T
+
+    # Only the last position's logits matter for next-token prediction.
+    last = np.ascontiguousarray(x[-1])
+    final = state.sc_hidden_norm
+    _rmsnorm_neon(last, model.final_norm, final, eps=c.rms_norm_eps)
+    return _lm_head(model, final, state.sc_logits)
+
+
 def generate(
     model: PackedBitNetModel,
     prompt_token_ids: list[int],
@@ -258,13 +392,8 @@ def generate(
             f"provided state has t_max={state.t_max}, need at least {t_max}"
         )
 
-    # Prefill
-    logits = None
-    for tid in prompt_token_ids:
-        logits = forward_one(model, state, int(tid))
-
-    if logits is None:
-        raise ValueError("prompt_token_ids must be non-empty")
+    # Prefill (batched if available)
+    logits = forward_prefill(model, state, list(prompt_token_ids))
 
     # Greedy decode
     generated: list[int] = []

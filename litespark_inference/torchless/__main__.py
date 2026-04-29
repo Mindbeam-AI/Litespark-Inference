@@ -32,7 +32,7 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 def cmd_generate(args: argparse.Namespace) -> int:
     from . import load_bitnet_2b, load_tokenizer
-    from .runtime import forward_one, generate, init_state
+    from .runtime import forward_one, forward_prefill, generate, init_state
 
     print(f"Loading tokenizer...", flush=True)
     t0 = time.perf_counter()
@@ -52,12 +52,10 @@ def cmd_generate(args: argparse.Namespace) -> int:
     t_max = len(prompt_ids) + args.max_tokens + 1
     state = init_state(model, t_max=t_max)
 
-    # Prefill
+    # Prefill (batched M=T when the kernel supports it)
     print("Prefill...", flush=True)
     t0 = time.perf_counter()
-    logits = None
-    for tid in prompt_ids:
-        logits = forward_one(model, state, int(tid))
+    logits = forward_prefill(model, state, list(prompt_ids))
     prefill_t = time.perf_counter() - t0
     print(f"  {len(prompt_ids)} tokens in {prefill_t:.2f}s "
           f"({len(prompt_ids)/prefill_t:.2f} tok/s)")
