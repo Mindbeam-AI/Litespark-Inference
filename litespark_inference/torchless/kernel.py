@@ -207,6 +207,12 @@ def _load() -> ctypes.CDLL:
         _alias("matmul_unpacked_m1", f"matmul_unpacked_{T}_m1",
                [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
                None)
+    # Batched (M=T) matmul for prefill: x86 only today.
+    if _IS_X86 and hasattr(lib, f"matmul_lut_{T}_mT"):
+        _alias("matmul_lut_mT", f"matmul_lut_{T}_mT",
+               [_I8, _F32, _U8, ctypes.c_float, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
     _alias("quantize_activation", f"quantize_activation_{T}",
            [_F32, _I8, ctypes.c_int],
            ctypes.c_float)
@@ -363,6 +369,34 @@ def has_unpacked_matmul() -> bool:
     `LITESPARK_PREUNPACK=1` storage on whether the runtime can use it.
     """
     return hasattr(_load(), "matmul_unpacked_m1")
+
+
+def has_batched_matmul() -> bool:
+    """Return True if the kernel has the M>T (batched-prefill) matmul."""
+    return hasattr(_load(), "matmul_lut_mT")
+
+
+def matmul_packed_mT(
+    x_int8: np.ndarray,         # [T, K] int8
+    x_scales: np.ndarray,       # [T] fp32
+    packed_w: np.ndarray,       # [N, K/4] uint8
+    w_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Batched ternary matmul for M=T (prefill).
+
+    Returns y of shape [T, N] fp32. The kernel unpacks each weight row
+    once and reuses it across the T tokens, amortizing both the unpack
+    cost and the weight memory read.
+    """
+    T, K = x_int8.shape
+    N, Kb = packed_w.shape
+    assert Kb * 4 == K, f"K mismatch: {K} vs Kb*4={Kb*4}"
+    if out is None:
+        out = np.empty((T, N), dtype=np.float32)
+    _load().matmul_lut_mT(x_int8, x_scales, packed_w, w_scale, out, T, N, K)
+    return out
 
 
 def matmul_unpacked_m1(

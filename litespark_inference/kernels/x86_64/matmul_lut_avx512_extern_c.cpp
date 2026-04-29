@@ -235,6 +235,110 @@ LSPK_API void matmul_lut_avx512_m1(
     }
 }
 
+// Batched (M=T tokens) matmul with the same packed weights. Used by the
+// prefill path so a T-token prompt costs one matmul kernel call per
+// projection instead of T calls. Per output row we unpack the weights
+// ONCE and then issue T VPDPBUSDs against the T per-token activations,
+// amortizing the unpack and the weight read across the whole batch.
+//
+// Layout:
+//   x:        int8 [T, K]   row-major; x[t, k] at x[t*K + k]
+//   x_scales: fp32 [T]
+//   packed_w: uint8 [N, K/4] (same as the M=1 kernel)
+//   w_scale:  fp32 (per-tensor)
+//   y:        fp32 [T, N]   row-major
+//
+// T cap is 64 -- bigger batches should chunk on the caller side. Each
+// active token holds one int32 accumulator in zmm; with T=64 the
+// compiler will spill some, but correctness is preserved and the win
+// over T M=1 calls is the shared unpack and the shared L1 weight read,
+// not register-resident accumulators.
+#define LSPK_MAX_T 64
+
+LSPK_API void matmul_lut_avx512_mT(
+    const int8_t*  __restrict__ x,
+    const float*   __restrict__ x_scales,
+    const uint8_t* __restrict__ packed_w,
+    float w_scale,
+    float* __restrict__ y,
+    int T, int N, int K
+) {
+    if (T <= 0 || T > LSPK_MAX_T) return;
+    const int Kb = K >> 2;
+
+    // Per-token sum(x) for the +1 bias correction (unsigned-nibble dot).
+    int32_t sum_x[LSPK_MAX_T];
+    {
+        const __m512i ones_u8 = _mm512_set1_epi8(1);
+        for (int t = 0; t < T; ++t) {
+            __m512i sx_v = _mm512_setzero_si512();
+            const int8_t* xt = x + static_cast<ptrdiff_t>(t) * K;
+            int k = 0;
+            for (; k + 64 <= K; k += 64) {
+                const __m512i x64 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(xt + k));
+                sx_v = _mm512_dpbusd_epi32(sx_v, ones_u8, x64);
+            }
+            int32_t s = _mm512_reduce_add_epi32(sx_v);
+            for (; k < K; ++k) s += static_cast<int32_t>(xt[k]);
+            sum_x[t] = s;
+        }
+    }
+
+#pragma omp parallel for if(N >= 64) schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* row = packed_w + static_cast<ptrdiff_t>(n) * Kb;
+
+        __m512i acc[LSPK_MAX_T];
+        for (int t = 0; t < T; ++t) acc[t] = _mm512_setzero_si512();
+
+        int kb = 0;
+        // Inner loop: 16 packed bytes / 64 unsigned nibbles unpacked
+        // ONCE, then T VPDPBUSDs against the T per-token activation
+        // chunks. T independent accumulators break the dep chain.
+        for (; kb + 16 <= Kb; kb += 16) {
+            const __m128i packed = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(row + kb));
+            const __m512i n_chunk = unpack_64_unsigned(packed);
+            const int kx = kb << 2;
+            for (int t = 0; t < T; ++t) {
+                const __m512i x_chunk = _mm512_loadu_si512(
+                    reinterpret_cast<const __m512i*>(x + static_cast<ptrdiff_t>(t) * K + kx));
+                acc[t] = _mm512_dpbusd_epi32(acc[t], n_chunk, x_chunk);
+            }
+        }
+
+        // Reduce per-token accumulators -> int32 partial sums.
+        int32_t partial[LSPK_MAX_T];
+        for (int t = 0; t < T; ++t) {
+            partial[t] = _mm512_reduce_add_epi32(acc[t]);
+        }
+
+        // Tail: byte at a time, unbiased.
+        for (; kb < Kb; ++kb) {
+            const uint8_t b = row[kb];
+            const int kx = kb << 2;
+            const int32_t n0 = (b >> 0) & 0x3;
+            const int32_t n1 = (b >> 2) & 0x3;
+            const int32_t n2 = (b >> 4) & 0x3;
+            const int32_t n3 = (b >> 6) & 0x3;
+            for (int t = 0; t < T; ++t) {
+                const int8_t* xt = x + static_cast<ptrdiff_t>(t) * K;
+                partial[t] += n0 * static_cast<int32_t>(xt[kx + 0])
+                           +  n1 * static_cast<int32_t>(xt[kx + 1])
+                           +  n2 * static_cast<int32_t>(xt[kx + 2])
+                           +  n3 * static_cast<int32_t>(xt[kx + 3]);
+            }
+        }
+
+        for (int t = 0; t < T; ++t) {
+            const float scale_t = x_scales[t] * w_scale;
+            y[static_cast<ptrdiff_t>(t) * N + n] =
+                static_cast<float>(partial[t] - sum_x[t]) * scale_t;
+        }
+    }
+}
+
+
 // Same matmul as above but consumes PRE-UNPACKED weights (one u8 per
 // weight in [0,1,2] -- the same encoding the packed format would expand
 // to but stored 4x bigger). Saves the entire port-5 unpack chain at the
