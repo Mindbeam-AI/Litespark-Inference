@@ -13,11 +13,14 @@ runtime measured ~600 MB live RSS for a fully-loaded BitNet-2B in a numpy-only
 POC.
 """
 
+from .api import BitNet, GenResult
 from .loader import load_bitnet_2b
 from .model import PackedBitNetModel
 from .tokenizer import BitNetTokenizer, load_tokenizer
 
 __all__ = [
+    "BitNet",
+    "GenResult",
     "load_bitnet_2b",
     "PackedBitNetModel",
     "BitNetTokenizer",
