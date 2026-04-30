@@ -962,6 +962,111 @@ LSPK_API void transpose_packed_to_amx_vnni(
 #endif  // LITESPARK_USE_AMX
 
 
+// Fused RMSNorm + per-tensor absmax int8 quantize.
+//
+// Single pass through x for sum-of-squares, then a single pass that
+// computes v = x * rrms * gamma, tracks absmax, and writes int8 once
+// scale is known. Saves the round-trip through the fp32 RMSNorm output
+// buffer plus one ctypes call per (rmsnorm, quantize) pair (4 per layer
+// in the BitNet forward).
+//
+// Returns the absmax scale (= max|v| / 127, clamped at 1e-5/127 floor).
+// Two variants: bf16 gamma (uint16) and fp32 gamma.
+static inline float _rmsnorm_quantize_core_bf16(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ gamma,
+    int8_t* __restrict__ x_int8_out,
+    int K, float eps,
+    float* tmp_fp32  // scratch [K]
+) {
+    // Pass 1: sum of squares.
+    __m512 ssq = _mm512_setzero_ps();
+    int k = 0;
+    for (; k + 16 <= K; k += 16) {
+        const __m512 v = _mm512_loadu_ps(x + k);
+        ssq = _mm512_fmadd_ps(v, v, ssq);
+    }
+    float sum_sq = hsum_f32_x16(ssq);
+    for (; k < K; ++k) sum_sq += x[k] * x[k];
+    const float rrms = 1.0f / std::sqrt(sum_sq / static_cast<float>(K) + eps);
+    const __m512 rrms_v = _mm512_set1_ps(rrms);
+
+    // Pass 2: write tmp_fp32 = x * rrms * gamma; track absmax.
+    __m512 absmax_v = _mm512_setzero_ps();
+    const __m512 sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
+    k = 0;
+    for (; k + 16 <= K; k += 16) {
+        const __m512 vx = _mm512_loadu_ps(x + k);
+        const __m256i g16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(gamma + k));
+        const __m512i g32 = _mm512_cvtepu16_epi32(g16);
+        const __m512  g   = _mm512_castsi512_ps(_mm512_slli_epi32(g32, 16));
+        const __m512  out = _mm512_mul_ps(_mm512_mul_ps(vx, rrms_v), g);
+        _mm512_storeu_ps(tmp_fp32 + k, out);
+        absmax_v = _mm512_max_ps(absmax_v, _mm512_and_ps(out, sign_mask));
+    }
+    float absmax = _mm512_reduce_max_ps(absmax_v);
+    for (; k < K; ++k) {
+        uint32_t gbits = static_cast<uint32_t>(gamma[k]) << 16;
+        float gv;
+        std::memcpy(&gv, &gbits, sizeof(float));
+        const float v = x[k] * rrms * gv;
+        tmp_fp32[k] = v;
+        const float a = std::fabs(v);
+        if (a > absmax) absmax = a;
+    }
+    if (absmax < 1e-5f) absmax = 1e-5f;
+    const float scale = absmax / 127.0f;
+    const float inv_scale = 1.0f / scale;
+
+    // Pass 3: quantize tmp_fp32 to int8.
+    const __m512 inv_v = _mm512_set1_ps(inv_scale);
+    k = 0;
+    for (; k + 16 <= K; k += 16) {
+        const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(tmp_fp32 + k), inv_v);
+        const __m512i i32 = _mm512_cvtps_epi32(v);
+        const __m128i i8  = _mm512_cvtsepi32_epi8(i32);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(x_int8_out + k), i8);
+    }
+    for (; k < K; ++k) {
+        float v = tmp_fp32[k] * inv_scale;
+        int32_t iv = static_cast<int32_t>(std::round(v));
+        if (iv >  127) iv =  127;
+        if (iv < -127) iv = -127;
+        x_int8_out[k] = static_cast<int8_t>(iv);
+    }
+    return scale;
+}
+
+LSPK_API float rmsnorm_quantize_bf16gamma_avx512(
+    const float*    __restrict__ x,
+    const uint16_t* __restrict__ gamma,
+    int8_t*         __restrict__ x_int8_out,
+    float*          __restrict__ tmp_fp32,
+    int K, float eps
+) {
+    return _rmsnorm_quantize_core_bf16(x, gamma, x_int8_out, K, eps, tmp_fp32);
+}
+
+LSPK_API void rmsnorm_quantize_bf16gamma_batched_avx512(
+    const float*    __restrict__ x,           // [T, K]
+    const uint16_t* __restrict__ gamma,       // [K]
+    int8_t*         __restrict__ x_int8_out,  // [T, K]
+    float*          __restrict__ scales_out,  // [T]
+    float*          __restrict__ tmp_fp32,    // [T, K]
+    int T, int K, float eps
+) {
+#pragma omp parallel for if(T >= 2) schedule(static)
+    for (int t = 0; t < T; ++t) {
+        scales_out[t] = _rmsnorm_quantize_core_bf16(
+            x + (ptrdiff_t)t * K,
+            gamma,
+            x_int8_out + (ptrdiff_t)t * K,
+            K, eps,
+            tmp_fp32 + (ptrdiff_t)t * K);
+    }
+}
+
+
 // Batched (T-token) versions of the per-row helpers used by prefill.
 // Each one processes T independent K-vectors in a single C call so the
 // ctypes round-trip and any thread-launch overhead amortize across T.

@@ -228,6 +228,14 @@ def _load() -> ctypes.CDLL:
                None)
         _alias("amx_request_permission", "amx_request_permission",
                [], ctypes.c_int)
+    # Fused rmsnorm+quantize (single pass + single ctypes call). x86 only.
+    if _IS_X86 and hasattr(lib, f"rmsnorm_quantize_bf16gamma_{T}"):
+        _alias("rmsnorm_quantize_bf16gamma", f"rmsnorm_quantize_bf16gamma_{T}",
+               [_F32, _U16, _I8, _F32, ctypes.c_int, ctypes.c_float],
+               ctypes.c_float)
+        _alias("rmsnorm_quantize_bf16gamma_batched", f"rmsnorm_quantize_bf16gamma_batched_{T}",
+               [_F32, _U16, _I8, _F32, _F32, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+               None)
     # Batched per-row helpers (rmsnorm, quantize, relu2_mul) that fold
     # the prefill's T-loop into a single C call. x86 only today.
     if _IS_X86 and hasattr(lib, f"rmsnorm_bf16gamma_fp32_batched_{T}"):
@@ -409,6 +417,40 @@ def has_batched_matmul() -> bool:
 def has_batched_helpers() -> bool:
     """True if rmsnorm/quantize/relu2_mul have batched (T-folded) versions."""
     return hasattr(_load(), "rmsnorm_bf16gamma_fp32_batched")
+
+
+def has_fused_rmsnorm_quantize() -> bool:
+    """True if the fused rmsnorm+quantize kernel is available."""
+    return hasattr(_load(), "rmsnorm_quantize_bf16gamma")
+
+
+def rmsnorm_quantize_into(
+    x_fp32: np.ndarray,    # [K]
+    gamma: np.ndarray,     # [K] uint16 (bf16) only for now
+    x_int8_out: np.ndarray,# [K]
+    tmp_fp32: np.ndarray,  # [K] scratch (reused buffer)
+    eps: float = 1e-5,
+) -> float:
+    """Fused RMSNorm + per-tensor absmax int8 quantize. bf16 gamma only."""
+    K = x_fp32.shape[0]
+    return float(_load().rmsnorm_quantize_bf16gamma(
+        x_fp32, gamma, x_int8_out, tmp_fp32, K, eps,
+    ))
+
+
+def rmsnorm_quantize_batched(
+    x_fp32: np.ndarray,    # [T, K]
+    gamma: np.ndarray,     # [K] uint16
+    x_int8_out: np.ndarray,# [T, K]
+    scales_out: np.ndarray,# [T]
+    tmp_fp32: np.ndarray,  # [T, K] scratch
+    eps: float = 1e-5,
+) -> np.ndarray:
+    T, K = x_fp32.shape
+    _load().rmsnorm_quantize_bf16gamma_batched(
+        x_fp32, gamma, x_int8_out, scales_out, tmp_fp32, T, K, eps,
+    )
+    return scales_out
 
 
 _amx_perm_requested = False

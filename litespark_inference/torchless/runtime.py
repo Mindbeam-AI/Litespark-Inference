@@ -28,6 +28,7 @@ from .kernel import (
     has_amx as _has_amx,
     has_batched_helpers as _has_batched_helpers,
     has_batched_matmul as _has_batched_matmul,
+    has_fused_rmsnorm_quantize as _has_fused_rmsq,
     lm_head_bf16 as _lm_head_bf16,
     lm_head_int4 as _lm_head_int4,
     lm_head_int8 as _lm_head_int8,
@@ -41,6 +42,8 @@ from .kernel import (
     relu2_mul_into_batched as _relu2_mul_batched,
     rmsnorm_into as _rmsnorm_neon,
     rmsnorm_into_batched as _rmsnorm_batched,
+    rmsnorm_quantize_into as _rmsq_fused,
+    rmsnorm_quantize_batched as _rmsq_fused_batched,
 )
 from .model import PackedBitNetModel, PackedProjection
 from .ops import (
@@ -191,10 +194,18 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
     h_fp = state.sc_hidden_norm    # fp32 scratch for hidden-sized rmsnorm outputs
     i_fp = state.sc_inter_norm     # fp32 scratch for inter-sized rmsnorm outputs
 
+    use_fused = _has_fused_rmsq()
+
+    def _rmsq1(src, gamma, fp_scratch, i8_out):
+        """M=1 RMSNorm + int8 quant. Fused single-pass kernel when bf16."""
+        if use_fused and gamma.dtype == np.uint16:
+            return _rmsq_fused(src, gamma, i8_out, fp_scratch, eps=c.rms_norm_eps)
+        _rmsnorm_neon(src, gamma, fp_scratch, eps=c.rms_norm_eps)
+        return _quant_neon(fp_scratch, i8_out)
+
     for li, layer in enumerate(model.layers):
         # ---- Attention ----
-        _rmsnorm_neon(x, layer.input_norm, h_fp, eps=c.rms_norm_eps)
-        h_scale = _quant_neon(h_fp, h_i8)
+        h_scale = _rmsq1(x, layer.input_norm, h_fp, h_i8)
         q_flat = _call_matmul(h_i8, h_scale, layer.q_proj, state.sc_q)
         k_flat = _call_matmul(h_i8, h_scale, layer.k_proj, state.sc_k)
         v_flat = _call_matmul(h_i8, h_scale, layer.v_proj, state.sc_v)
@@ -220,20 +231,17 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
         attn = np.matmul(weights, v_perm)            # [KV, GQA, D]
         attn_flat = np.ascontiguousarray(attn.reshape(Q * D))
 
-        _rmsnorm_neon(attn_flat, layer.attn_sub_norm, h_fp, eps=c.rms_norm_eps)
-        attn_scale = _quant_neon(h_fp, h_i8)
+        attn_scale = _rmsq1(attn_flat, layer.attn_sub_norm, h_fp, h_i8)
         _call_matmul(h_i8, attn_scale, layer.o_proj, state.sc_hidden_a)
         _add_inplace(x, state.sc_hidden_a)           # x += o_out
 
         # ---- MLP ----
-        _rmsnorm_neon(x, layer.post_attn_norm, h_fp, eps=c.rms_norm_eps)
-        h_scale = _quant_neon(h_fp, h_i8)
+        h_scale = _rmsq1(x, layer.post_attn_norm, h_fp, h_i8)
         _call_matmul(h_i8, h_scale, layer.gate_proj, state.sc_inter_a)
         _call_matmul(h_i8, h_scale, layer.up_proj,   state.sc_inter_b)
         # inter = relu2(gate) * up   -> overwrite sc_inter_a in-place.
         _relu2_mul(state.sc_inter_a, state.sc_inter_b, state.sc_inter_a)
-        _rmsnorm_neon(state.sc_inter_a, layer.ffn_sub_norm, i_fp, eps=c.rms_norm_eps)
-        inter_scale = _quant_neon(i_fp, i_i8)
+        inter_scale = _rmsq1(state.sc_inter_a, layer.ffn_sub_norm, i_fp, i_i8)
         _call_matmul(i_i8, inter_scale, layer.down_proj, state.sc_hidden_b)
         _add_inplace(x, state.sc_hidden_b)           # x += down_out
 
@@ -291,43 +299,41 @@ def _forward_prefill_hidden(
 
     base_pos = state.pos
     use_batched_helpers = _has_batched_helpers()
+    use_fused_rmsq = _has_fused_rmsq()
     use_amx = _has_amx() and any(getattr(L.q_proj, "w_amx", None) is not None for L in model.layers)
 
     def _matmul_proj(x_int8_all, x_scales_all, proj):
         """Dispatch matmul on (T, kernel availability):
 
-          - T == 1: caller uses M=1 forward_one (not this function)
-          - 8 <= T <= 16 with AMX:  phase 9 AMX (1 tile, no padding)
-          - 17 <= T <= 64 with AMX: phase 10 AMX (multi-tile B reuse).
-                                    Pad to 16-multiple and trim outputs.
-          - otherwise:              VNNI M=T
+          - 8 <= T <= 16 with AMX:        phase 9 AMX (1 tile, no padding)
+          - T in {32, 48, 64} with AMX:   phase 10 AMX (multi-tile B reuse)
+          - otherwise:                    VNNI M=T
 
-        AMX always does full 16-row TMUL; padding is junk that we
-        discard. For T<8 the per-call AMX overhead loses to linear-
-        in-T VNNI; for T>64 we'd need >4 C tiles which exceeds the
-        AMX 8-tile budget.
+        We only take the phase 10 path on exact 16-multiples because the
+        zero-padding alloc + trim costs we measured for non-multiples
+        (e.g. T=35 -> pad to 48) eat the kernel speedup. A pre-allocated
+        scratch buffer in InferState would fix that; left as future work.
+        For T<8 the per-call AMX overhead loses to linear-in-T VNNI; for
+        T>64 we'd need >4 C tiles which exceeds the AMX 8-tile budget.
         """
         T_local = x_int8_all.shape[0]
-        N_local = proj.out_features
         w_amx = getattr(proj, "w_amx", None)
-        if use_amx and w_amx is not None and T_local <= 64:
+        if use_amx and w_amx is not None:
             if 8 <= T_local <= 16:
                 return _matmul_amx_mT(x_int8_all, x_scales_all, w_amx, proj.scale)
-            if T_local > 16:
-                T_padded = ((T_local + 15) // 16) * 16
-                if T_padded == T_local:
-                    return _matmul_amx_mT_padded(x_int8_all, x_scales_all, w_amx, proj.scale)
-                # Pad x and scales with zeros, then trim outputs.
-                x_padded = np.zeros((T_padded, x_int8_all.shape[1]), dtype=np.int8)
-                x_padded[:T_local] = x_int8_all
-                s_padded = np.zeros(T_padded, dtype=np.float32)
-                s_padded[:T_local] = x_scales_all
-                y_padded = _matmul_amx_mT_padded(x_padded, s_padded, w_amx, proj.scale)
-                return np.ascontiguousarray(y_padded[:T_local])
+            if T_local in (32, 48, 64):
+                return _matmul_amx_mT_padded(x_int8_all, x_scales_all, w_amx, proj.scale)
         return _matmul_packed_mT(x_int8_all, x_scales_all, proj.w_packed, proj.scale)
 
     def _rmsq(src, gamma, fp_out, i8_out, scales_out):
-        """RMSNorm + per-token absmax int8 quantize over the T-batch."""
+        """RMSNorm + per-token absmax int8 quantize over the T-batch.
+
+        Prefer the fused single-pass kernel when available AND gamma is
+        bf16 (uint16); fall back to the two separate calls otherwise.
+        """
+        if use_fused_rmsq and gamma.dtype == np.uint16:
+            _rmsq_fused_batched(src, gamma, i8_out, scales_out, fp_out, eps=c.rms_norm_eps)
+            return
         if use_batched_helpers:
             _rmsnorm_batched(src, gamma, fp_out, eps=c.rms_norm_eps)
             _quant_batched(fp_out, i8_out, scales_out)
