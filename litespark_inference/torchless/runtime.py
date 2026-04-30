@@ -247,30 +247,17 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
     return logits
 
 
-def forward_prefill(
+def _forward_prefill_hidden(
     model: PackedBitNetModel, state: InferState, token_ids: list[int],
-) -> np.ndarray:
-    """
-    Run a forward pass for T prompt tokens at once and return the final-
-    position logits (the only thing decode needs from prefill).
-
-    Each projection is one batched M=T matmul kernel call instead of T
-    M=1 calls; per-token weight reads are amortized and the unpack
-    happens once per row regardless of T. Attention is still computed
-    per token to keep the causal-mask logic simple -- the matmul
-    savings are the dominant win.
-
-    Falls back to the M=1 forward_one loop on platforms without the
-    batched kernel (e.g. ARM NEON build today).
-    """
+) -> "np.ndarray | None":
+    """Internal: run the layer loop for T tokens and return the post-final-
+    rmsnorm hidden state [T, H] for ALL positions, or None on the M=1
+    fallback path. Caller is responsible for the LM head."""
     T = len(token_ids)
     if T == 0:
         raise ValueError("token_ids must be non-empty")
     if T == 1 or not _has_batched_matmul():
-        logits = None
-        for tid in token_ids:
-            logits = forward_one(model, state, int(tid))
-        return logits  # type: ignore[return-value]
+        return None  # caller handles M=1 path
 
     c = model.config
     H = c.hidden_size
@@ -392,11 +379,244 @@ def forward_prefill(
 
     state.pos = base_pos + T
 
-    # Only the last position's logits matter for next-token prediction.
-    last = np.ascontiguousarray(x[-1])
-    final = state.sc_hidden_norm
-    _rmsnorm_neon(last, model.final_norm, final, eps=c.rms_norm_eps)
-    return _lm_head(model, final, state.sc_logits)
+    # Final RMSNorm over all T positions, then return hidden state.
+    final_all = np.empty((T, H), dtype=np.float32)
+    if use_batched_helpers:
+        _rmsnorm_batched(x, model.final_norm, final_all, eps=c.rms_norm_eps)
+    else:
+        for t in range(T):
+            _rmsnorm_neon(x[t], model.final_norm, final_all[t], eps=c.rms_norm_eps)
+    return final_all
+
+
+def forward_prefill(
+    model: PackedBitNetModel, state: InferState, token_ids: list[int],
+) -> np.ndarray:
+    """
+    Run a forward pass for T prompt tokens at once and return the final-
+    position logits (the only thing decode needs from prefill).
+
+    Falls back to forward_one * T on platforms without the batched
+    matmul kernel (e.g. ARM NEON build today).
+    """
+    final_all = _forward_prefill_hidden(model, state, list(token_ids))
+    if final_all is None:
+        # M=1 fallback (T=1 or no batched kernel)
+        logits = None
+        for tid in token_ids:
+            logits = forward_one(model, state, int(tid))
+        return logits  # type: ignore[return-value]
+    return _lm_head(model, np.ascontiguousarray(final_all[-1]), state.sc_logits)
+
+
+def forward_prefill_all_logits(
+    model: PackedBitNetModel, state: InferState, token_ids: list[int],
+) -> np.ndarray:
+    """Same as forward_prefill but returns logits for ALL T positions.
+
+    Used by speculative-decode validation: we need the model's prediction
+    after every speculatively-fed token to decide which ones to accept.
+
+    Returns array of shape [T, vocab_size] fp32.
+    """
+    T = len(token_ids)
+    if T == 0:
+        raise ValueError("token_ids must be non-empty")
+
+    final_all = _forward_prefill_hidden(model, state, list(token_ids))
+    if final_all is None:
+        # M=1 fallback: forward_one each token, collect each logits.
+        out = np.empty((T, model.config.vocab_size), dtype=np.float32)
+        for t, tid in enumerate(token_ids):
+            out[t] = forward_one(model, state, int(tid))
+        return out
+
+    # Batched path: T LM heads over the per-position post-final-norm
+    # hidden states. Each LM head is independent; iterate in Python --
+    # for T <= 16 the LM head cost is small relative to the layer work
+    # we just did.
+    out = np.empty((T, model.config.vocab_size), dtype=np.float32)
+    for t in range(T):
+        h = np.ascontiguousarray(final_all[t])
+        _lm_head(model, h, out[t])
+    return out
+
+
+def _lookup_speculation(
+    context: list[int], match_n: int, k: int,
+) -> list[int]:
+    """Prompt-lookup speculation (Saxena 2023): scan `context` from end to
+    find an n-gram whose tail matches the most recent `match_n` tokens of
+    context. Return the next `k` tokens after the longest such match.
+    Empty list if no match.
+
+    Tries n in [match_n, match_n-1, ..., 2] in order, returning the
+    candidates from the FIRST n that finds a match. Latest match wins
+    (search backwards).
+    """
+    L = len(context)
+    if L < 2 or k <= 0:
+        return []
+    for n in range(min(match_n, L - 1), 1, -1):
+        needle = context[L - n:]
+        # Search backwards (i is the start index of an n-gram in context).
+        # Skip the trivial match at the end (i = L - n).
+        for i in range(L - n - 1, -1, -1):
+            if context[i:i + n] == needle:
+                # Take the next k tokens after the match.
+                start = i + n
+                end = min(start + k, L)
+                cand = context[start:end]
+                if cand:
+                    return cand
+    return []
+
+
+def generate_speculative(
+    model: PackedBitNetModel,
+    prompt_token_ids: list[int],
+    max_new_tokens: int,
+    spec_k: int = 4,
+    match_n: int = 4,
+    eos_id: Optional[int] = None,
+    state: Optional[InferState] = None,
+    return_stats: bool = False,
+):
+    """
+    Greedy speculative decoding via prompt-lookup speculation.
+
+    Args:
+        model:             loaded PackedBitNetModel
+        prompt_token_ids:  prompt tokens
+        max_new_tokens:    cap on generated tokens
+        spec_k:            number of tokens to speculate per step
+        match_n:           n-gram length to match against context
+        eos_id:            optional EOS to stop on (skipped if None)
+        state:             existing InferState or None to allocate
+        return_stats:      if True, also return a stats dict
+
+    Returns the list of generated token IDs, or (tokens, stats) if
+    return_stats. Output is bit-identical to greedy decode.
+    """
+    if not _has_batched_matmul():
+        # No batched kernel -> just do plain greedy.
+        toks = generate(model, prompt_token_ids, max_new_tokens, state=state)
+        if return_stats:
+            return toks, {"specdec_supported": False, "steps": len(toks),
+                          "tokens_per_step": 1.0, "acceptance_rate": 0.0}
+        return toks
+
+    t_max = len(prompt_token_ids) + max_new_tokens + spec_k + 2
+    if state is None:
+        state = init_state(model, t_max)
+    elif state.t_max < t_max:
+        raise ValueError(f"state.t_max={state.t_max} < required {t_max}")
+
+    # Prefill -> last position's logits predicts t0.
+    logits_next = forward_prefill(model, state, list(prompt_token_ids))
+
+    generated: list[int] = []
+    context = list(prompt_token_ids)
+    accept_total = 0
+    step_count = 0
+    matched_steps = 0
+
+    while len(generated) < max_new_tokens:
+        # First-token argmax from previously-cached logits.
+        next_token = int(np.argmax(logits_next))
+        if eos_id is not None and next_token == eos_id:
+            break
+
+        # Try speculation
+        spec = _lookup_speculation(context + [next_token], match_n, spec_k)
+
+        if not spec:
+            # No match -> regular forward_one for next step.
+            generated.append(next_token)
+            context.append(next_token)
+            step_count += 1
+            if len(generated) >= max_new_tokens:
+                break
+            logits_next = forward_one(model, state, next_token)
+            continue
+
+        # Validation: feed [next_token, spec[0..K-2]] (K tokens),
+        # collect K logits. logits[i] predicts what comes AFTER input[i].
+        K_actual = min(spec_k, len(spec))
+        # Cap to avoid running off the t_max budget.
+        rem = max_new_tokens - len(generated)
+        K_actual = min(K_actual, rem)
+        if K_actual <= 0:
+            break
+
+        val_input = [next_token] + spec[:K_actual - 1]
+        start_pos = state.pos
+        all_logits = forward_prefill_all_logits(model, state, val_input)
+        # state.pos now = start_pos + K_actual
+
+        # Walk the predictions: logits[i] predicts the token after val_input[i].
+        #   logits[0]   should predict spec[0]
+        #   logits[1]   should predict spec[1]
+        #   ...
+        #   logits[K-2] should predict spec[K-2]
+        #   logits[K-1] is the always-accepted bonus token after spec[K-2].
+        accepted = 0
+        for i in range(K_actual - 1):
+            pred = int(np.argmax(all_logits[i]))
+            if pred == spec[i]:
+                accepted += 1
+            else:
+                bonus = pred  # mismatch: bonus is the model's actual prediction
+                break
+        else:
+            # All speculated tokens matched their predictions; bonus is
+            # the model's prediction after spec[K-2].
+            bonus = int(np.argmax(all_logits[K_actual - 1]))
+
+        # Tokens this step: next_token + spec[0..accepted-1] + bonus
+        emit = [next_token] + spec[:accepted] + [bonus]
+        # Roll back state.pos. Valid kv positions: start_pos (next_token)
+        # ... start_pos + accepted (spec[accepted-1]). Invalid above that.
+        # New state.pos should be start_pos + accepted + 1 (next free
+        # slot after next_token + accepted spec tokens).
+        state.pos = start_pos + accepted + 1
+
+        # Check eos / max-new-tokens cap incrementally.
+        for tok in emit:
+            if eos_id is not None and tok == eos_id:
+                generated.append(tok)
+                context.append(tok)
+                logits_next = None  # signal halt below
+                break
+            generated.append(tok)
+            context.append(tok)
+            if len(generated) >= max_new_tokens:
+                logits_next = None
+                break
+        if logits_next is None:
+            break
+
+        # Need logits_next predicting AFTER bonus. Bonus's k/v is not yet
+        # in cache (it replaced spec[accepted] in the output). forward_one
+        # writes it and returns the prediction.
+        logits_next = forward_one(model, state, bonus)
+
+        accept_total += accepted
+        matched_steps += 1
+        step_count += 1
+
+    if return_stats:
+        stats = {
+            "specdec_supported": True,
+            "steps": step_count,
+            "tokens": len(generated),
+            "tokens_per_step": (len(generated) / step_count) if step_count else 0.0,
+            "acceptance_rate": (accept_total / (matched_steps * (spec_k - 1)))
+                               if matched_steps and spec_k > 1 else 0.0,
+            "matched_steps": matched_steps,
+        }
+        return generated, stats
+    return generated
 
 
 def generate(
