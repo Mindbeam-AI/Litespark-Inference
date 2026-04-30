@@ -21,6 +21,7 @@ litespark_inference.torchless.kernel loads it via ctypes.
 
 from __future__ import annotations
 
+import os
 import platform
 from pathlib import Path
 from typing import Optional
@@ -99,6 +100,15 @@ def _platform_compile_args(compiler_type: str) -> tuple[list[str], list[str]]:
         # the kernel. Explicit macro because MSVC doesn't predefine
         # __AVX512VBMI__ even when /arch:AVX512 is set.
         compile_args += ["-DLITESPARK_USE_VBMI=1"] if is_msvc else []
+        # LITESPARK_USE_AMX gates the AMX TMUL kernel on. Off by default
+        # because AMX needs Sapphire Rapids+ -- enable via
+        # LITESPARK_BUILD_AMX=1 at install time on a machine that can
+        # actually run it. Older boxes will SIGILL on first AMX load
+        # otherwise.
+        if os.environ.get("LITESPARK_BUILD_AMX", "0") == "1":
+            compile_args += ["-DLITESPARK_USE_AMX=1"]
+            if not is_msvc:
+                compile_args += ["-mamx-tile", "-mamx-int8"]
         if is_msvc:
             # /arch:AVX512 enables F+CD+BW+DQ+VL on Skylake-X+. MSVC's
             # intrinsic headers gate VBMI / VNNI by their own __cpuid

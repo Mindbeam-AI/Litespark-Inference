@@ -669,6 +669,167 @@ LSPK_API void relu2_mul_fp32_avx512(
     }
 }
 
+// ---------------------------------------------------------------------------
+// AMX matmul (Sapphire Rapids+, optional via -DLITESPARK_USE_AMX).
+//
+// Uses TDPBSSD (signed * signed int8) with weights pre-transposed at load
+// time into AMX-VNNI layout: for a [N, K] int8 weight in {-1, 0, +1}, the
+// AMX layout is [K/4, N, 4] -- i.e. each row of the layout holds 4 K-
+// adjacent weights for one of N output channels, packed as int8 into a
+// 4-byte group. TILELOADD reads a (rows=16, cols=64) tile in one shot.
+//
+// Tile config for our matmul:
+//   tile 0 = A  : M_tile rows  * 64 cols i8     (T tokens, 64 K elements)
+//   tile 1 = B  : 16 rows      * 64 cols i8     (16 N channels, 64 K in VNNI groups)
+//   tile 2 = C  : M_tile rows  * 64 cols i32    (16 N channels, int32 result)
+//
+// Unsigned-bias / sum_x trick is not needed since TDPBSSD takes signed
+// operands directly. We just feed the [-1, 0, +1] weights as int8.
+//
+// M_tile capped at 16 (AMX hard limit). Caller chunks T > 16 outside.
+#if defined(LITESPARK_USE_AMX)
+#include <immintrin.h>
+
+// Linux requires explicit opt-in to use AMX from userspace. Without this
+// arch_prctl call, the first TILELOADD/TDPBSSD raises SIGILL even on a
+// CPU that has the feature. Returns 1 on success (AMX usable), 0 if the
+// kernel refused (older kernel without dynamic xstate, or non-Linux).
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+#ifndef ARCH_GET_XCOMP_PERM
+#define ARCH_GET_XCOMP_PERM 0x1022
+#endif
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#ifndef XFEATURE_XTILEDATA
+#define XFEATURE_XTILEDATA 18
+#endif
+#endif
+
+LSPK_API int amx_request_permission(void) {
+#if defined(__linux__)
+    long r = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
+    return r == 0 ? 1 : 0;
+#else
+    return 1;  // not Linux: assume the kernel doesn't gate AMX
+#endif
+}
+
+struct __attribute__((packed)) amx_tile_config {
+    uint8_t  palette_id;
+    uint8_t  start_row;
+    uint8_t  reserved[14];
+    uint16_t colsb[16];
+    uint8_t  rows[16];
+};
+
+static inline void _lspk_amx_load_cfg(int M_tile) {
+    struct amx_tile_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.palette_id = 1;
+    cfg.start_row  = 0;
+    // Tile 0: A   (M_tile rows, 64 cols i8)
+    cfg.colsb[0] = 64;
+    cfg.rows[0]  = static_cast<uint8_t>(M_tile);
+    // Tile 1: B   (16 rows,     64 cols i8 -- one row = one N channel)
+    cfg.colsb[1] = 64;
+    cfg.rows[1]  = 16;
+    // Tile 2: C   (M_tile rows, 64 cols i32 = 16 N int32s)
+    cfg.colsb[2] = 64;
+    cfg.rows[2]  = static_cast<uint8_t>(M_tile);
+    _tile_loadconfig(&cfg);
+}
+
+// AMX-VNNI ternary matmul for M=T (T <= 16).
+//
+// x:        int8 [T, K]   (row-major)
+// x_scales: fp32 [T]
+// w_amx:    int8 [K/4, N, 4]   (pre-transposed; w[k_group][n][b] holds
+//                               weight n at K-offset k_group*4 + b)
+// w_scale:  fp32 (per-tensor)
+// y:        fp32 [T, N]
+LSPK_API void matmul_amx_int8_mT(
+    const int8_t* __restrict__ x,
+    const float*  __restrict__ x_scales,
+    const int8_t* __restrict__ w_amx,
+    float w_scale,
+    float*        __restrict__ y,
+    int T, int N, int K
+) {
+    if (T <= 0 || T > 16) return;        // caller chunks
+    if ((K & 0x3F) != 0) return;          // K must be a multiple of 64
+    if ((N & 0x0F) != 0) return;          // N must be a multiple of 16
+    const int K_groups = K >> 2;          // 4 K-elements per VNNI group
+    const int b_row_stride = N * 4;       // bytes per row of w_amx[k_group]
+
+    _lspk_amx_load_cfg(T);
+
+#pragma omp parallel for if(N >= 64) schedule(static)
+    for (int n = 0; n < N; n += 16) {
+        // Each thread owns its own tile state -- AMX is per-logical-CPU.
+        // Re-load config in each thread to be safe.
+        _lspk_amx_load_cfg(T);
+
+        _tile_zero(2);
+        for (int k = 0; k < K; k += 64) {
+            _tile_loadd(0, x + k, K);
+            // B tile: rows = 16 N channels, cols = 64 K bytes (VNNI grouped).
+            // Source layout w_amx[k/4 + 0..15][n][0..3]:
+            //   row r of the tile = w_amx[k_group+r] starting at column n*4
+            // That row stride is N*4 bytes (b_row_stride).
+            const int8_t* b_ptr = w_amx
+                + static_cast<ptrdiff_t>(k >> 2) * static_cast<ptrdiff_t>(b_row_stride)
+                + static_cast<ptrdiff_t>(n) * 4;
+            _tile_loadd(1, b_ptr, b_row_stride);
+            _tile_dpbssd(2, 0, 1);
+        }
+        // Spill the int32 tile and write fp32 result.
+        alignas(64) int32_t buf[16 * 16];
+        _tile_stored(2, buf, 16 * sizeof(int32_t));
+        for (int t = 0; t < T; ++t) {
+            const float scale_t = x_scales[t] * w_scale;
+            for (int nn = 0; nn < 16; ++nn) {
+                y[static_cast<ptrdiff_t>(t) * N + n + nn] =
+                    static_cast<float>(buf[t * 16 + nn]) * scale_t;
+            }
+        }
+    }
+
+    _tile_release();
+}
+
+// One-shot helper: transpose a [N, K/4] packed ternary matrix into
+// [K/4, N, 4] int8 AMX-VNNI layout. Called at load time.
+//
+// w_packed: uint8 [N, K/4]   (4 ternary weights per byte, encoding
+//                             (w0+1) | (w1+1)<<2 | (w2+1)<<4 | (w3+1)<<6)
+// w_amx:    int8 [K/4, N, 4]  (output, caller-allocated, 4*N*K/4 bytes)
+LSPK_API void transpose_packed_to_amx_vnni(
+    const uint8_t* __restrict__ w_packed,
+    int8_t*        __restrict__ w_amx,
+    int N, int K
+) {
+    const int Kb = K >> 2;
+#pragma omp parallel for schedule(static)
+    for (int kb = 0; kb < Kb; ++kb) {
+        for (int n = 0; n < N; ++n) {
+            const uint8_t b = w_packed[static_cast<ptrdiff_t>(n) * Kb + kb];
+            int8_t* dst = w_amx
+                + static_cast<ptrdiff_t>(kb) * N * 4
+                + static_cast<ptrdiff_t>(n) * 4;
+            dst[0] = static_cast<int8_t>((b >> 0) & 0x3) - 1;
+            dst[1] = static_cast<int8_t>((b >> 2) & 0x3) - 1;
+            dst[2] = static_cast<int8_t>((b >> 4) & 0x3) - 1;
+            dst[3] = static_cast<int8_t>((b >> 6) & 0x3) - 1;
+        }
+    }
+}
+#endif  // LITESPARK_USE_AMX
+
+
 // Batched (T-token) versions of the per-row helpers used by prefill.
 // Each one processes T independent K-vectors in a single C call so the
 // ctypes round-trip and any thread-launch overhead amortize across T.

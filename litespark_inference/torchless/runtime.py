@@ -25,11 +25,13 @@ import numpy as np
 
 from .kernel import (
     add_inplace as _add_inplace,
+    has_amx as _has_amx,
     has_batched_helpers as _has_batched_helpers,
     has_batched_matmul as _has_batched_matmul,
     lm_head_bf16 as _lm_head_bf16,
     lm_head_int4 as _lm_head_int4,
     lm_head_int8 as _lm_head_int8,
+    matmul_amx_mT as _matmul_amx_mT,
     matmul_packed_m1,
     matmul_packed_mT as _matmul_packed_mT,
     quantize_activation as _quant_neon,
@@ -301,6 +303,30 @@ def forward_prefill(
 
     base_pos = state.pos
     use_batched_helpers = _has_batched_helpers()
+    use_amx = _has_amx() and any(getattr(L.q_proj, "w_amx", None) is not None for L in model.layers)
+
+    def _matmul_proj(x_int8_all, x_scales_all, proj):
+        """Dispatch to the AMX kernel when the projection has the
+        AMX-VNNI weight layout AND 8 <= T <= 16 (one AMX tile worth,
+        well-utilized).
+
+        AMX always does the full 16-row TMUL regardless of how many M
+        rows are populated, so for T < 8 the unused rows make the
+        kernel net-slower than the linear-in-T VNNI path. For T > 16
+        the AMX path would re-read weights once per 16-row chunk,
+        which on these shapes is more bandwidth than the compute it
+        saves -- VNNI M=T (one weight read for the whole T) wins.
+
+        Sweet spot is T in [8, 16] -- typical for speculative-decode
+        validation batches.
+        """
+        T_local = x_int8_all.shape[0]
+        w_amx = getattr(proj, "w_amx", None)
+        if use_amx and w_amx is not None and 8 <= T_local <= 16:
+            return _matmul_amx_mT(
+                x_int8_all, x_scales_all, w_amx, proj.scale,
+            )
+        return _matmul_packed_mT(x_int8_all, x_scales_all, proj.w_packed, proj.scale)
 
     def _rmsq(src, gamma, fp_out, i8_out, scales_out):
         """RMSNorm + per-token absmax int8 quantize over the T-batch."""
@@ -316,9 +342,9 @@ def forward_prefill(
         # ---- Attention block ----
         _rmsq(x, layer.input_norm, h_fp, h_i8, h_scales)
 
-        q_all = _matmul_packed_mT(h_i8, h_scales, layer.q_proj.w_packed, layer.q_proj.scale)
-        k_all = _matmul_packed_mT(h_i8, h_scales, layer.k_proj.w_packed, layer.k_proj.scale)
-        v_all = _matmul_packed_mT(h_i8, h_scales, layer.v_proj.w_packed, layer.v_proj.scale)
+        q_all = _matmul_proj(h_i8, h_scales, layer.q_proj)
+        k_all = _matmul_proj(h_i8, h_scales, layer.k_proj)
+        v_all = _matmul_proj(h_i8, h_scales, layer.v_proj)
 
         # Apply RoPE per token, write KV cache.
         for t in range(T):
@@ -347,13 +373,13 @@ def forward_prefill(
             attn_out[t] = np.ascontiguousarray(attn.reshape(Q * D))
 
         _rmsq(attn_out, layer.attn_sub_norm, h_fp, h_i8, h_scales)
-        o_all = _matmul_packed_mT(h_i8, h_scales, layer.o_proj.w_packed, layer.o_proj.scale)
+        o_all = _matmul_proj(h_i8, h_scales, layer.o_proj)
         x += o_all                                  # residual: x[T, H] += o[T, H]
 
         # ---- MLP block ----
         _rmsq(x, layer.post_attn_norm, h_fp, h_i8, h_scales)
-        gate_all = _matmul_packed_mT(h_i8, h_scales, layer.gate_proj.w_packed, layer.gate_proj.scale)
-        up_all   = _matmul_packed_mT(h_i8, h_scales, layer.up_proj.w_packed,   layer.up_proj.scale)
+        gate_all = _matmul_proj(h_i8, h_scales, layer.gate_proj)
+        up_all   = _matmul_proj(h_i8, h_scales, layer.up_proj)
 
         if use_batched_helpers:
             _relu2_mul_batched(gate_all, up_all, inter)
@@ -361,7 +387,7 @@ def forward_prefill(
             for t in range(T):
                 _relu2_mul(gate_all[t], up_all[t], inter[t])
         _rmsq(inter, layer.ffn_sub_norm, i_fp, i_i8, i_scales)
-        down_all = _matmul_packed_mT(i_i8, i_scales, layer.down_proj.w_packed, layer.down_proj.scale)
+        down_all = _matmul_proj(i_i8, i_scales, layer.down_proj)
         x += down_all                               # residual
 
     state.pos = base_pos + T

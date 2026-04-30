@@ -213,6 +213,17 @@ def _load() -> ctypes.CDLL:
                [_I8, _F32, _U8, ctypes.c_float, _F32,
                 ctypes.c_int, ctypes.c_int, ctypes.c_int],
                None)
+    # AMX matmul + load-time transposer (Sapphire Rapids only).
+    if _IS_X86 and hasattr(lib, "matmul_amx_int8_mT"):
+        _alias("matmul_amx_int8_mT", "matmul_amx_int8_mT",
+               [_I8, _F32, _I8, ctypes.c_float, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
+        _alias("transpose_packed_to_amx_vnni", "transpose_packed_to_amx_vnni",
+               [_U8, _I8, ctypes.c_int, ctypes.c_int],
+               None)
+        _alias("amx_request_permission", "amx_request_permission",
+               [], ctypes.c_int)
     # Batched per-row helpers (rmsnorm, quantize, relu2_mul) that fold
     # the prefill's T-loop into a single C call. x86 only today.
     if _IS_X86 and hasattr(lib, f"rmsnorm_bf16gamma_fp32_batched_{T}"):
@@ -394,6 +405,58 @@ def has_batched_matmul() -> bool:
 def has_batched_helpers() -> bool:
     """True if rmsnorm/quantize/relu2_mul have batched (T-folded) versions."""
     return hasattr(_load(), "rmsnorm_bf16gamma_fp32_batched")
+
+
+_amx_perm_requested = False
+
+
+def has_amx() -> bool:
+    """True if the loaded kernel has AMX TMUL ternary matmul.
+
+    Requires the build to have been done with LITESPARK_BUILD_AMX=1
+    AND the host CPU to have amx_tile + amx_int8 (Sapphire Rapids+).
+    Also performs the one-time Linux arch_prctl opt-in so the first
+    TILELOADD doesn't SIGILL.
+    """
+    global _amx_perm_requested
+    lib = _load()
+    if not hasattr(lib, "matmul_amx_int8_mT"):
+        return False
+    if not _amx_perm_requested:
+        # Linux requires arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)
+        # before any AMX instruction. Older kernels or non-AMX CPUs return 0.
+        ok = lib.amx_request_permission()
+        _amx_perm_requested = True
+        if not ok:
+            return False
+    return True
+
+
+def transpose_packed_to_amx_vnni(
+    w_packed: np.ndarray, w_amx_out: np.ndarray, N: int, K: int,
+) -> np.ndarray:
+    """One-shot load-time helper: convert [N, K/4] packed ternary into
+    [K/4, N, 4] int8 AMX-VNNI layout. The output array must already be
+    allocated by the caller (4*K*N bytes)."""
+    _load().transpose_packed_to_amx_vnni(w_packed, w_amx_out, N, K)
+    return w_amx_out
+
+
+def matmul_amx_mT(
+    x_int8: np.ndarray,         # [T, K] int8, T <= 16
+    x_scales: np.ndarray,       # [T] fp32
+    w_amx: np.ndarray,          # [K/4, N, 4] int8 (AMX-VNNI layout)
+    w_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """AMX TMUL ternary matmul for M=T (T <= 16)."""
+    T, K = x_int8.shape
+    Kg, N, four = w_amx.shape
+    assert four == 4 and Kg == K // 4
+    if out is None:
+        out = np.empty((T, N), dtype=np.float32)
+    _load().matmul_amx_int8_mT(x_int8, x_scales, w_amx, w_scale, out, T, N, K)
+    return out
 
 
 def rmsnorm_into_batched(

@@ -42,6 +42,9 @@ class PackedProjection:
     in_features: int
     out_features: int
     w_unpacked: "np.ndarray | None" = None   # uint8 [N, K] in [0, 1, 2]
+    # AMX-VNNI layout: int8 [K/4, N, 4] in {-1, 0, +1}. Set by the loader
+    # when LITESPARK_AMX=1 and the kernel was built with AMX support.
+    w_amx: "np.ndarray | None" = None
 
 
 @dataclass

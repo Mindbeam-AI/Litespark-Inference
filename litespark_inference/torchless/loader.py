@@ -84,6 +84,7 @@ def _resolve_hf_snapshot(repo: str) -> tuple[Path, Path]:
 
 
 _PREUNPACK = os.environ.get("LITESPARK_PREUNPACK", "0") == "1"
+_AMX = os.environ.get("LITESPARK_AMX", "0") == "1"
 
 
 def _load_proj(sf, prefix: str, suffix: str) -> PackedProjection:
@@ -99,11 +100,25 @@ def _load_proj(sf, prefix: str, suffix: str) -> PackedProjection:
     # form (4x memory, but the matmul kernel skips the whole port-5
     # unpack chain). Costs ~3 GB of RAM for BitNet-2B vs ~700 MB packed.
     w_unpacked = (w_int8 + 1).astype(np.uint8) if _PREUNPACK else None
+    # If LITESPARK_AMX=1 and the kernel has AMX support, build the
+    # AMX-VNNI transposed layout up front. Same 4x memory hit as
+    # LITESPARK_PREUNPACK but in [-1, 0, +1] signed form and pre-
+    # transposed for direct AMX TILELOADD.
+    w_amx = None
+    if _AMX:
+        try:
+            from .kernel import has_amx, transpose_packed_to_amx_vnni
+            if has_amx():
+                w_amx = np.empty((K // 4, N, 4), dtype=np.int8)
+                transpose_packed_to_amx_vnni(w_packed, w_amx, N, K)
+        except Exception:
+            w_amx = None
     del w_int8
     proj = PackedProjection(
         w_packed=w_packed, w_sum=w_sum, scale=scale,
         in_features=K, out_features=N,
         w_unpacked=w_unpacked,
+        w_amx=w_amx,
     )
     # Return freed transient blocks to the OS every projection, not just
     # every layer. ~210 pressure-relief calls is cheap and keeps peak
