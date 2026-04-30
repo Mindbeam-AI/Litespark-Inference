@@ -801,6 +801,138 @@ LSPK_API void matmul_amx_int8_mT(
     _tile_release();
 }
 
+// Phase 10 AMX kernel: same contract as matmul_amx_int8_mT but supports
+// T up to 64 by holding multiple C accumulator tiles and sharing the
+// B (weight) tile across them within each (n, k) iteration. The B load
+// is the dominant memory cost; reusing it across T_chunks turns a
+// re-loaded-per-chunk pattern into a single load per (n, k).
+//
+// Tile budget: 1 A + 1 B + T_chunks C = 2 + T_chunks. AMX gives 8 tiles
+// total, so T_chunks <= 6 (T <= 96). We cap at 4 (T <= 64) because that
+// matches LSPK_MAX_T from the VNNI path.
+//
+// CALLER CONTRACT: T must be a multiple of 16 (pad with zeros if not).
+// The kernel does not handle a partial last chunk -- it would require
+// a different tile config and the runtime (which knows real_T) handles
+// the trim on the way out. Padding rows feed zero activations to TMUL,
+// which produce zero outputs that the runtime discards.
+LSPK_API void matmul_amx_int8_mT_v2(
+    const int8_t* __restrict__ x,         // [T_padded, K]
+    const float*  __restrict__ x_scales,  // [T_padded] (zeroed scales for pad rows)
+    const int8_t* __restrict__ w_amx,     // [K/4, N, 4]
+    float w_scale,
+    float*        __restrict__ y,         // [T_padded, N]
+    int T_padded, int N, int K
+) {
+    if (T_padded <= 0 || (T_padded & 0xF) != 0) return;   // must be 16-multiple
+    if (T_padded > 64) return;
+    if ((K & 0x3F) != 0) return;
+    if ((N & 0x0F) != 0) return;
+    const int T_chunks    = T_padded >> 4;                 // 1..4
+    const int K_groups    = K >> 2;
+    const int b_row_stride= N * 4;
+    (void)K_groups;
+
+    struct amx_tile_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.palette_id = 1;
+    cfg.start_row  = 0;
+    // Tile 0: A   (16 rows x 64 cols i8)  -- reloaded per t_chunk
+    cfg.colsb[0] = 64;
+    cfg.rows[0]  = 16;
+    // Tile 1: B   (16 rows x 64 cols i8)  -- shared across t_chunks
+    cfg.colsb[1] = 64;
+    cfg.rows[1]  = 16;
+    // Tiles 2..5: up to 4 C accumulators (16 rows x 64 cols i32)
+    for (int c = 0; c < T_chunks; ++c) {
+        cfg.colsb[2 + c] = 64;
+        cfg.rows[2 + c]  = 16;
+    }
+
+    _tile_loadconfig(&cfg);
+
+#pragma omp parallel for if(N >= 64) schedule(static)
+    for (int n = 0; n < N; n += 16) {
+        // Each thread re-loads the same config -- AMX state is per logical CPU.
+        _tile_loadconfig(&cfg);
+
+        // Zero up to 4 C accumulators. tile id is an immediate operand,
+        // so unroll by hand.
+        if (T_chunks >= 1) _tile_zero(2);
+        if (T_chunks >= 2) _tile_zero(3);
+        if (T_chunks >= 3) _tile_zero(4);
+        if (T_chunks >= 4) _tile_zero(5);
+
+        for (int k = 0; k < K; k += 64) {
+            // Load B once for this (n, k).
+            const int8_t* b_ptr = w_amx
+                + static_cast<ptrdiff_t>(k >> 2) * b_row_stride
+                + static_cast<ptrdiff_t>(n) * 4;
+            _tile_loadd(1, b_ptr, b_row_stride);
+
+            // For each T-chunk, load its A tile and TDPBSSD into its C.
+            // Tile id has to be an immediate, so unroll.
+            if (T_chunks >= 1) {
+                _tile_loadd(0, x + 0 * 16 * K + k, K);
+                _tile_dpbssd(2, 0, 1);
+            }
+            if (T_chunks >= 2) {
+                _tile_loadd(0, x + 1 * 16 * K + k, K);
+                _tile_dpbssd(3, 0, 1);
+            }
+            if (T_chunks >= 3) {
+                _tile_loadd(0, x + 2 * 16 * K + k, K);
+                _tile_dpbssd(4, 0, 1);
+            }
+            if (T_chunks >= 4) {
+                _tile_loadd(0, x + 3 * 16 * K + k, K);
+                _tile_dpbssd(5, 0, 1);
+            }
+        }
+
+        // Spill each C accumulator and write fp32 outputs.
+        alignas(64) int32_t buf[16 * 16];
+        if (T_chunks >= 1) {
+            _tile_stored(2, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[0 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(0 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+        if (T_chunks >= 2) {
+            _tile_stored(3, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[1 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(1 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+        if (T_chunks >= 3) {
+            _tile_stored(4, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[2 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(2 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+        if (T_chunks >= 4) {
+            _tile_stored(5, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[3 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(3 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+    }
+    _tile_release();
+}
+
+
 // One-shot helper: transpose a [N, K/4] packed ternary matrix into
 // [K/4, N, 4] int8 AMX-VNNI layout. Called at load time.
 //

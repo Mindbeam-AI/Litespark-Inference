@@ -32,6 +32,7 @@ from .kernel import (
     lm_head_int4 as _lm_head_int4,
     lm_head_int8 as _lm_head_int8,
     matmul_amx_mT as _matmul_amx_mT,
+    matmul_amx_mT_padded as _matmul_amx_mT_padded,
     matmul_packed_m1,
     matmul_packed_mT as _matmul_packed_mT,
     quantize_activation as _quant_neon,
@@ -293,26 +294,36 @@ def _forward_prefill_hidden(
     use_amx = _has_amx() and any(getattr(L.q_proj, "w_amx", None) is not None for L in model.layers)
 
     def _matmul_proj(x_int8_all, x_scales_all, proj):
-        """Dispatch to the AMX kernel when the projection has the
-        AMX-VNNI weight layout AND 8 <= T <= 16 (one AMX tile worth,
-        well-utilized).
+        """Dispatch matmul on (T, kernel availability):
 
-        AMX always does the full 16-row TMUL regardless of how many M
-        rows are populated, so for T < 8 the unused rows make the
-        kernel net-slower than the linear-in-T VNNI path. For T > 16
-        the AMX path would re-read weights once per 16-row chunk,
-        which on these shapes is more bandwidth than the compute it
-        saves -- VNNI M=T (one weight read for the whole T) wins.
+          - T == 1: caller uses M=1 forward_one (not this function)
+          - 8 <= T <= 16 with AMX:  phase 9 AMX (1 tile, no padding)
+          - 17 <= T <= 64 with AMX: phase 10 AMX (multi-tile B reuse).
+                                    Pad to 16-multiple and trim outputs.
+          - otherwise:              VNNI M=T
 
-        Sweet spot is T in [8, 16] -- typical for speculative-decode
-        validation batches.
+        AMX always does full 16-row TMUL; padding is junk that we
+        discard. For T<8 the per-call AMX overhead loses to linear-
+        in-T VNNI; for T>64 we'd need >4 C tiles which exceeds the
+        AMX 8-tile budget.
         """
         T_local = x_int8_all.shape[0]
+        N_local = proj.out_features
         w_amx = getattr(proj, "w_amx", None)
-        if use_amx and w_amx is not None and 8 <= T_local <= 16:
-            return _matmul_amx_mT(
-                x_int8_all, x_scales_all, w_amx, proj.scale,
-            )
+        if use_amx and w_amx is not None and T_local <= 64:
+            if 8 <= T_local <= 16:
+                return _matmul_amx_mT(x_int8_all, x_scales_all, w_amx, proj.scale)
+            if T_local > 16:
+                T_padded = ((T_local + 15) // 16) * 16
+                if T_padded == T_local:
+                    return _matmul_amx_mT_padded(x_int8_all, x_scales_all, w_amx, proj.scale)
+                # Pad x and scales with zeros, then trim outputs.
+                x_padded = np.zeros((T_padded, x_int8_all.shape[1]), dtype=np.int8)
+                x_padded[:T_local] = x_int8_all
+                s_padded = np.zeros(T_padded, dtype=np.float32)
+                s_padded[:T_local] = x_scales_all
+                y_padded = _matmul_amx_mT_padded(x_padded, s_padded, w_amx, proj.scale)
+                return np.ascontiguousarray(y_padded[:T_local])
         return _matmul_packed_mT(x_int8_all, x_scales_all, proj.w_packed, proj.scale)
 
     def _rmsq(src, gamma, fp_out, i8_out, scales_out):

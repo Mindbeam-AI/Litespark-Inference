@@ -219,6 +219,10 @@ def _load() -> ctypes.CDLL:
                [_I8, _F32, _I8, ctypes.c_float, _F32,
                 ctypes.c_int, ctypes.c_int, ctypes.c_int],
                None)
+        _alias("matmul_amx_int8_mT_v2", "matmul_amx_int8_mT_v2",
+               [_I8, _F32, _I8, ctypes.c_float, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
         _alias("transpose_packed_to_amx_vnni", "transpose_packed_to_amx_vnni",
                [_U8, _I8, ctypes.c_int, ctypes.c_int],
                None)
@@ -456,6 +460,26 @@ def matmul_amx_mT(
     if out is None:
         out = np.empty((T, N), dtype=np.float32)
     _load().matmul_amx_int8_mT(x_int8, x_scales, w_amx, w_scale, out, T, N, K)
+    return out
+
+
+def matmul_amx_mT_padded(
+    x_int8_padded: np.ndarray,  # [T_padded, K] int8, T_padded multiple of 16, <= 64
+    x_scales_padded: np.ndarray,# [T_padded] fp32 (pad rows can be 0)
+    w_amx: np.ndarray,
+    w_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Phase 10 AMX kernel: T must be 16-multiple. Caller pads."""
+    T_padded, K = x_int8_padded.shape
+    Kg, N, four = w_amx.shape
+    assert four == 4 and Kg == K // 4
+    assert T_padded % 16 == 0 and 0 < T_padded <= 64
+    if out is None:
+        out = np.empty((T_padded, N), dtype=np.float32)
+    _load().matmul_amx_int8_mT_v2(
+        x_int8_padded, x_scales_padded, w_amx, w_scale, out, T_padded, N, K,
+    )
     return out
 
 
