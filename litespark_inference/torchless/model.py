@@ -5,6 +5,7 @@ Plain-data container for a loaded, packed BitNet model. No nn.Module, no torch.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Tuple
 
 import numpy as np
 
@@ -42,6 +43,9 @@ class PackedProjection:
     in_features: int
     out_features: int
     w_unpacked: "np.ndarray | None" = None   # uint8 [N, K] in [0, 1, 2]
+    # AMX-VNNI layout: int8 [K/4, N, 4] in {-1, 0, +1}. Set by the loader
+    # when LITESPARK_AMX=1 and the kernel was built with AMX support.
+    w_amx: "np.ndarray | None" = None
 
 
 @dataclass
@@ -150,4 +154,88 @@ class PackedBitNetModel:
                 + nbytes(self.embed_int4)
                 + nbytes(self.embed_scale)
             ),
+        }
+
+
+@dataclass
+class FalconTernaryConfig:
+    hidden_size: int
+    num_layers: int
+    num_heads: int
+    num_kv_heads: int
+    intermediate_size: int
+    vocab_size: int
+    max_position_embeddings: int
+    rms_norm_eps: float
+    rope_theta: float
+    eos_token_ids: Tuple[int, ...] = (2,)
+
+
+@dataclass
+class PackedFalconLayer:
+    q_proj: PackedProjection
+    k_proj: PackedProjection
+    v_proj: PackedProjection
+    o_proj: PackedProjection
+    gate_proj: PackedProjection
+    up_proj: PackedProjection
+    down_proj: PackedProjection
+    input_norm: np.ndarray
+    post_attn_norm: np.ndarray
+
+
+@dataclass
+class PackedFalconModel:
+    config: FalconTernaryConfig
+    embed_tokens: "np.ndarray | None"
+    final_norm: np.ndarray
+    layers: list[PackedFalconLayer] = field(default_factory=list)
+
+    embed_int8: "np.ndarray | None" = None
+    embed_int4: "np.ndarray | None" = None
+    embed_scale: "np.ndarray | None" = None
+
+    lm_head_tokens: "np.ndarray | None" = None
+    lm_head_int8: "np.ndarray | None" = None
+    lm_head_int4: "np.ndarray | None" = None
+    lm_head_scale: "np.ndarray | None" = None
+
+    def tensor_bytes(self) -> dict:
+        def nbytes(x):
+            return int(x.nbytes) if isinstance(x, np.ndarray) else 0
+
+        packed = 0
+        sums = 0
+        norms = 0
+        for layer in self.layers:
+            for proj_name in (
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ):
+                proj = getattr(layer, proj_name)
+                packed += nbytes(proj.w_packed)
+                sums += nbytes(proj.w_sum)
+            norms += nbytes(layer.input_norm) + nbytes(layer.post_attn_norm)
+
+        embedding = (
+            nbytes(self.embed_tokens)
+            + nbytes(self.embed_int8)
+            + nbytes(self.embed_int4)
+            + nbytes(self.embed_scale)
+        )
+        lm_head = (
+            nbytes(self.lm_head_tokens)
+            + nbytes(self.lm_head_int8)
+            + nbytes(self.lm_head_int4)
+            + nbytes(self.lm_head_scale)
+        )
+        total = packed + sums + norms + nbytes(self.final_norm) + embedding + lm_head
+        return {
+            "packed_weights": packed,
+            "w_sum": sums,
+            "per_layer_norms": norms,
+            "final_norm": nbytes(self.final_norm),
+            "embedding": embedding,
+            "lm_head": lm_head,
+            "total_incl_embedding": total,
         }

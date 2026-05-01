@@ -669,6 +669,404 @@ LSPK_API void relu2_mul_fp32_avx512(
     }
 }
 
+// ---------------------------------------------------------------------------
+// AMX matmul (Sapphire Rapids+, optional via -DLITESPARK_USE_AMX).
+//
+// Uses TDPBSSD (signed * signed int8) with weights pre-transposed at load
+// time into AMX-VNNI layout: for a [N, K] int8 weight in {-1, 0, +1}, the
+// AMX layout is [K/4, N, 4] -- i.e. each row of the layout holds 4 K-
+// adjacent weights for one of N output channels, packed as int8 into a
+// 4-byte group. TILELOADD reads a (rows=16, cols=64) tile in one shot.
+//
+// Tile config for our matmul:
+//   tile 0 = A  : M_tile rows  * 64 cols i8     (T tokens, 64 K elements)
+//   tile 1 = B  : 16 rows      * 64 cols i8     (16 N channels, 64 K in VNNI groups)
+//   tile 2 = C  : M_tile rows  * 64 cols i32    (16 N channels, int32 result)
+//
+// Unsigned-bias / sum_x trick is not needed since TDPBSSD takes signed
+// operands directly. We just feed the [-1, 0, +1] weights as int8.
+//
+// M_tile capped at 16 (AMX hard limit). Caller chunks T > 16 outside.
+#if defined(LITESPARK_USE_AMX)
+#include <immintrin.h>
+
+// Linux requires explicit opt-in to use AMX from userspace. Without this
+// arch_prctl call, the first TILELOADD/TDPBSSD raises SIGILL even on a
+// CPU that has the feature. Returns 1 on success (AMX usable), 0 if the
+// kernel refused (older kernel without dynamic xstate, or non-Linux).
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+#ifndef ARCH_GET_XCOMP_PERM
+#define ARCH_GET_XCOMP_PERM 0x1022
+#endif
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#ifndef XFEATURE_XTILEDATA
+#define XFEATURE_XTILEDATA 18
+#endif
+#endif
+
+LSPK_API int amx_request_permission(void) {
+#if defined(__linux__)
+    long r = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
+    return r == 0 ? 1 : 0;
+#else
+    return 1;  // not Linux: assume the kernel doesn't gate AMX
+#endif
+}
+
+struct __attribute__((packed)) amx_tile_config {
+    uint8_t  palette_id;
+    uint8_t  start_row;
+    uint8_t  reserved[14];
+    uint16_t colsb[16];
+    uint8_t  rows[16];
+};
+
+static inline void _lspk_amx_load_cfg(int M_tile) {
+    struct amx_tile_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.palette_id = 1;
+    cfg.start_row  = 0;
+    // Tile 0: A   (M_tile rows, 64 cols i8)
+    cfg.colsb[0] = 64;
+    cfg.rows[0]  = static_cast<uint8_t>(M_tile);
+    // Tile 1: B   (16 rows,     64 cols i8 -- one row = one N channel)
+    cfg.colsb[1] = 64;
+    cfg.rows[1]  = 16;
+    // Tile 2: C   (M_tile rows, 64 cols i32 = 16 N int32s)
+    cfg.colsb[2] = 64;
+    cfg.rows[2]  = static_cast<uint8_t>(M_tile);
+    _tile_loadconfig(&cfg);
+}
+
+// AMX-VNNI ternary matmul for M=T (T <= 16).
+//
+// x:        int8 [T, K]   (row-major)
+// x_scales: fp32 [T]
+// w_amx:    int8 [K/4, N, 4]   (pre-transposed; w[k_group][n][b] holds
+//                               weight n at K-offset k_group*4 + b)
+// w_scale:  fp32 (per-tensor)
+// y:        fp32 [T, N]
+LSPK_API void matmul_amx_int8_mT(
+    const int8_t* __restrict__ x,
+    const float*  __restrict__ x_scales,
+    const int8_t* __restrict__ w_amx,
+    float w_scale,
+    float*        __restrict__ y,
+    int T, int N, int K
+) {
+    if (T <= 0 || T > 16) return;        // caller chunks
+    if ((K & 0x3F) != 0) return;          // K must be a multiple of 64
+    if ((N & 0x0F) != 0) return;          // N must be a multiple of 16
+    const int K_groups = K >> 2;          // 4 K-elements per VNNI group
+    const int b_row_stride = N * 4;       // bytes per row of w_amx[k_group]
+
+    _lspk_amx_load_cfg(T);
+
+#pragma omp parallel for if(N >= 64) schedule(static)
+    for (int n = 0; n < N; n += 16) {
+        // Each thread owns its own tile state -- AMX is per-logical-CPU.
+        // Re-load config in each thread to be safe.
+        _lspk_amx_load_cfg(T);
+
+        _tile_zero(2);
+        for (int k = 0; k < K; k += 64) {
+            _tile_loadd(0, x + k, K);
+            // B tile: rows = 16 N channels, cols = 64 K bytes (VNNI grouped).
+            // Source layout w_amx[k/4 + 0..15][n][0..3]:
+            //   row r of the tile = w_amx[k_group+r] starting at column n*4
+            // That row stride is N*4 bytes (b_row_stride).
+            const int8_t* b_ptr = w_amx
+                + static_cast<ptrdiff_t>(k >> 2) * static_cast<ptrdiff_t>(b_row_stride)
+                + static_cast<ptrdiff_t>(n) * 4;
+            _tile_loadd(1, b_ptr, b_row_stride);
+            _tile_dpbssd(2, 0, 1);
+        }
+        // Spill the int32 tile and write fp32 result.
+        alignas(64) int32_t buf[16 * 16];
+        _tile_stored(2, buf, 16 * sizeof(int32_t));
+        for (int t = 0; t < T; ++t) {
+            const float scale_t = x_scales[t] * w_scale;
+            for (int nn = 0; nn < 16; ++nn) {
+                y[static_cast<ptrdiff_t>(t) * N + n + nn] =
+                    static_cast<float>(buf[t * 16 + nn]) * scale_t;
+            }
+        }
+    }
+
+    _tile_release();
+}
+
+// Phase 10 AMX kernel: same contract as matmul_amx_int8_mT but supports
+// T up to 64 by holding multiple C accumulator tiles and sharing the
+// B (weight) tile across them within each (n, k) iteration. The B load
+// is the dominant memory cost; reusing it across T_chunks turns a
+// re-loaded-per-chunk pattern into a single load per (n, k).
+//
+// Tile budget: 1 A + 1 B + T_chunks C = 2 + T_chunks. AMX gives 8 tiles
+// total, so T_chunks <= 6 (T <= 96). We cap at 4 (T <= 64) because that
+// matches LSPK_MAX_T from the VNNI path.
+//
+// CALLER CONTRACT: T must be a multiple of 16 (pad with zeros if not).
+// The kernel does not handle a partial last chunk -- it would require
+// a different tile config and the runtime (which knows real_T) handles
+// the trim on the way out. Padding rows feed zero activations to TMUL,
+// which produce zero outputs that the runtime discards.
+LSPK_API void matmul_amx_int8_mT_v2(
+    const int8_t* __restrict__ x,         // [T_padded, K]
+    const float*  __restrict__ x_scales,  // [T_padded] (zeroed scales for pad rows)
+    const int8_t* __restrict__ w_amx,     // [K/4, N, 4]
+    float w_scale,
+    float*        __restrict__ y,         // [T_padded, N]
+    int T_padded, int N, int K
+) {
+    if (T_padded <= 0 || (T_padded & 0xF) != 0) return;   // must be 16-multiple
+    if (T_padded > 64) return;
+    if ((K & 0x3F) != 0) return;
+    if ((N & 0x0F) != 0) return;
+    const int T_chunks    = T_padded >> 4;                 // 1..4
+    const int K_groups    = K >> 2;
+    const int b_row_stride= N * 4;
+    (void)K_groups;
+
+    struct amx_tile_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.palette_id = 1;
+    cfg.start_row  = 0;
+    // Tile 0: A   (16 rows x 64 cols i8)  -- reloaded per t_chunk
+    cfg.colsb[0] = 64;
+    cfg.rows[0]  = 16;
+    // Tile 1: B   (16 rows x 64 cols i8)  -- shared across t_chunks
+    cfg.colsb[1] = 64;
+    cfg.rows[1]  = 16;
+    // Tiles 2..5: up to 4 C accumulators (16 rows x 64 cols i32)
+    for (int c = 0; c < T_chunks; ++c) {
+        cfg.colsb[2 + c] = 64;
+        cfg.rows[2 + c]  = 16;
+    }
+
+    _tile_loadconfig(&cfg);
+
+#pragma omp parallel for if(N >= 64) schedule(static)
+    for (int n = 0; n < N; n += 16) {
+        // Each thread re-loads the same config -- AMX state is per logical CPU.
+        _tile_loadconfig(&cfg);
+
+        // Zero up to 4 C accumulators. tile id is an immediate operand,
+        // so unroll by hand.
+        if (T_chunks >= 1) _tile_zero(2);
+        if (T_chunks >= 2) _tile_zero(3);
+        if (T_chunks >= 3) _tile_zero(4);
+        if (T_chunks >= 4) _tile_zero(5);
+
+        for (int k = 0; k < K; k += 64) {
+            // Load B once for this (n, k).
+            const int8_t* b_ptr = w_amx
+                + static_cast<ptrdiff_t>(k >> 2) * b_row_stride
+                + static_cast<ptrdiff_t>(n) * 4;
+            _tile_loadd(1, b_ptr, b_row_stride);
+
+            // For each T-chunk, load its A tile and TDPBSSD into its C.
+            // Tile id has to be an immediate, so unroll.
+            if (T_chunks >= 1) {
+                _tile_loadd(0, x + 0 * 16 * K + k, K);
+                _tile_dpbssd(2, 0, 1);
+            }
+            if (T_chunks >= 2) {
+                _tile_loadd(0, x + 1 * 16 * K + k, K);
+                _tile_dpbssd(3, 0, 1);
+            }
+            if (T_chunks >= 3) {
+                _tile_loadd(0, x + 2 * 16 * K + k, K);
+                _tile_dpbssd(4, 0, 1);
+            }
+            if (T_chunks >= 4) {
+                _tile_loadd(0, x + 3 * 16 * K + k, K);
+                _tile_dpbssd(5, 0, 1);
+            }
+        }
+
+        // Spill each C accumulator and write fp32 outputs.
+        alignas(64) int32_t buf[16 * 16];
+        if (T_chunks >= 1) {
+            _tile_stored(2, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[0 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(0 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+        if (T_chunks >= 2) {
+            _tile_stored(3, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[1 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(1 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+        if (T_chunks >= 3) {
+            _tile_stored(4, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[2 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(2 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+        if (T_chunks >= 4) {
+            _tile_stored(5, buf, 16 * sizeof(int32_t));
+            for (int t = 0; t < 16; ++t) {
+                const float scale_t = x_scales[3 * 16 + t] * w_scale;
+                for (int nn = 0; nn < 16; ++nn) {
+                    y[(3 * 16 + t) * N + n + nn] = static_cast<float>(buf[t * 16 + nn]) * scale_t;
+                }
+            }
+        }
+    }
+    _tile_release();
+}
+
+
+// One-shot helper: transpose a [N, K/4] packed ternary matrix into
+// [K/4, N, 4] int8 AMX-VNNI layout. Called at load time.
+//
+// w_packed: uint8 [N, K/4]   (4 ternary weights per byte, encoding
+//                             (w0+1) | (w1+1)<<2 | (w2+1)<<4 | (w3+1)<<6)
+// w_amx:    int8 [K/4, N, 4]  (output, caller-allocated, 4*N*K/4 bytes)
+LSPK_API void transpose_packed_to_amx_vnni(
+    const uint8_t* __restrict__ w_packed,
+    int8_t*        __restrict__ w_amx,
+    int N, int K
+) {
+    const int Kb = K >> 2;
+#pragma omp parallel for schedule(static)
+    for (int kb = 0; kb < Kb; ++kb) {
+        for (int n = 0; n < N; ++n) {
+            const uint8_t b = w_packed[static_cast<ptrdiff_t>(n) * Kb + kb];
+            int8_t* dst = w_amx
+                + static_cast<ptrdiff_t>(kb) * N * 4
+                + static_cast<ptrdiff_t>(n) * 4;
+            dst[0] = static_cast<int8_t>((b >> 0) & 0x3) - 1;
+            dst[1] = static_cast<int8_t>((b >> 2) & 0x3) - 1;
+            dst[2] = static_cast<int8_t>((b >> 4) & 0x3) - 1;
+            dst[3] = static_cast<int8_t>((b >> 6) & 0x3) - 1;
+        }
+    }
+}
+#endif  // LITESPARK_USE_AMX
+
+
+// Fused RMSNorm + per-tensor absmax int8 quantize.
+//
+// Single pass through x for sum-of-squares, then a single pass that
+// computes v = x * rrms * gamma, tracks absmax, and writes int8 once
+// scale is known. Saves the round-trip through the fp32 RMSNorm output
+// buffer plus one ctypes call per (rmsnorm, quantize) pair (4 per layer
+// in the BitNet forward).
+//
+// Returns the absmax scale (= max|v| / 127, clamped at 1e-5/127 floor).
+// Two variants: bf16 gamma (uint16) and fp32 gamma.
+static inline float _rmsnorm_quantize_core_bf16(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ gamma,
+    int8_t* __restrict__ x_int8_out,
+    int K, float eps,
+    float* tmp_fp32  // scratch [K]
+) {
+    // Pass 1: sum of squares.
+    __m512 ssq = _mm512_setzero_ps();
+    int k = 0;
+    for (; k + 16 <= K; k += 16) {
+        const __m512 v = _mm512_loadu_ps(x + k);
+        ssq = _mm512_fmadd_ps(v, v, ssq);
+    }
+    float sum_sq = hsum_f32_x16(ssq);
+    for (; k < K; ++k) sum_sq += x[k] * x[k];
+    const float rrms = 1.0f / std::sqrt(sum_sq / static_cast<float>(K) + eps);
+    const __m512 rrms_v = _mm512_set1_ps(rrms);
+
+    // Pass 2: write tmp_fp32 = x * rrms * gamma; track absmax.
+    __m512 absmax_v = _mm512_setzero_ps();
+    const __m512 sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
+    k = 0;
+    for (; k + 16 <= K; k += 16) {
+        const __m512 vx = _mm512_loadu_ps(x + k);
+        const __m256i g16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(gamma + k));
+        const __m512i g32 = _mm512_cvtepu16_epi32(g16);
+        const __m512  g   = _mm512_castsi512_ps(_mm512_slli_epi32(g32, 16));
+        const __m512  out = _mm512_mul_ps(_mm512_mul_ps(vx, rrms_v), g);
+        _mm512_storeu_ps(tmp_fp32 + k, out);
+        absmax_v = _mm512_max_ps(absmax_v, _mm512_and_ps(out, sign_mask));
+    }
+    float absmax = _mm512_reduce_max_ps(absmax_v);
+    for (; k < K; ++k) {
+        uint32_t gbits = static_cast<uint32_t>(gamma[k]) << 16;
+        float gv;
+        std::memcpy(&gv, &gbits, sizeof(float));
+        const float v = x[k] * rrms * gv;
+        tmp_fp32[k] = v;
+        const float a = std::fabs(v);
+        if (a > absmax) absmax = a;
+    }
+    if (absmax < 1e-5f) absmax = 1e-5f;
+    const float scale = absmax / 127.0f;
+    const float inv_scale = 1.0f / scale;
+
+    // Pass 3: quantize tmp_fp32 to int8.
+    const __m512 inv_v = _mm512_set1_ps(inv_scale);
+    k = 0;
+    for (; k + 16 <= K; k += 16) {
+        const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(tmp_fp32 + k), inv_v);
+        const __m512i i32 = _mm512_cvtps_epi32(v);
+        const __m128i i8  = _mm512_cvtsepi32_epi8(i32);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(x_int8_out + k), i8);
+    }
+    for (; k < K; ++k) {
+        float v = tmp_fp32[k] * inv_scale;
+        int32_t iv = static_cast<int32_t>(std::round(v));
+        if (iv >  127) iv =  127;
+        if (iv < -127) iv = -127;
+        x_int8_out[k] = static_cast<int8_t>(iv);
+    }
+    return scale;
+}
+
+LSPK_API float rmsnorm_quantize_bf16gamma_avx512(
+    const float*    __restrict__ x,
+    const uint16_t* __restrict__ gamma,
+    int8_t*         __restrict__ x_int8_out,
+    float*          __restrict__ tmp_fp32,
+    int K, float eps
+) {
+    return _rmsnorm_quantize_core_bf16(x, gamma, x_int8_out, K, eps, tmp_fp32);
+}
+
+LSPK_API void rmsnorm_quantize_bf16gamma_batched_avx512(
+    const float*    __restrict__ x,           // [T, K]
+    const uint16_t* __restrict__ gamma,       // [K]
+    int8_t*         __restrict__ x_int8_out,  // [T, K]
+    float*          __restrict__ scales_out,  // [T]
+    float*          __restrict__ tmp_fp32,    // [T, K]
+    int T, int K, float eps
+) {
+#pragma omp parallel for if(T >= 2) schedule(static)
+    for (int t = 0; t < T; ++t) {
+        scales_out[t] = _rmsnorm_quantize_core_bf16(
+            x + (ptrdiff_t)t * K,
+            gamma,
+            x_int8_out + (ptrdiff_t)t * K,
+            K, eps,
+            tmp_fp32 + (ptrdiff_t)t * K);
+    }
+}
+
+
 // Batched (T-token) versions of the per-row helpers used by prefill.
 // Each one processes T independent K-vectors in a single C call so the
 // ctypes round-trip and any thread-launch overhead amortize across T.
