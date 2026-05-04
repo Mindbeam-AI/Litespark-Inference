@@ -176,7 +176,7 @@ def _quantize_embedding_int8(
 def load_bitnet_2b(
     repo: str = _DEFAULT_HF_REPO,
     *,
-    embed_dtype: str = "int8",
+    embed_dtype: str = "int4",
 ) -> PackedBitNetModel:
     """
     Load bitnet-2b torchless.
