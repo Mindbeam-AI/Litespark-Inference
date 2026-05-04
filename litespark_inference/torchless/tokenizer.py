@@ -74,7 +74,59 @@ class BitNetTokenizer:
         return f"{system}\n\nQuestion: {prompt}\nAnswer:"
 
 
-def load_tokenizer(repo: str = _DEFAULT_HF_REPO) -> BitNetTokenizer:
+@dataclass
+class FalconTokenizer:
+    _tok: "object"
+    eos_token_id: int
+    bos_token_id: Optional[int]
+    pad_token_id: Optional[int]
+    chat_template: Optional[str]
+    eos_token: Optional[str] = None
+    bos_token: Optional[str] = None
+    stop_token_ids: tuple[int, ...] = ()
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        return self._tok.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        return self._tok.decode(list(ids), skip_special_tokens=skip_special_tokens)
+
+    def format_messages(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        add_generation_prompt: bool = True,
+    ) -> str:
+        if self.chat_template and "<|im_start|>" in self.chat_template:
+            bos = self.bos_token or ""
+            parts = [bos]
+            for message in messages:
+                role = message["role"]
+                content = message["content"]
+                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+            if add_generation_prompt:
+                parts.append("<|im_start|>assistant\n")
+            return "".join(parts)
+
+        system_messages = [m["content"] for m in messages if m["role"] == "system"]
+        user_messages = [m["content"] for m in messages if m["role"] == "user"]
+        instruction = system_messages[-1] if system_messages else ""
+        latest_user = user_messages[-1] if user_messages else ""
+        return f"{instruction}\n\nQuestion: {latest_user}\nAnswer:".strip()
+
+    def format_chat(self, prompt: str, system: Optional[str] = None) -> str:
+        if system is None:
+            system = ("You are Litespark, a helpful AI assistant running locally. "
+                      "Provide accurate, concise, and practical answers.")
+        return self.format_messages(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ]
+        )
+
+
+def load_tokenizer(repo: str = _DEFAULT_HF_REPO) -> BitNetTokenizer | FalconTokenizer:
     # Import inside function so `import litespark_inference.torchless` stays
     # cheap for callers that don't need the tokenizer.
     from tokenizers import Tokenizer  # type: ignore
@@ -97,19 +149,45 @@ def load_tokenizer(repo: str = _DEFAULT_HF_REPO) -> BitNetTokenizer:
             if isinstance(x, dict):
                 return x.get("content")
             return x
-        eos_id = tok.token_to_id(_content(eos)) if eos else None
-        bos_id = tok.token_to_id(_content(bos)) if bos else None
-        pad_id = tok.token_to_id(_content(pad)) if pad else None
+        eos_token = _content(eos)
+        bos_token = _content(bos)
+        pad_token = _content(pad)
+        eos_id = tok.token_to_id(eos_token) if eos_token else None
+        bos_id = tok.token_to_id(bos_token) if bos_token else None
+        pad_id = tok.token_to_id(pad_token) if pad_token else None
         chat_template = cfg.get("chat_template")
+    else:
+        eos_token = None
+        bos_token = None
 
     if eos_id is None:
         # Fall back to a common default for Llama-style tokenizers.
-        eos_id = tok.token_to_id("<|end_of_text|>") or 0
+        eos_token = "<|end_of_text|>"
+        eos_id = tok.token_to_id(eos_token) or 0
 
-    return BitNetTokenizer(
+    stop_ids = {int(eos_id)}
+    im_end_id = tok.token_to_id("<|im_end|>")
+    if im_end_id is not None and chat_template and "<|im_end|>" in chat_template:
+        stop_ids.add(int(im_end_id))
+
+    tokenizer_cls = (
+        FalconTokenizer
+        if chat_template and "<|im_start|>" in chat_template
+        else BitNetTokenizer
+    )
+
+    common = dict(
         _tok=tok,
         eos_token_id=int(eos_id),
         bos_token_id=int(bos_id) if bos_id is not None else None,
         pad_token_id=int(pad_id) if pad_id is not None else None,
         chat_template=chat_template,
     )
+    if tokenizer_cls is FalconTokenizer:
+        return FalconTokenizer(
+            **common,
+            eos_token=eos_token,
+            bos_token=bos_token,
+            stop_token_ids=tuple(sorted(stop_ids)),
+        )
+    return BitNetTokenizer(**common)

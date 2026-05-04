@@ -14,7 +14,7 @@ import os
 import platform
 from pathlib import Path
 
-from .model import BitNetConfig, PackedBitNetModel, PackedLayer, PackedProjection
+from .model import BitNetConfig, PackedBitNetModel, PackedLayer, PackedProjection, FalconTernaryConfig, PackedFalconLayer, PackedFalconModel
 from .pack import pack_ternary_4_per_byte
 from .quantize import bf16_u16_to_fp32, quantize_ternary_absmean
 from .safetensors_io import open_safetensors
@@ -318,3 +318,141 @@ def load_bitnet_2b(
         model._emb_mm_length = emb_off1 - emb_off0
 
     return model
+
+
+FALCON_TORCHLESS_REPOS = {
+    "falcon-edge-1b": "tiiuae/Falcon-E-1B-Base",
+    "falcon-edge-1b-instruct": "tiiuae/Falcon-E-1B-Instruct",
+    "falcon-edge-3b": "tiiuae/Falcon-E-3B-Base",
+    "falcon-edge-3b-instruct": "tiiuae/Falcon-E-3B-Instruct",
+}
+
+
+def _check_dtype(a: np.ndarray) -> np.ndarray:
+    if a.dtype == np.uint16:
+        return bf16_u16_to_fp32(a)
+    if a.dtype == np.float32:
+        return a
+    return a.astype(np.float32)
+
+
+def _unpack_hf_packed_bitnet(packed: np.ndarray, out_features: int) -> np.ndarray:
+    """Unpack HF uint8 BitNet packing into int8 {-1, 0, 1} rows."""
+    if packed.ndim == 1:
+        packed = packed[:, None]
+    n, cols = packed.shape
+    out = np.empty((n * 4, cols), dtype=np.uint8)
+    for i in range(4):
+        out[i * n:(i + 1) * n] = (packed >> (2 * i)) & 0x3
+    return out[:out_features].astype(np.int8) - 1
+
+
+def _load_falcon_proj(sf, key: str, out_features: int) -> PackedProjection:
+    raw, _dtype = sf.get(key)
+    scale_key = key + "_scale"
+    if raw.dtype != np.uint8:
+        raise ValueError(f"Expected packed uint8 Falcon projection {key}, got {raw.dtype}")
+    w_int8 = _unpack_hf_packed_bitnet(raw, out_features)
+    if scale_key in sf.header:
+        scale_arr, _ = sf.get(scale_key)
+        scale = float(1.0 / _check_dtype(scale_arr).reshape(-1)[0])
+    else:
+        scale = 1.0
+    N, K = w_int8.shape
+    w_sum = w_int8.sum(axis=1, dtype=np.int32)
+    w_packed = pack_ternary_4_per_byte(w_int8)
+    del raw, w_int8
+    _release_pages()
+    return PackedProjection(
+        w_packed=w_packed,
+        w_sum=w_sum,
+        scale=scale,
+        in_features=K,
+        out_features=N,
+    )
+
+
+def _load_dense_matrix(sf, key: str, embed_dtype: str) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    raw, _ = sf.get(key)
+    if raw.dtype != np.uint16:
+        raise ValueError(f"Falcon dense tensor {key} must be BF16/uint16, got {raw.dtype}")
+    if embed_dtype == "bf16":
+        return raw.copy(), None, None, None
+    if embed_dtype == "int8":
+        q, scale = _quantize_embedding_int8(raw)
+        return None, q, None, scale
+    if embed_dtype == "int4":
+        q, scale = _quantize_embedding_int4(raw)
+        return None, None, q, scale
+    raise ValueError(f"embed_dtype must be 'bf16', 'int8', or 'int4', got {embed_dtype!r}")
+
+
+def load_falcon_edge(model_name: str, *, embed_dtype: str = "int4") -> PackedFalconModel:
+    repo = FALCON_TORCHLESS_REPOS.get(model_name, model_name)
+    config_path, model_path = _resolve_hf_snapshot(repo)
+
+    with open(config_path) as f:
+        hf_config = json.load(f)
+    eos_raw = hf_config.get("eos_token_id", 2)
+    eos_ids = tuple(eos_raw) if isinstance(eos_raw, list) else (int(eos_raw),)
+    config = FalconTernaryConfig(
+        hidden_size=hf_config["hidden_size"],
+        num_layers=hf_config["num_hidden_layers"],
+        num_heads=hf_config["num_attention_heads"],
+        num_kv_heads=hf_config.get("num_key_value_heads", hf_config["num_attention_heads"]),
+        intermediate_size=hf_config["intermediate_size"],
+        vocab_size=hf_config["vocab_size"],
+        max_position_embeddings=hf_config.get("max_position_embeddings", 2048),
+        rms_norm_eps=hf_config.get("rms_norm_eps", 1e-5),
+        rope_theta=hf_config.get("rope_theta", 10000.0),
+        eos_token_ids=eos_ids,
+    )
+
+    sf = open_safetensors(str(model_path))
+    try:
+        emb_bf16, emb_int8, emb_int4, emb_scale = _load_dense_matrix(sf, "model.embed_tokens.weight", embed_dtype)
+        _release_pages()
+
+        if "lm_head.weight" in sf.header:
+            lm_bf16, lm_int8, lm_int4, lm_scale = _load_dense_matrix(sf, "lm_head.weight", embed_dtype)
+        else:
+            lm_bf16, lm_int8, lm_int4, lm_scale = emb_bf16, emb_int8, emb_int4, emb_scale
+        _release_pages()
+
+        final_norm = sf.get("model.norm.weight")[0].copy()
+        layers: list[PackedFalconLayer] = []
+        for i in range(config.num_layers):
+            prefix = f"model.layers.{i}"
+            kv_out = config.num_kv_heads * (config.hidden_size // config.num_heads)
+            layers.append(
+                PackedFalconLayer(
+                    q_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.q_proj.weight", config.hidden_size),
+                    k_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.k_proj.weight", kv_out),
+                    v_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.v_proj.weight", kv_out),
+                    o_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.o_proj.weight", config.hidden_size),
+                    gate_proj=_load_falcon_proj(sf, f"{prefix}.mlp.gate_proj.weight", config.intermediate_size),
+                    up_proj=_load_falcon_proj(sf, f"{prefix}.mlp.up_proj.weight", config.intermediate_size),
+                    down_proj=_load_falcon_proj(sf, f"{prefix}.mlp.down_proj.weight", config.hidden_size),
+                    input_norm=sf.get(f"{prefix}.input_layernorm.weight")[0].copy(),
+                    post_attn_norm=sf.get(f"{prefix}.post_attention_layernorm.weight")[0].copy(),
+                )
+            )
+            _release_pages()
+
+        return PackedFalconModel(
+            config=config,
+            embed_tokens=emb_bf16,
+            embed_int8=emb_int8,
+            embed_int4=emb_int4,
+            embed_scale=emb_scale,
+            lm_head_tokens=lm_bf16,
+            lm_head_int8=lm_int8,
+            lm_head_int4=lm_int4,
+            lm_head_scale=lm_scale,
+            final_norm=final_norm,
+            layers=layers,
+        )
+    finally:
+        sf.close()
+        gc.collect()
+        _release_pages()

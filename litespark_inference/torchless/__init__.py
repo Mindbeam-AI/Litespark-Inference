@@ -14,15 +14,21 @@ POC.
 """
 
 from .api import BitNet, GenResult
-from .loader import load_bitnet_2b
-from .model import PackedBitNetModel
-from .tokenizer import BitNetTokenizer, load_tokenizer
+from .loader import FALCON_TORCHLESS_REPOS, load_bitnet_2b, load_falcon_edge
+from .model import PackedBitNetModel, FalconTernaryConfig, PackedFalconLayer, PackedFalconModel
+from .tokenizer import BitNetTokenizer, FalconTokenizer, load_tokenizer
 
 __all__ = [
     "BitNet",
     "GenResult",
+    "FALCON_TORCHLESS_REPOS",
+    "FalconTernaryConfig",
     "load_bitnet_2b",
+    "load_falcon_edge",
     "PackedBitNetModel",
+    "PackedFalconLayer",
+    "PackedFalconModel",
     "BitNetTokenizer",
+    "FalconTokenizer",
     "load_tokenizer",
 ]

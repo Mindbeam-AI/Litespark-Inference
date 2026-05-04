@@ -29,7 +29,13 @@ _CHAT_UNSUPPORTED_MODELS = {
 # Models the torchless runtime can handle today. Extend as new families are
 # ported. Anything outside this set silently falls back to the torch-backed
 # path so existing Falcon Edge workflows keep working unchanged.
-_TORCHLESS_SUPPORTED_MODELS = {'bitnet-2b'}
+_TORCHLESS_SUPPORTED_MODELS = {
+    'bitnet-2b',
+    'falcon-edge-1b',
+    'falcon-edge-1b-instruct',
+    'falcon-edge-3b',
+    'falcon-edge-3b-instruct',
+}
 
 
 def _should_use_torchless(args) -> bool:
@@ -80,7 +86,9 @@ def cmd_generate(args):
         class _A: pass
         tl_args = _A()
         tl_args.prompt = args.prompt
+        tl_args.model = args.model
         tl_args.max_tokens = args.max_tokens
+        tl_args.embed_dtype = args.embed_dtype
         tl_args.raw = False   # use the chat-format wrapper, like the torch path does
         tl_args.ignore_eos = False
         print(f"[litespark-inference] torchless runtime (model={args.model}).")
@@ -132,7 +140,7 @@ def cmd_chat(args):
         tl_args = _A()
         tl_args.model = args.model
         tl_args.max_tokens = args.max_tokens
-        tl_args.embed_dtype = 'int4'
+        tl_args.embed_dtype = args.embed_dtype
         print(f"[litespark-inference] routing to torchless runtime for '{args.model}'.")
         return _cmd_chat_torchless(tl_args)
 
@@ -204,7 +212,7 @@ def cmd_benchmark(args):
         tl_args = _A()
         tl_args.model = args.model
         tl_args.tokens = args.tokens
-        tl_args.embed_dtype = 'int4'
+        tl_args.embed_dtype = args.embed_dtype
         print(f"[litespark-inference] routing to torchless runtime for '{args.model}'.")
         return _cmd_benchmark_torchless(tl_args)
 
@@ -355,6 +363,7 @@ def main():
     if _is_apple_silicon:
         gen_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     gen_parser.add_argument('--max-tokens', '-n', type=int, default=100, help='Max tokens to generate')
+    gen_parser.add_argument('--embed-dtype', choices=['bf16', 'int8', 'int4'], default='int4')
     gen_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
     gen_parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling threshold')
     gen_parser.add_argument('--top-k', type=int, default=50, help='Top-k sampling')
@@ -366,6 +375,7 @@ def main():
     if _is_apple_silicon:
         chat_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     chat_parser.add_argument('--max-tokens', '-n', type=int, default=200, help='Max tokens per response')
+    chat_parser.add_argument('--embed-dtype', choices=['bf16', 'int8', 'int4'], default='int4')
     chat_parser.add_argument('--temperature', '-t', type=float, default=0.7, help='Sampling temperature')
     chat_parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling threshold')
     chat_parser.add_argument('--top-k', type=int, default=50, help='Top-k sampling')
@@ -377,6 +387,7 @@ def main():
     if _is_apple_silicon:
         bench_parser.add_argument('--mode', type=str, default='neon', choices=['neon', 'accelerate'], help='Kernel mode: neon (fast, int8) or accelerate (accurate, float32)')
     bench_parser.add_argument('--tokens', '-n', type=int, default=20, help='Tokens to generate')
+    bench_parser.add_argument('--embed-dtype', choices=['bf16', 'int8', 'int4'], default='int4')
     bench_parser.set_defaults(func=cmd_benchmark)
 
     # info command

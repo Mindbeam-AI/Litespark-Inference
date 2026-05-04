@@ -107,7 +107,7 @@ def get_current_rss_mb() -> float:
                 capture_output=True, text=True, timeout=5,
             )
             return int(result.stdout.strip()) / 1024
-        except (subprocess.TimeoutExpired, ValueError):
+        except (subprocess.TimeoutExpired, ValueError, OSError):
             pass
     elif system == 'Linux':
         try:
@@ -549,25 +549,39 @@ def _run_inference_benchmark_torchless(
     model_name: str, num_threads: int, num_tokens: int, embed_dtype: str,
 ) -> Dict:
     """Torchless (numpy + extern "C" NEON) inference benchmark path."""
-    from litespark_inference.torchless import load_bitnet_2b, load_tokenizer
-    from litespark_inference.torchless.runtime import forward_one, generate, init_state
     import gc
+    import numpy as np
 
     print(f"\n{'='*70}")
     print(f"INFERENCE BENCHMARK (pp128 + tg{num_tokens}) -- torchless [{embed_dtype}]")
     print(f"{'='*70}\n")
 
-    if model_name != 'bitnet-2b':
-        raise ValueError(
-            f"torchless backend only supports 'bitnet-2b' today, got {model_name!r}. "
-            f"Pass --backend torch for other model families."
-        )
-
     print(f"Loading model: {model_name} (torchless, embed_dtype={embed_dtype})")
     gc.collect()
     mem_before = get_current_rss_mb()
-    model = load_bitnet_2b(embed_dtype=embed_dtype)
-    tokenizer = load_tokenizer()
+    if model_name == 'bitnet-2b':
+        from litespark_inference.torchless import load_bitnet_2b, load_tokenizer
+        from litespark_inference.torchless.runtime import forward_one, generate, init_state
+
+        model = load_bitnet_2b(embed_dtype=embed_dtype)
+        tokenizer = load_tokenizer()
+    elif model_name.startswith('falcon-edge-'):
+        from litespark_inference.torchless import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
+        from litespark_inference.torchless.runtime import falcon_forward_one, init_state
+
+        if model_name not in FALCON_TORCHLESS_REPOS:
+            raise ValueError(
+                f"Unknown Falcon Edge model {model_name!r}. "
+                f"Available Falcon torchless models: {sorted(FALCON_TORCHLESS_REPOS)}"
+        )
+        model = load_falcon_edge(model_name, embed_dtype=embed_dtype)
+        tokenizer = load_tokenizer(FALCON_TORCHLESS_REPOS[model_name])
+    else:
+        raise ValueError(
+            f"Unsupported torchless model {model_name!r}. "
+            "Use 'bitnet-2b' or a model name starting with 'falcon-edge-'."
+        )
+
     gc.collect()
     mem_after = get_current_rss_mb()
     memory_mb_rss = mem_after - mem_before
@@ -600,7 +614,10 @@ def _run_inference_benchmark_torchless(
     print("\nWarming up...")
     state = init_state(model, t_max=t_max)
     for tid in input_ids:
-        _ = forward_one(model, state, int(tid))
+        if model_name == 'bitnet-2b':
+            _ = forward_one(model, state, int(tid))
+        else:
+            _ = falcon_forward_one(model, state, int(tid))
 
     # Prompt processing (pp): time a fresh prefill from scratch.
     print("\nPrompt Processing (pp):")
@@ -609,7 +626,10 @@ def _run_inference_benchmark_torchless(
         state = init_state(model, t_max=t_max)
         start = time.perf_counter()
         for tid in input_ids:
-            _ = forward_one(model, state, int(tid))
+            if model_name == 'bitnet-2b':
+                _ = forward_one(model, state, int(tid))
+            else:
+                _ = falcon_forward_one(model, state, int(tid))
         pp_times.append((time.perf_counter() - start) * 1000)
 
     pp_mean = statistics.mean(pp_times)
@@ -622,8 +642,18 @@ def _run_inference_benchmark_torchless(
     print(f"\nToken Generation (tg{num_tokens}):")
     tg_times = []
     for _ in range(3):
-        start = time.perf_counter()
-        _ = generate(model, input_ids, max_new_tokens=num_tokens)
+        if model_name == 'bitnet-2b':
+            start = time.perf_counter()
+            _ = generate(model, input_ids, max_new_tokens=num_tokens)
+        else:
+            state = init_state(model, t_max=t_max)
+            logits = None
+            for tid in input_ids:
+                logits = falcon_forward_one(model, state, int(tid))
+            start = time.perf_counter()
+            for _ in range(num_tokens):
+                next_id = int(np.argmax(logits))
+                logits = falcon_forward_one(model, state, next_id)
         tg_times.append(time.perf_counter() - start)
 
     tg_mean = statistics.mean(tg_times)
@@ -998,11 +1028,15 @@ def main():
     backend_explicit = any(arg == '--backend' or arg.startswith('--backend=') for arg in argv)
     args = parser.parse_args()
 
-    if (args.inference or args.all) and args.backend == 'torchless' and args.model != 'bitnet-2b':
+    from litespark_inference.torchless import FALCON_TORCHLESS_REPOS
+    torchless_supported_models = {'bitnet-2b', *FALCON_TORCHLESS_REPOS}
+
+    if ((args.inference or args.all) and args.backend == 'torchless' and args.model not in torchless_supported_models):
         if backend_explicit:
             parser.error(
-                "The torchless backend only supports 'bitnet-2b', "
-                f"got {args.model!r}. Pass --backend torch for other model families."
+                f"The torchless backend does not support {args.model!r}. "
+                f"Available torchless models: {sorted(torchless_supported_models)}. "
+                "Pass --backend torch for other model families."
             )
         print(
             f"\n[info] {args.model} is not supported on the torchless backend. "

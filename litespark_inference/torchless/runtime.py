@@ -45,7 +45,7 @@ from .kernel import (
     rmsnorm_quantize_into as _rmsq_fused,
     rmsnorm_quantize_batched as _rmsq_fused_batched,
 )
-from .model import PackedBitNetModel, PackedProjection
+from .model import PackedBitNetModel, PackedFalconModel, PackedProjection
 from .ops import (
     apply_rope,
     bf16_u16_to_fp32,
@@ -665,3 +665,125 @@ def generate(
         generated.append(next_id)
         logits = forward_one(model, state, next_id)
     return generated
+
+
+def _falcon_lm_head(model: PackedFalconModel, x_fp32: np.ndarray, out_logits: np.ndarray) -> np.ndarray:
+    if model.lm_head_int4 is not None:
+        return _lm_head_int4(model.lm_head_int4, model.lm_head_scale, x_fp32, out_logits, H=model.config.hidden_size,)
+    if model.lm_head_int8 is not None:
+        return _lm_head_int8(model.lm_head_int8, model.lm_head_scale, x_fp32, out_logits)
+    return _lm_head_bf16(model.lm_head_tokens, x_fp32, out_logits)
+
+
+def _falcon_embed_lookup(model: PackedFalconModel, token_id: int) -> np.ndarray:
+    if model.embed_int4 is not None:
+        H_half = model.embed_int4.shape[1]
+        packed = model.embed_int4[token_id].astype(np.int8)
+        low = (packed.astype(np.int8) << 4) >> 4
+        high = packed.astype(np.int8) >> 4
+        row = np.empty(H_half * 2, dtype=np.float32)
+        row[0::2] = low.astype(np.float32)
+        row[1::2] = high.astype(np.float32)
+        row *= model.embed_scale[token_id]
+        return row
+    if model.embed_int8 is not None:
+        row = model.embed_int8[token_id].astype(np.float32)
+        row *= model.embed_scale[token_id]
+        return row
+    return bf16_u16_to_fp32(model.embed_tokens[token_id:token_id + 1])[0].copy()
+
+
+def _silu_mul_into(gate: np.ndarray, up: np.ndarray, out: np.ndarray) -> np.ndarray:
+    np.negative(gate, out=out)
+    np.exp(out, out=out)
+    out += 1.0
+    np.divide(gate, out, out=out)
+    out *= up
+    return out
+
+
+def falcon_forward_one(model: PackedFalconModel, state: InferState, token_id: int) -> np.ndarray:
+    c = model.config
+    H = c.hidden_size
+    D = H // c.num_heads
+    Q = c.num_heads
+    KV = c.num_kv_heads
+    GQA = Q // KV
+
+    if state.pos >= state.t_max:
+        raise RuntimeError(f"inference state exhausted: pos={state.pos} >= t_max={state.t_max}")
+
+    x = state.sc_residual
+    np.copyto(x, _falcon_embed_lookup(model, token_id))
+
+    cos_row = state.rope_cos[state.pos]
+    sin_row = state.rope_sin[state.pos]
+    inv_sqrt_d = 1.0 / float(np.sqrt(D))
+
+    h_i8 = state.sc_int8_hidden
+    i_i8 = state.sc_int8_inter
+    h_fp = state.sc_hidden_norm
+    i_fp = state.sc_inter_norm
+
+    for li, layer in enumerate(model.layers):
+        _rmsnorm_neon(x, layer.input_norm, h_fp, eps=c.rms_norm_eps)
+        h_scale = _quant_neon(h_fp, h_i8)
+        q_flat = _call_matmul(h_i8, h_scale, layer.q_proj, state.sc_q)
+        k_flat = _call_matmul(h_i8, h_scale, layer.k_proj, state.sc_k)
+        v_flat = _call_matmul(h_i8, h_scale, layer.v_proj, state.sc_v)
+
+        q = apply_rope(q_flat.reshape(Q, D), cos_row, sin_row)
+        k = apply_rope(k_flat.reshape(KV, D), cos_row, sin_row)
+
+        state.cache_k[li, state.pos] = k
+        state.cache_v[li, state.pos] = v_flat.reshape(KV, D)
+        k_hist = state.cache_k[li, :state.pos + 1]
+        v_hist = state.cache_v[li, :state.pos + 1]
+
+        q_grouped = q.reshape(KV, GQA, D)
+        k_perm = k_hist.transpose(1, 0, 2)
+        scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))
+        scores *= inv_sqrt_d
+        weights = softmax(scores, axis=-1)
+        v_perm = v_hist.transpose(1, 0, 2)
+        attn = np.matmul(weights, v_perm)
+        attn_flat = np.ascontiguousarray(attn.reshape(Q * D))
+
+        attn_scale = _quant_neon(attn_flat, h_i8)
+        _call_matmul(h_i8, attn_scale, layer.o_proj, state.sc_hidden_a)
+        _add_inplace(x, state.sc_hidden_a)
+
+        _rmsnorm_neon(x, layer.post_attn_norm, h_fp, eps=c.rms_norm_eps)
+        h_scale = _quant_neon(h_fp, h_i8)
+        _call_matmul(h_i8, h_scale, layer.gate_proj, state.sc_inter_a)
+        _call_matmul(h_i8, h_scale, layer.up_proj, state.sc_inter_b)
+        _silu_mul_into(state.sc_inter_a, state.sc_inter_b, i_fp)
+        inter_scale = _quant_neon(i_fp, i_i8)
+        _call_matmul(i_i8, inter_scale, layer.down_proj, state.sc_hidden_b)
+        _add_inplace(x, state.sc_hidden_b)
+
+    _rmsnorm_neon(x, model.final_norm, h_fp, eps=c.rms_norm_eps)
+    logits = _falcon_lm_head(model, h_fp, state.sc_logits)
+    state.pos += 1
+    return logits
+
+
+def falcon_forward_prefill(model: PackedFalconModel, state: InferState, token_ids: list[int]) -> np.ndarray:
+    logits = None
+    for token_id in token_ids:
+        logits = falcon_forward_one(model, state, int(token_id))
+    return logits
+
+
+def falcon_generate(model: PackedFalconModel, token_ids: list[int], max_new_tokens: int) -> list[int]:
+    state = init_state(model, t_max=len(token_ids) + max_new_tokens + 1)
+    logits = falcon_forward_prefill(model, state, token_ids)
+    out: list[int] = []
+    eos = set(model.config.eos_token_ids)
+    for _ in range(max_new_tokens):
+        next_id = int(np.argmax(logits))
+        if next_id in eos:
+            break
+        out.append(next_id)
+        logits = falcon_forward_one(model, state, next_id)
+    return out
