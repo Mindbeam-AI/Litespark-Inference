@@ -26,6 +26,14 @@ from setuptools.command.build_ext import build_ext
 
 _KERNEL_SRC = Path("litespark_inference/kernels/arm64/matmul_lut_neon_extern_c.cpp")
 
+# The NEON kernel source unconditionally includes <arm_neon.h>, so it can only
+# be compiled on ARM64. On x86_64 we skip the extension entirely; the package
+# still installs cleanly and the runtime falls back to the x86_64 kernels under
+# litespark_inference/kernels/x86_64/ (or to torch/transformers when those are
+# unavailable). Without this gate, `pip install` on Linux/macOS x86 fails with
+# "'arm_neon.h' file not found".
+_IS_ARM64 = platform.machine().lower() in ("arm64", "aarch64")
+
 
 def _platform_compile_args() -> tuple[list[str], list[str]]:
     """Return (extra_compile_args, extra_link_args) for the current platform.
@@ -104,6 +112,6 @@ _torchless_ext = Extension(
 
 
 setup(
-    ext_modules=[_torchless_ext] if _KERNEL_SRC.exists() else [],
+    ext_modules=[_torchless_ext] if (_KERNEL_SRC.exists() and _IS_ARM64) else [],
     cmdclass={"build_ext": _NEONExtensionBuild},
 )
