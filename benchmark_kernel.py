@@ -25,6 +25,7 @@ import statistics
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 import argparse
+import numpy as np
 
 
 @dataclass
@@ -622,8 +623,15 @@ def _run_inference_benchmark_torchless(
     print(f"\nToken Generation (tg{num_tokens}):")
     tg_times = []
     for _ in range(3):
+        state = init_state(model, t_max=t_max)
+        logits = None
+        for tid in input_ids:
+            logits = forward_one(model, state, int(tid))
+
         start = time.perf_counter()
-        _ = generate(model, input_ids, max_new_tokens=num_tokens)
+        for _ in range(num_tokens):
+            next_id = int(np.argmax(logits))
+            logits = forward_one(model, state, next_id)
         tg_times.append(time.perf_counter() - start)
 
     tg_mean = statistics.mean(tg_times)
