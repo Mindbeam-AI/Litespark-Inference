@@ -13,26 +13,42 @@ the extern "C" NEON packed matmul kernel for every projection.
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
 import time
 
 
-def cmd_info(args: argparse.Namespace) -> int:
-    import platform
+def _is_apple_silicon() -> bool:
+    return platform.system() == "Darwin" and platform.machine().lower() in ("arm64", "aarch64")
 
-    from .kernel import ensure_built, has_omp, max_threads
+
+def _kernel_label(mode: str) -> str:
+    if mode == "accelerate":
+        return "accelerate (torchless, Apple Accelerate)"
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        return "neon (torchless, extern \"C\" NEON SDOT)"
+    if machine in ("x86_64", "amd64"):
+        return "avx512 (torchless, extern \"C\" AVX-512/VNNI)"
+    return "torchless"
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    from .kernel import ensure_built, has_accelerate, has_omp, max_threads
 
     print(f"litespark_inference.torchless")
     print(f"  platform : {platform.system()} {platform.machine()}")
     print(f"  python   : {platform.python_version()}")
     print(f"  kernel   : {ensure_built()}")
     print(f"  OpenMP   : {has_omp()}  (max_threads={max_threads()})")
+    print(f"  Accelerate: {has_accelerate()}")
     return 0
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
     model_name = getattr(args, "model", "bitnet-2b")
     embed_dtype = getattr(args, "embed_dtype", "int4")
+    mode = getattr(args, "mode", "neon")
 
     print(f"Loading tokenizer...", flush=True)
     t0 = time.perf_counter()
@@ -41,7 +57,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
         from .runtime import forward_one, forward_prefill, init_state
 
         tok = load_tokenizer()
-        model = load_bitnet_2b(embed_dtype=embed_dtype)
+        model = load_bitnet_2b(embed_dtype=embed_dtype, mode=mode)
     elif model_name.startswith("falcon-edge-"):
         from . import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
         from .runtime import falcon_forward_one, falcon_forward_prefill, init_state
@@ -52,7 +68,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
                 f"Available: {sorted(FALCON_TORCHLESS_REPOS)}"
         )
         tok = load_tokenizer(FALCON_TORCHLESS_REPOS[model_name])
-        model = load_falcon_edge(model_name, embed_dtype=embed_dtype)
+        model = load_falcon_edge(model_name, embed_dtype=embed_dtype, mode=mode)
     else:
         raise ValueError(f"Unsupported torchless model {model_name!r}.")
     print(f"  {time.perf_counter() - t0:.2f}s")
@@ -121,8 +137,13 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     print(f"\nArchitecture: {platform.machine()}")
     print(f"Platform: {platform.system()}")
     from .kernel import has_omp, max_threads
-    print(f"Kernel: neon (torchless, extern \"C\" NEON SDOT, OMP={has_omp()} "
-          f"max_threads={max_threads()})")
+
+    mode = getattr(args, "mode", "neon")
+    if mode == "accelerate":
+        print(f"Kernel: {_kernel_label(mode)}")
+    else:
+        print(f"Kernel: {_kernel_label(mode)} (OMP={has_omp()} "
+              f"max_threads={max_threads()})")
 
     print(f"\nLoading model: {args.model} (embed_dtype={args.embed_dtype})")
     t0 = time.perf_counter()
@@ -130,7 +151,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         from . import load_bitnet_2b, load_tokenizer
         from .runtime import forward_one, init_state
 
-        model = load_bitnet_2b(embed_dtype=args.embed_dtype)
+        model = load_bitnet_2b(embed_dtype=args.embed_dtype, mode=mode)
         tok = load_tokenizer()
     elif args.model.startswith("falcon-edge-"):
         from . import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
@@ -141,7 +162,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
                 f"Unknown Falcon Edge model {args.model!r}. "
                 f"Available: {sorted(FALCON_TORCHLESS_REPOS)}"
         )
-        model = load_falcon_edge(args.model, embed_dtype=args.embed_dtype)
+        model = load_falcon_edge(args.model, embed_dtype=args.embed_dtype, mode=mode)
         tok = load_tokenizer(FALCON_TORCHLESS_REPOS[args.model])
     else:
         raise ValueError(f"Unsupported torchless model {args.model!r}. ")
@@ -150,9 +171,10 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     tb = model.tensor_bytes()
     MB = 1024 * 1024
     total_tensor_mb = tb["total_incl_embedding"] / MB
-    print(f"Memory: {total_tensor_mb:.0f} MB  "
-          f"(packed={tb['packed_weights']/MB:.0f} MB, "
-          f"embed={tb['embedding']/MB:.0f} MB)")
+    weight_type = (
+        f"float32={tb.get('float32_weights', 0)/MB:.0f} MB"
+        if mode == "accelerate" else f"packed={tb['packed_weights']/MB:.0f} MB")
+    print(f"Memory: {total_tensor_mb:.0f} MB  "f"({weight_type}, embed={tb['embedding']/MB:.0f} MB)")
     print(f"Load time: {load_t:.2f}s")
 
     prompt = "The quick brown fox jumps over the lazy dog."
@@ -231,11 +253,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
     print("Loading tokenizer and model...", flush=True)
     model_name = getattr(args, "model", "bitnet-2b")
+    mode = getattr(args, "mode", "neon")
     if model_name == "bitnet-2b":
         from . import load_bitnet_2b, load_tokenizer
         from .runtime import forward_one, init_state
 
-        model = load_bitnet_2b(embed_dtype=args.embed_dtype)
+        model = load_bitnet_2b(embed_dtype=args.embed_dtype, mode=mode)
         tok = load_tokenizer()
     elif model_name.startswith("falcon-edge-"):
         from . import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
@@ -246,7 +269,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 f"Unknown Falcon Edge model {model_name!r}. "
                 f"Available: {sorted(FALCON_TORCHLESS_REPOS)}"
         )
-        model = load_falcon_edge(model_name, embed_dtype=args.embed_dtype)
+        model = load_falcon_edge(model_name, embed_dtype=args.embed_dtype, mode=mode)
         tok = load_tokenizer(FALCON_TORCHLESS_REPOS[model_name])
     else:
         raise ValueError(f"Unsupported torchless model {model_name!r}.")
@@ -343,6 +366,9 @@ def main(argv: list[str] | None = None) -> int:
     pg.add_argument("prompt", type=str)
     pg.add_argument("--model", "-m", type=str, default="bitnet-2b")
     pg.add_argument("--max-tokens", type=int, default=32)
+    if _is_apple_silicon():
+        pg.add_argument("--mode", choices=["neon", "accelerate"], default="neon",
+                        help="Backend: packed NEON or Apple Accelerate.")
     pg.add_argument("--embed-dtype", choices=["bf16", "int8", "int4"], default="int4")
     pg.add_argument("--raw", action="store_true",
                     help="Skip the chat-format wrapper around the prompt.")
@@ -357,16 +383,24 @@ def main(argv: list[str] | None = None) -> int:
     pb.add_argument("--model", type=str, default="bitnet-2b")
     pb.add_argument("--tokens", type=int, default=32,
                     help="Tokens to generate for the tg measurement.")
+    if _is_apple_silicon():
+        pb.add_argument("--mode", choices=["neon", "accelerate"], default="neon",
+                        help="Backend: packed NEON or Apple Accelerate.")
     pb.add_argument("--embed-dtype", choices=["bf16", "int8", "int4"], default="int4")
     pb.set_defaults(func=cmd_benchmark)
 
     pc = sub.add_parser("chat", help="Interactive chat (greedy decode)")
     pc.add_argument("--model", type=str, default="bitnet-2b")
     pc.add_argument("--max-tokens", type=int, default=256)
+    if _is_apple_silicon():
+        pc.add_argument("--mode", choices=["neon", "accelerate"], default="neon",
+                        help="Backend: packed NEON or Apple Accelerate.")
     pc.add_argument("--embed-dtype", choices=["bf16", "int8", "int4"], default="int4")
     pc.set_defaults(func=cmd_chat)
 
     args = p.parse_args(argv)
+    if not hasattr(args, "mode"):
+        args.mode = "neon"
     return args.func(args)
 
 

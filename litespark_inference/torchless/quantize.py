@@ -58,3 +58,9 @@ def quantize_ternary_absmean(
         block_fp32 = bf16_u16_to_fp32(w_bf16_u16[r0:r1])
         w_int8[r0:r1] = np.round(block_fp32 * scale_inv).clip(-1, 1).astype(np.int8)
     return w_int8, absmean
+
+def quantize_ternary_absmean_f32(w_bf16_u16: np.ndarray, row_block: int = 128) -> tuple[np.ndarray, float]:
+    w_int8, absmean = quantize_ternary_absmean(w_bf16_u16, row_block=row_block)
+    w_f32 = w_int8.astype(np.float32)
+    w_f32 *= absmean
+    return w_f32, absmean

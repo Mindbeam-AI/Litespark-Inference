@@ -89,6 +89,7 @@ def cmd_generate(args):
         tl_args.model = args.model
         tl_args.max_tokens = args.max_tokens
         tl_args.embed_dtype = args.embed_dtype
+        tl_args.mode = getattr(args, 'mode', 'neon')
         tl_args.raw = False   # use the chat-format wrapper, like the torch path does
         tl_args.ignore_eos = False
         print(f"[litespark-inference] torchless runtime (model={args.model}).")
@@ -141,6 +142,7 @@ def cmd_chat(args):
         tl_args.model = args.model
         tl_args.max_tokens = args.max_tokens
         tl_args.embed_dtype = args.embed_dtype
+        tl_args.mode = getattr(args, 'mode', 'neon')
         print(f"[litespark-inference] routing to torchless runtime for '{args.model}'.")
         return _cmd_chat_torchless(tl_args)
 
@@ -213,6 +215,7 @@ def cmd_benchmark(args):
         tl_args.model = args.model
         tl_args.tokens = args.tokens
         tl_args.embed_dtype = args.embed_dtype
+        tl_args.mode = getattr(args, 'mode', 'neon')
         print(f"[litespark-inference] routing to torchless runtime for '{args.model}'.")
         return _cmd_benchmark_torchless(tl_args)
 

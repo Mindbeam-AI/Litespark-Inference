@@ -131,6 +131,8 @@ def _compile() -> None:
         base += ["-mcpu=native"] if platform.system() == "Darwin" else [
             "-march=armv8.2-a+dotprod",
         ]
+        if platform.system() == "Darwin":
+            base += ["-framework", "Accelerate"]
     elif _IS_X86:
         # Match setup.py: AVX-512F + BW + DQ + VNNI + VBMI + FMA.
         base += [
@@ -202,6 +204,10 @@ def _load() -> ctypes.CDLL:
     _alias("matmul_lut_m1", f"matmul_lut_{T}_m1",
            [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
            None)
+    if hasattr(lib, f"matmul_accelerate_f32_{T}_m1"):
+        _alias("matmul_accelerate_f32_m1", f"matmul_accelerate_f32_{T}_m1",
+               [_F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+               None)
     # Pre-unpacked-weights matmul: x86 only today (no NEON variant yet).
     if _IS_X86 and hasattr(lib, f"matmul_unpacked_{T}_m1"):
         _alias("matmul_unpacked_m1", f"matmul_unpacked_{T}_m1",
@@ -277,6 +283,8 @@ def _load() -> ctypes.CDLL:
            None)
     _alias("has_omp_probe", f"matmul_lut_{T}_has_omp", [], ctypes.c_int)
     _alias("max_threads_probe", f"matmul_lut_{T}_max_threads", [], ctypes.c_int)
+    if hasattr(lib, f"matmul_lut_{T}_has_accelerate"):
+        _alias("has_accelerate_probe", f"matmul_lut_{T}_has_accelerate", [], ctypes.c_int)
 
     _lib = lib
     return lib
@@ -288,6 +296,11 @@ def has_omp() -> bool:
 
 def max_threads() -> int:
     return int(_load().max_threads_probe())
+
+
+def has_accelerate() -> bool:
+    lib = _load()
+    return bool(getattr(lib, "has_accelerate_probe", lambda: 0)())
 
 
 # All wrappers below skip per-call dtype/shape asserts and just hand the
@@ -397,6 +410,17 @@ def matmul_packed_m1(
     if out is None:
         out = np.empty(N, dtype=np.float32)
     _load().matmul_lut_m1(x_int8, packed_w, w_scale, x_scale, out, N, K)
+    return out
+
+
+def matmul_accelerate_f32_m1(x_fp32: np.ndarray, w_float32: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
+    lib = _load()
+    if not hasattr(lib, "matmul_accelerate_f32_m1") or not has_accelerate():
+        raise RuntimeError("mode='accelerate' requires Apple Accelerate")
+    N, K = w_float32.shape
+    if out is None:
+        out = np.empty(N, dtype=np.float32)
+    lib.matmul_accelerate_f32_m1(x_fp32, w_float32, out, N, K)
     return out
 
 

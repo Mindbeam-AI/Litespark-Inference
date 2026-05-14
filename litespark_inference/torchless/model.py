@@ -37,11 +37,12 @@ class PackedProjection:
     in memory but lets the matmul skip the entire port-5 unpack chain. Set
     by the loader when LITESPARK_PREUNPACK=1; None otherwise.
     """
-    w_packed: np.ndarray              # uint8 [N, ceil(K/4)]
+    w_packed: "np.ndarray | None"     # uint8 [N, ceil(K/4)]
     w_sum: np.ndarray                 # int32 [N] (unused by the current M=1 kernel)
     scale: float                      # per-tensor absmean
     in_features: int
     out_features: int
+    w_float32: "np.ndarray | None" = None  # fp32 [N, K], scaled ternary
     w_unpacked: "np.ndarray | None" = None   # uint8 [N, K] in [0, 1, 2]
     # AMX-VNNI layout: int8 [K/4, N, 4] in {-1, 0, +1}. Set by the loader
     # when LITESPARK_AMX=1 and the kernel was built with AMX support.
@@ -70,6 +71,7 @@ class PackedBitNetModel:
     # full-precision path, or None if loaded with int8 embedding quant.
     embed_tokens: "np.ndarray | None"
     final_norm: np.ndarray
+    projection_backend: str = "neon"
     layers: list = field(default_factory=list)
 
     # Optional int8 per-row-quantized embedding. When these are set the
@@ -122,6 +124,7 @@ class PackedBitNetModel:
             return int(x.nbytes) if isinstance(x, np.ndarray) else 0
 
         packed = 0
+        float32 = 0
         sums = 0
         norms = 0
         for L in self.layers:
@@ -129,6 +132,7 @@ class PackedBitNetModel:
                               "gate_proj", "up_proj", "down_proj"):
                 p = getattr(L, proj_name)
                 packed += nbytes(p.w_packed)
+                float32 += nbytes(p.w_float32)
                 sums += nbytes(p.w_sum)
             for n in ("input_norm", "post_attn_norm", "attn_sub_norm", "ffn_sub_norm"):
                 norms += nbytes(getattr(L, n))
@@ -136,6 +140,7 @@ class PackedBitNetModel:
         scales = 0
         return {
             "packed_weights": packed,
+            "float32_weights": float32,
             "w_sum": sums,
             "scales": scales,
             "per_layer_norms": norms,
@@ -146,9 +151,9 @@ class PackedBitNetModel:
                 + nbytes(self.embed_int4)
                 + nbytes(self.embed_scale)
             ),
-            "total_excl_embedding": packed + sums + scales + norms + nbytes(self.final_norm),
+            "total_excl_embedding": packed + float32 + sums + scales + norms + nbytes(self.final_norm),
             "total_incl_embedding": (
-                packed + sums + scales + norms + nbytes(self.final_norm)
+                packed + float32 + sums + scales + norms + nbytes(self.final_norm)
                 + nbytes(self.embed_tokens)
                 + nbytes(self.embed_int8)
                 + nbytes(self.embed_int4)
@@ -189,6 +194,7 @@ class PackedFalconModel:
     config: FalconTernaryConfig
     embed_tokens: "np.ndarray | None"
     final_norm: np.ndarray
+    projection_backend: str = "neon"
     layers: list[PackedFalconLayer] = field(default_factory=list)
 
     embed_int8: "np.ndarray | None" = None
@@ -205,6 +211,7 @@ class PackedFalconModel:
             return int(x.nbytes) if isinstance(x, np.ndarray) else 0
 
         packed = 0
+        float32 = 0
         sums = 0
         norms = 0
         for layer in self.layers:
@@ -214,6 +221,7 @@ class PackedFalconModel:
             ):
                 proj = getattr(layer, proj_name)
                 packed += nbytes(proj.w_packed)
+                float32 += nbytes(proj.w_float32)
                 sums += nbytes(proj.w_sum)
             norms += nbytes(layer.input_norm) + nbytes(layer.post_attn_norm)
 
@@ -229,9 +237,10 @@ class PackedFalconModel:
             + nbytes(self.lm_head_int4)
             + nbytes(self.lm_head_scale)
         )
-        total = packed + sums + norms + nbytes(self.final_norm) + embedding + lm_head
+        total = packed + float32 + sums + norms + nbytes(self.final_norm) + embedding + lm_head
         return {
             "packed_weights": packed,
+            "float32_weights": float32,
             "w_sum": sums,
             "per_layer_norms": norms,
             "final_norm": nbytes(self.final_norm),

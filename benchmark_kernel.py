@@ -27,6 +27,32 @@ from typing import List, Tuple, Dict
 import argparse
 
 
+def _is_apple_silicon() -> bool:
+    return platform.system() == 'Darwin' and platform.machine().lower() in ('arm64', 'aarch64')
+
+
+def _torchless_kernel_name(mode: str) -> str:
+    if mode == 'accelerate':
+        return 'accelerate-torchless'
+    machine = platform.machine().lower()
+    if machine in ('arm64', 'aarch64'):
+        return 'neon-torchless'
+    if machine in ('x86_64', 'amd64'):
+        return 'avx512-torchless'
+    return 'torchless'
+
+
+def _torchless_kernel_label(mode: str) -> str:
+    if mode == 'accelerate':
+        return 'accelerate (torchless, Apple Accelerate/BLAS)'
+    machine = platform.machine().lower()
+    if machine in ('arm64', 'aarch64'):
+        return 'neon (torchless, extern "C" NEON SDOT + OMP)'
+    if machine in ('x86_64', 'amd64'):
+        return 'avx512 (torchless, extern "C" AVX-512/VNNI + OMP)'
+    return 'torchless'
+
+
 @dataclass
 class BenchmarkResult:
     matrix_size: str
@@ -521,12 +547,13 @@ def run_inference_benchmark(
     *,
     backend: str = 'torchless',
     embed_dtype: str = 'int4',
+    mode: str = 'neon',
 ) -> Dict:
     """
     Run end-to-end inference benchmark (pp128 + tg128 style).
 
     backend="torchless" (default) exercises litespark_inference.torchless,
-    the numpy + extern "C" NEON runtime (no torch at inference time).
+    the numpy + native extern "C" runtime (no torch at inference time).
     backend="torch" falls back to the original torch-backed path via
     litespark_inference.models.load_ternary_model; kept for regression
     checks against the pre-branch numbers.
@@ -534,21 +561,21 @@ def run_inference_benchmark(
     if backend == 'torchless':
         return _run_inference_benchmark_torchless(
             model_name=model_name, num_threads=num_threads,
-            num_tokens=num_tokens, embed_dtype=embed_dtype,
+            num_tokens=num_tokens, embed_dtype=embed_dtype, mode=mode,
         )
     elif backend == 'torch':
         return _run_inference_benchmark_torch(
             model_name=model_name, num_threads=num_threads,
-            num_tokens=num_tokens,
+            num_tokens=num_tokens, mode=mode,
         )
     else:
         raise ValueError(f"backend must be 'torchless' or 'torch', got {backend!r}")
 
 
 def _run_inference_benchmark_torchless(
-    model_name: str, num_threads: int, num_tokens: int, embed_dtype: str,
+    model_name: str, num_threads: int, num_tokens: int, embed_dtype: str, mode: str,
 ) -> Dict:
-    """Torchless (numpy + extern "C" NEON) inference benchmark path."""
+    """Torchless (numpy + native extern "C") inference benchmark path."""
     import gc
     import numpy as np
 
@@ -561,9 +588,9 @@ def _run_inference_benchmark_torchless(
     mem_before = get_current_rss_mb()
     if model_name == 'bitnet-2b':
         from litespark_inference.torchless import load_bitnet_2b, load_tokenizer
-        from litespark_inference.torchless.runtime import forward_one, generate, init_state
+        from litespark_inference.torchless.runtime import forward_one, init_state
 
-        model = load_bitnet_2b(embed_dtype=embed_dtype)
+        model = load_bitnet_2b(embed_dtype=embed_dtype, mode=mode)
         tokenizer = load_tokenizer()
     elif model_name.startswith('falcon-edge-'):
         from litespark_inference.torchless import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
@@ -574,7 +601,7 @@ def _run_inference_benchmark_torchless(
                 f"Unknown Falcon Edge model {model_name!r}. "
                 f"Available Falcon torchless models: {sorted(FALCON_TORCHLESS_REPOS)}"
         )
-        model = load_falcon_edge(model_name, embed_dtype=embed_dtype)
+        model = load_falcon_edge(model_name, embed_dtype=embed_dtype, mode=mode)
         tokenizer = load_tokenizer(FALCON_TORCHLESS_REPOS[model_name])
     else:
         raise ValueError(
@@ -592,10 +619,14 @@ def _run_inference_benchmark_torchless(
     # honest "what the process is costing" number. sum of tensor bytes is
     # always 657 MB for bitnet-2b int4 regardless of runtime overhead.
     memory_mb = max(memory_mb_rss, memory_mb_tensors)
+    if mode == 'accelerate':
+        weight_type = f"float32={tb.get('float32_weights', 0)/MB:.0f} MB"
+    else:
+        weight_type = f"packed={tb['packed_weights']/MB:.0f} MB"
     print(f"  [MEM-DEBUG torchless] rss_before={mem_before:.1f} MB  "
           f"rss_after={mem_after:.1f} MB  rss_delta={memory_mb_rss:.1f} MB  "
           f"tensor_bytes={memory_mb_tensors:.1f} MB "
-          f"(packed={tb['packed_weights']/MB:.0f} embed={tb['embedding']/MB:.0f}) "
+          f"({weight_type} embed={tb['embedding']/MB:.0f} MB) "
           f"reported={memory_mb:.1f} MB")
 
     prompt = "The quick brown fox jumps over the lazy dog. " * 20
@@ -603,7 +634,7 @@ def _run_inference_benchmark_torchless(
     actual_prompt_tokens = len(input_ids)
     t_max = actual_prompt_tokens + num_tokens + 4
 
-    print(f"Kernel: neon (torchless, extern \"C\" NEON SDOT + OMP)")
+    print(f"Kernel: {_torchless_kernel_label(mode)}")
     print(f"Threads: {num_threads}")
     print(f"Memory: {memory_mb:.0f} MB")
     print(f"Prompt tokens: {actual_prompt_tokens}")
@@ -643,8 +674,15 @@ def _run_inference_benchmark_torchless(
     tg_times = []
     for _ in range(3):
         if model_name == 'bitnet-2b':
+            state = init_state(model, t_max=t_max)
+            logits = None
+            for tid in input_ids:
+                logits = forward_one(model, state, int(tid))
+
             start = time.perf_counter()
-            _ = generate(model, input_ids, max_new_tokens=num_tokens)
+            for _ in range(num_tokens):
+                next_id = int(np.argmax(logits))
+                logits = forward_one(model, state, next_id)
         else:
             state = init_state(model, t_max=t_max)
             logits = None
@@ -664,7 +702,7 @@ def _run_inference_benchmark_torchless(
 
     results = {
         'model': model_name,
-        'kernel': 'neon-torchless',
+        'kernel': _torchless_kernel_name(mode),
         'backend': 'torchless',
         'embed_dtype': embed_dtype,
         'threads': num_threads,
@@ -682,6 +720,8 @@ def _run_inference_benchmark_torchless(
             'throughput_tps': tg_throughput,
         },
     }
+    if mode == 'accelerate':
+        results['mode'] = mode
 
     del model, tokenizer
     gc.collect()
@@ -689,7 +729,7 @@ def _run_inference_benchmark_torchless(
 
 
 def _run_inference_benchmark_torch(
-    model_name: str, num_threads: int, num_tokens: int,
+    model_name: str, num_threads: int, num_tokens: int, mode: str,
 ) -> Dict:
     """Legacy torch-backed inference benchmark (original behavior)."""
     torch = _lazy_torch()
@@ -704,7 +744,7 @@ def _run_inference_benchmark_torch(
     print(f"Loading model: {model_name}")
     gc.collect()
     mem_before = get_current_rss_mb()
-    model, tokenizer = load_ternary_model(model_name, num_threads=num_threads, mode='neon')
+    model, tokenizer = load_ternary_model(model_name, num_threads=num_threads, mode=mode)
     gc.collect()
     mem_after = get_current_rss_mb()
     memory_mb_rss = mem_after - mem_before
@@ -784,6 +824,8 @@ def _run_inference_benchmark_torch(
             'throughput_tps': tg_throughput,
         }
     }
+    if mode == 'accelerate':
+        results['mode'] = mode
 
     del model, tokenizer
     gc.collect()
@@ -1015,6 +1057,9 @@ def main():
                         help='Which Litespark runtime to benchmark in --inference: '
                              '"torchless" (default, numpy + extern "C" NEON, no torch) '
                              'or "torch" (legacy torch-backed path).')
+    if _is_apple_silicon():
+        parser.add_argument('--mode', choices=['neon', 'accelerate'], default='neon',
+                            help='Backend mode for Litespark inference (default: neon).')
     parser.add_argument('--embed-dtype', choices=['bf16', 'int8', 'int4'], default='int4',
                         help='Embedding quantization for the torchless backend '
                              '(default: int4). Ignored when --backend=torch.')
@@ -1027,6 +1072,8 @@ def main():
     argv = sys.argv[1:]
     backend_explicit = any(arg == '--backend' or arg.startswith('--backend=') for arg in argv)
     args = parser.parse_args()
+    if not hasattr(args, 'mode'):
+        args.mode = 'neon'
 
     from litespark_inference.torchless import FALCON_TORCHLESS_REPOS
     torchless_supported_models = {'bitnet-2b', *FALCON_TORCHLESS_REPOS}
@@ -1124,7 +1171,7 @@ def main():
             inference_results = run_inference_benchmark(
                 model_name=args.model, num_threads=args.threads,
                 num_tokens=num_tokens, backend='torchless',
-                embed_dtype=args.embed_dtype,
+                embed_dtype=args.embed_dtype, mode=args.mode,
             )
             all_results['benchmarks']['inference'] = inference_results
             if args.pytorch:
@@ -1149,7 +1196,7 @@ def main():
             inference_results = run_inference_benchmark(
                 model_name=args.model, num_threads=args.threads,
                 num_tokens=num_tokens, backend='torch',
-                embed_dtype=args.embed_dtype,
+                embed_dtype=args.embed_dtype, mode=args.mode,
             )
             all_results['benchmarks']['inference'] = inference_results
 

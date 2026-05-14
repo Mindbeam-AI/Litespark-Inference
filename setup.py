@@ -128,6 +128,7 @@ def _platform_compile_args(compiler_type: str) -> tuple[list[str], list[str]]:
 
     # OpenMP
     if sys_name == "Darwin":
+        link_args += ["-framework", "Accelerate"]
         # Homebrew installs libomp at /opt/homebrew (arm64) or /usr/local
         # (intel). Try both.
         candidates = [

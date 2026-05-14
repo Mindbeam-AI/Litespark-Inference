@@ -114,10 +114,14 @@ def init_state(model: PackedBitNetModel, t_max: int) -> InferState:
 def _call_matmul(
     x_int8: np.ndarray, x_scale: float, proj: PackedProjection,
     out: np.ndarray,
+    x_fp32: "np.ndarray | None" = None,
 ) -> np.ndarray:
     """Pre-quantized matmul. Uses the unpacked-weights path when the loader
     pre-decoded weights (LITESPARK_PREUNPACK=1) and the active kernel
     supports it; otherwise falls back to the packed-weights matmul."""
+    if proj.w_float32 is not None:
+        from .kernel import matmul_accelerate_f32_m1
+        return matmul_accelerate_f32_m1(x_fp32, proj.w_float32, out=out)
     if proj.w_unpacked is not None:
         from .kernel import matmul_unpacked_m1
         return matmul_unpacked_m1(x_int8, proj.w_unpacked, proj.scale, x_scale, out=out)
@@ -195,6 +199,7 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
     i_fp = state.sc_inter_norm     # fp32 scratch for inter-sized rmsnorm outputs
 
     use_fused = _has_fused_rmsq()
+    use_accelerate = getattr(model, "projection_backend", "neon") == "accelerate"
 
     def _rmsq1(src, gamma, fp_scratch, i8_out):
         """M=1 RMSNorm + int8 quant. Fused single-pass kernel when bf16."""
@@ -205,10 +210,16 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
 
     for li, layer in enumerate(model.layers):
         # ---- Attention ----
-        h_scale = _rmsq1(x, layer.input_norm, h_fp, h_i8)
-        q_flat = _call_matmul(h_i8, h_scale, layer.q_proj, state.sc_q)
-        k_flat = _call_matmul(h_i8, h_scale, layer.k_proj, state.sc_k)
-        v_flat = _call_matmul(h_i8, h_scale, layer.v_proj, state.sc_v)
+        if use_accelerate:
+            _rmsnorm_neon(x, layer.input_norm, h_fp, eps=c.rms_norm_eps)
+            q_flat = _call_matmul(h_i8, 1.0, layer.q_proj, state.sc_q, x_fp32=h_fp)
+            k_flat = _call_matmul(h_i8, 1.0, layer.k_proj, state.sc_k, x_fp32=h_fp)
+            v_flat = _call_matmul(h_i8, 1.0, layer.v_proj, state.sc_v, x_fp32=h_fp)
+        else:
+            h_scale = _rmsq1(x, layer.input_norm, h_fp, h_i8)
+            q_flat = _call_matmul(h_i8, h_scale, layer.q_proj, state.sc_q)
+            k_flat = _call_matmul(h_i8, h_scale, layer.k_proj, state.sc_k)
+            v_flat = _call_matmul(h_i8, h_scale, layer.v_proj, state.sc_v)
 
         q = apply_rope(q_flat.reshape(Q, D), cos_row, sin_row)
         k = apply_rope(k_flat.reshape(KV, D), cos_row, sin_row)
@@ -231,18 +242,31 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
         attn = np.matmul(weights, v_perm)            # [KV, GQA, D]
         attn_flat = np.ascontiguousarray(attn.reshape(Q * D))
 
-        attn_scale = _rmsq1(attn_flat, layer.attn_sub_norm, h_fp, h_i8)
-        _call_matmul(h_i8, attn_scale, layer.o_proj, state.sc_hidden_a)
+        if use_accelerate:
+            _rmsnorm_neon(attn_flat, layer.attn_sub_norm, h_fp, eps=c.rms_norm_eps)
+            _call_matmul(h_i8, 1.0, layer.o_proj, state.sc_hidden_a, x_fp32=h_fp)
+        else:
+            attn_scale = _rmsq1(attn_flat, layer.attn_sub_norm, h_fp, h_i8)
+            _call_matmul(h_i8, attn_scale, layer.o_proj, state.sc_hidden_a)
         _add_inplace(x, state.sc_hidden_a)           # x += o_out
 
         # ---- MLP ----
-        h_scale = _rmsq1(x, layer.post_attn_norm, h_fp, h_i8)
-        _call_matmul(h_i8, h_scale, layer.gate_proj, state.sc_inter_a)
-        _call_matmul(h_i8, h_scale, layer.up_proj,   state.sc_inter_b)
+        if use_accelerate:
+            _rmsnorm_neon(x, layer.post_attn_norm, h_fp, eps=c.rms_norm_eps)
+            _call_matmul(h_i8, 1.0, layer.gate_proj, state.sc_inter_a, x_fp32=h_fp)
+            _call_matmul(h_i8, 1.0, layer.up_proj,   state.sc_inter_b, x_fp32=h_fp)
+        else:
+            h_scale = _rmsq1(x, layer.post_attn_norm, h_fp, h_i8)
+            _call_matmul(h_i8, h_scale, layer.gate_proj, state.sc_inter_a)
+            _call_matmul(h_i8, h_scale, layer.up_proj,   state.sc_inter_b)
         # inter = relu2(gate) * up   -> overwrite sc_inter_a in-place.
         _relu2_mul(state.sc_inter_a, state.sc_inter_b, state.sc_inter_a)
-        inter_scale = _rmsq1(state.sc_inter_a, layer.ffn_sub_norm, i_fp, i_i8)
-        _call_matmul(i_i8, inter_scale, layer.down_proj, state.sc_hidden_b)
+        if use_accelerate:
+            _rmsnorm_neon(state.sc_inter_a, layer.ffn_sub_norm, i_fp, eps=c.rms_norm_eps)
+            _call_matmul(i_i8, 1.0, layer.down_proj, state.sc_hidden_b, x_fp32=i_fp)
+        else:
+            inter_scale = _rmsq1(state.sc_inter_a, layer.ffn_sub_norm, i_fp, i_i8)
+            _call_matmul(i_i8, inter_scale, layer.down_proj, state.sc_hidden_b)
         _add_inplace(x, state.sc_hidden_b)           # x += down_out
 
     _rmsnorm_neon(x, model.final_norm, h_fp, eps=c.rms_norm_eps)
@@ -265,6 +289,8 @@ def _forward_prefill_hidden(
     T = len(token_ids)
     if T == 0:
         raise ValueError("token_ids must be non-empty")
+    if getattr(model, "projection_backend", "neon") == "accelerate":
+        return None
     if T == 1 or not _has_batched_matmul():
         return None  # caller handles M=1 path
 
@@ -724,13 +750,19 @@ def falcon_forward_one(model: PackedFalconModel, state: InferState, token_id: in
     i_i8 = state.sc_int8_inter
     h_fp = state.sc_hidden_norm
     i_fp = state.sc_inter_norm
+    use_accelerate = getattr(model, "projection_backend", "neon") == "accelerate"
 
     for li, layer in enumerate(model.layers):
         _rmsnorm_neon(x, layer.input_norm, h_fp, eps=c.rms_norm_eps)
-        h_scale = _quant_neon(h_fp, h_i8)
-        q_flat = _call_matmul(h_i8, h_scale, layer.q_proj, state.sc_q)
-        k_flat = _call_matmul(h_i8, h_scale, layer.k_proj, state.sc_k)
-        v_flat = _call_matmul(h_i8, h_scale, layer.v_proj, state.sc_v)
+        if use_accelerate:
+            q_flat = _call_matmul(h_i8, 1.0, layer.q_proj, state.sc_q, x_fp32=h_fp)
+            k_flat = _call_matmul(h_i8, 1.0, layer.k_proj, state.sc_k, x_fp32=h_fp)
+            v_flat = _call_matmul(h_i8, 1.0, layer.v_proj, state.sc_v, x_fp32=h_fp)
+        else:
+            h_scale = _quant_neon(h_fp, h_i8)
+            q_flat = _call_matmul(h_i8, h_scale, layer.q_proj, state.sc_q)
+            k_flat = _call_matmul(h_i8, h_scale, layer.k_proj, state.sc_k)
+            v_flat = _call_matmul(h_i8, h_scale, layer.v_proj, state.sc_v)
 
         q = apply_rope(q_flat.reshape(Q, D), cos_row, sin_row)
         k = apply_rope(k_flat.reshape(KV, D), cos_row, sin_row)
@@ -749,17 +781,27 @@ def falcon_forward_one(model: PackedFalconModel, state: InferState, token_id: in
         attn = np.matmul(weights, v_perm)
         attn_flat = np.ascontiguousarray(attn.reshape(Q * D))
 
-        attn_scale = _quant_neon(attn_flat, h_i8)
-        _call_matmul(h_i8, attn_scale, layer.o_proj, state.sc_hidden_a)
+        if use_accelerate:
+            _call_matmul(h_i8, 1.0, layer.o_proj, state.sc_hidden_a, x_fp32=attn_flat)
+        else:
+            attn_scale = _quant_neon(attn_flat, h_i8)
+            _call_matmul(h_i8, attn_scale, layer.o_proj, state.sc_hidden_a)
         _add_inplace(x, state.sc_hidden_a)
 
         _rmsnorm_neon(x, layer.post_attn_norm, h_fp, eps=c.rms_norm_eps)
-        h_scale = _quant_neon(h_fp, h_i8)
-        _call_matmul(h_i8, h_scale, layer.gate_proj, state.sc_inter_a)
-        _call_matmul(h_i8, h_scale, layer.up_proj, state.sc_inter_b)
+        if use_accelerate:
+            _call_matmul(h_i8, 1.0, layer.gate_proj, state.sc_inter_a, x_fp32=h_fp)
+            _call_matmul(h_i8, 1.0, layer.up_proj, state.sc_inter_b, x_fp32=h_fp)
+        else:
+            h_scale = _quant_neon(h_fp, h_i8)
+            _call_matmul(h_i8, h_scale, layer.gate_proj, state.sc_inter_a)
+            _call_matmul(h_i8, h_scale, layer.up_proj, state.sc_inter_b)
         _silu_mul_into(state.sc_inter_a, state.sc_inter_b, i_fp)
-        inter_scale = _quant_neon(i_fp, i_i8)
-        _call_matmul(i_i8, inter_scale, layer.down_proj, state.sc_hidden_b)
+        if use_accelerate:
+            _call_matmul(i_i8, 1.0, layer.down_proj, state.sc_hidden_b, x_fp32=i_fp)
+        else:
+            inter_scale = _quant_neon(i_fp, i_i8)
+            _call_matmul(i_i8, inter_scale, layer.down_proj, state.sc_hidden_b)
         _add_inplace(x, state.sc_hidden_b)
 
     _rmsnorm_neon(x, model.final_norm, h_fp, eps=c.rms_norm_eps)
