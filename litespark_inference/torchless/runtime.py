@@ -234,12 +234,14 @@ def forward_one(model: PackedBitNetModel, state: InferState, token_id: int) -> n
         #     score[kv_h, g, t] = dot(q[kv_h, g, :], k_hist[t, kv_h, :])
         q_grouped = q.reshape(KV, GQA, D)            # [KV, GQA, D]
         k_perm = k_hist.transpose(1, 0, 2)           # [KV, T, D]
-        scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))  # [KV, GQA, T]
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))  # [KV, GQA, T]
         scores *= inv_sqrt_d
         weights = softmax(scores, axis=-1)
 
         v_perm = v_hist.transpose(1, 0, 2)           # [KV, T, D]
-        attn = np.matmul(weights, v_perm)            # [KV, GQA, D]
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            attn = np.matmul(weights, v_perm)        # [KV, GQA, D]
         attn_flat = np.ascontiguousarray(attn.reshape(Q * D))
 
         if use_accelerate:
@@ -395,11 +397,13 @@ def _forward_prefill_hidden(
             v_hist = state.cache_v[li, :pos + 1]
             q_grouped = q.reshape(KV, GQA, D)
             k_perm = k_hist.transpose(1, 0, 2)
-            scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))
             scores *= inv_sqrt_d
             weights = softmax(scores, axis=-1)
             v_perm = v_hist.transpose(1, 0, 2)
-            attn = np.matmul(weights, v_perm)
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                attn = np.matmul(weights, v_perm)
             attn_out[t] = np.ascontiguousarray(attn.reshape(Q * D))
 
         _rmsq(attn_out, layer.attn_sub_norm, h_fp, h_i8, h_scales)
@@ -774,11 +778,13 @@ def falcon_forward_one(model: PackedFalconModel, state: InferState, token_id: in
 
         q_grouped = q.reshape(KV, GQA, D)
         k_perm = k_hist.transpose(1, 0, 2)
-        scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            scores = np.matmul(q_grouped, k_perm.transpose(0, 2, 1))
         scores *= inv_sqrt_d
         weights = softmax(scores, axis=-1)
         v_perm = v_hist.transpose(1, 0, 2)
-        attn = np.matmul(weights, v_perm)
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            attn = np.matmul(weights, v_perm)
         attn_flat = np.ascontiguousarray(attn.reshape(Q * D))
 
         if use_accelerate:
