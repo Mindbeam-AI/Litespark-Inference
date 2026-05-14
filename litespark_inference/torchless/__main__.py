@@ -109,7 +109,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
         if "\ufffd" not in text_now and text_now.startswith(streamed_text):
             print(text_now[len(streamed_text):], end="", flush=True)
             streamed_text = text_now
-        if not hasattr(tok, "format_messages"):
+        if model_name == "bitnet-2b":
             logits = forward_one(model, state, next_id)
         else:
             logits = falcon_forward_one(model, state, next_id)
@@ -350,10 +350,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
             print(response[len(streamed_text):], end="", flush=True)
         print()
 
-        if model_name == "bitnet-2b":
-            history_assistant.append(response)
-        else:
+        if hasattr(tok, "format_messages"):
             messages.append({"role": "assistant", "content": response})
+        else:
+            history_assistant.append(response)
 
     return 0
 

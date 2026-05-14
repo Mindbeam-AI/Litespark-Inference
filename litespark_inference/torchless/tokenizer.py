@@ -44,6 +44,7 @@ class BitNetTokenizer:
     bos_token_id: Optional[int]
     pad_token_id: Optional[int]
     chat_template: Optional[str]
+    stop_token_ids: tuple[int, ...] = ()
 
     def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
         return self._tok.encode(text, add_special_tokens=add_special_tokens).ids
@@ -51,27 +52,33 @@ class BitNetTokenizer:
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
         return self._tok.decode(list(ids), skip_special_tokens=skip_special_tokens)
 
+    def format_messages(self, messages: list[dict[str, str]], *, add_generation_prompt: bool = True) -> str:
+        if self.chat_template and "<|eot_id|>" in self.chat_template:
+            parts = []
+            for message in messages:
+                role = message["role"].capitalize()
+                content = message["content"].strip()
+                parts.append(f"{role}: {content}<|eot_id|>")
+            if add_generation_prompt:
+                parts.append("Assistant: ")
+            return "".join(parts)
+
+        system_messages = [m["content"] for m in messages if m["role"] == "system"]
+        user_messages = [m["content"] for m in messages if m["role"] == "user"]
+        instruction = system_messages[-1] if system_messages else ""
+        latest_user = user_messages[-1] if user_messages else ""
+        return f"{instruction}\n\nQuestion: {latest_user}\nAnswer:".strip()
+
     def format_chat(self, prompt: str, system: Optional[str] = None) -> str:
-        """
-        Build the prompt string the same way cli.py:_build_prompt does when a
-        chat template is available, falling back to the plain prompt otherwise.
-
-        We don't implement Jinja; instead, for BitNet-2B we use the documented
-        format:
-
-            <|begin_of_text|>System: ...<newline>User: ...<newline>Assistant:
-
-        The torch-backed CLI uses apply_chat_template from transformers, which
-        applies the tokenizer's chat template. Without transformers we hand-
-        write the minimal format. If callers need exact parity they can pass
-        the already-templated string directly.
-        """
         if system is None:
             system = ("You are Litespark, a helpful AI assistant running locally. "
                       "Provide accurate, concise, and practical answers.")
-        # Minimal non-templated prompt, matches the fallback branch in
-        # cli.py:_build_prompt.
-        return f"{system}\n\nQuestion: {prompt}\nAnswer:"
+        return self.format_messages(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ]
+        )
 
 
 @dataclass
@@ -166,6 +173,9 @@ def load_tokenizer(repo: str = _DEFAULT_HF_REPO) -> BitNetTokenizer | FalconToke
         eos_id = tok.token_to_id(eos_token) or 0
 
     stop_ids = {int(eos_id)}
+    eot_id = tok.token_to_id("<|eot_id|>")
+    if eot_id is not None and chat_template and "<|eot_id|>" in chat_template:
+        stop_ids.add(int(eot_id))
     im_end_id = tok.token_to_id("<|im_end|>")
     if im_end_id is not None and chat_template and "<|im_end|>" in chat_template:
         stop_ids.add(int(im_end_id))
@@ -190,4 +200,4 @@ def load_tokenizer(repo: str = _DEFAULT_HF_REPO) -> BitNetTokenizer | FalconToke
             bos_token=bos_token,
             stop_token_ids=tuple(sorted(stop_ids)),
         )
-    return BitNetTokenizer(**common)
+    return BitNetTokenizer(**common, stop_token_ids=tuple(sorted(stop_ids)))
