@@ -29,6 +29,12 @@ def _kernel_label(mode: str) -> str:
     if machine in ("arm64", "aarch64"):
         return "neon (torchless, extern \"C\" NEON SDOT)"
     if machine in ("x86_64", "amd64"):
+        # The actual loaded kernel is decided at runtime in kernel.py based
+        # on /proc/cpuinfo. Report whichever it picked rather than always
+        # claiming AVX-512.
+        from .kernel import _ARCH_TAG
+        if _ARCH_TAG == "avx2":
+            return "avx2 (torchless, extern \"C\" AVX2+FMA fallback)"
         return "avx512 (torchless, extern \"C\" AVX-512/VNNI)"
     return "torchless"
 
