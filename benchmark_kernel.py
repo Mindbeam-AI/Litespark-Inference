@@ -21,6 +21,7 @@ import platform
 import os
 import sys
 import json
+import re
 import statistics
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
@@ -31,6 +32,16 @@ def _is_apple_silicon() -> bool:
     return platform.system() == 'Darwin' and platform.machine().lower() in ('arm64', 'aarch64')
 
 
+def _x86_kernel_arch_tag() -> str:
+    """Return whichever x86 torchless kernel kernel.py picked at import.
+    Defaults to 'avx512' if the lookup fails (e.g. torchless not loaded)."""
+    try:
+        from litespark_inference.torchless.kernel import _ARCH_TAG
+        return _ARCH_TAG if _ARCH_TAG in ('avx512', 'avx2') else 'avx512'
+    except Exception:
+        return 'avx512'
+
+
 def _torchless_kernel_name(mode: str) -> str:
     if mode == 'accelerate':
         return 'accelerate-torchless'
@@ -38,7 +49,7 @@ def _torchless_kernel_name(mode: str) -> str:
     if machine in ('arm64', 'aarch64'):
         return 'neon-torchless'
     if machine in ('x86_64', 'amd64'):
-        return 'avx512-torchless'
+        return f'{_x86_kernel_arch_tag()}-torchless'
     return 'torchless'
 
 
@@ -49,6 +60,9 @@ def _torchless_kernel_label(mode: str) -> str:
     if machine in ('arm64', 'aarch64'):
         return 'neon (torchless, extern "C" NEON SDOT + OMP)'
     if machine in ('x86_64', 'amd64'):
+        tag = _x86_kernel_arch_tag()
+        if tag == 'avx2':
+            return 'avx2 (torchless, extern "C" AVX2+FMA fallback + OMP)'
         return 'avx512 (torchless, extern "C" AVX-512/VNNI + OMP)'
     return 'torchless'
 
@@ -147,6 +161,144 @@ def get_current_rss_mb() -> float:
     if system == 'Darwin':
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def refresh_power_monitor_permission() -> None:
+    if platform.system() != "Darwin" or not hasattr(os, "geteuid") or os.geteuid() == 0:
+        return
+    import subprocess
+    subprocess.run(["sudo", "-n", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def start_power_monitor(enabled: bool):
+    if not enabled:
+        return None
+
+    system = platform.system()
+    if system == "Darwin":
+        import subprocess
+        cmd = ["powermetrics", "--samplers", "cpu_power", "-i", "500"]
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            refresh_power_monitor_permission()
+            cmd = ["sudo", "-n", *cmd]
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return None
+
+        time.sleep(0.2)
+        if proc.poll() is not None:
+            proc.communicate()
+            return None
+        return {"type": "powermetrics", "proc": proc}
+
+    if system == "Linux":
+        base = "/sys/class/powercap"
+        if not os.path.isdir(base):
+            return None
+
+        zones = []
+        for entry in sorted(os.listdir(base)):
+            if entry.count(":") != 1:
+                continue
+            zone_dir = os.path.join(base, entry)
+            energy_path = os.path.join(zone_dir, "energy_uj")
+            max_path = os.path.join(zone_dir, "max_energy_range_uj")
+            if not os.path.isfile(energy_path):
+                continue
+            try:
+                with open(energy_path) as f:
+                    start_uj = int(f.read().strip())
+                with open(max_path) as f:
+                    max_uj = int(f.read().strip())
+            except (OSError, ValueError):
+                continue
+            zones.append((energy_path, max_uj, start_uj))
+
+        if zones:
+            return {"type": "powercap", "zones": zones}
+
+    return None
+
+
+def stop_power_monitor(monitor, elapsed_seconds: float, tokens: int) -> "Dict | None":
+    if monitor is None:
+        return None
+
+    if monitor["type"] == "powermetrics":
+        proc = monitor["proc"]
+        proc.terminate()
+        try:
+            stdout, _ = proc.communicate(timeout=3)
+        except Exception:
+            proc.kill()
+            stdout, _ = proc.communicate()
+
+        samples = []
+        for line in stdout.splitlines():
+            match = re.search(r"\bCPU Power:\s*([0-9.]+)\s*(mW|W)\b", line)
+            if not match:
+                continue
+            value = float(match.group(1))
+            samples.append(value / 1000.0 if match.group(2) == "mW" else value)
+
+        if not samples:
+            return None
+
+        avg_power_watts = sum(samples) / len(samples)
+        energy_joules = avg_power_watts * elapsed_seconds
+    elif monitor["type"] == "powercap":
+        total_delta_uj = 0
+        for energy_path, max_uj, start_uj in monitor["zones"]:
+            try:
+                with open(energy_path) as f:
+                    end_uj = int(f.read().strip())
+            except (OSError, ValueError):
+                return None
+            delta_uj = end_uj - start_uj
+            if delta_uj < 0:
+                delta_uj += max_uj
+            total_delta_uj += delta_uj
+        energy_joules = total_delta_uj / 1_000_000.0
+    else:
+        return None
+
+    return {"energy_joules": energy_joules, "elapsed_seconds": elapsed_seconds, "tokens": tokens}
+
+
+def summarize_power_samples(samples: list[Dict]) -> "Dict | None":
+    if not samples:
+        return None
+    total_energy = sum(sample["energy_joules"] for sample in samples)
+    total_tokens = sum(sample["tokens"] for sample in samples)
+    return {
+        "available": True,
+        "energy_joules": total_energy / len(samples),
+        "joules_per_token": total_energy / total_tokens if total_tokens > 0 else 0.0,
+    }
+
+
+def print_power_metrics(power_metrics: "Dict | None", requested: bool) -> None:
+    if power_metrics:
+        print(f"  Energy: {power_metrics['energy_joules']:.2f} J")
+        print(f"  Energy/token: {power_metrics['joules_per_token']:.4f} J/token")
+    elif requested:
+        print("  Energy: unavailable")
+
+
+def power_cooldown(enabled: bool, seconds: float, completed_label: str, next_label: str) -> None:
+    if not enabled or seconds <= 0:
+        return
+    print(f"\n[info] {completed_label} inference benchmark complete. Sleeping for {seconds:g}s before {next_label} begins.")
+    deadline = time.monotonic() + seconds
+    refresh_power_monitor_permission()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(60.0, remaining))
+        refresh_power_monitor_permission()
 
 
 def load_kernel():
@@ -393,7 +545,7 @@ def run_thread_scaling_benchmark(thread_counts: List[int] = None, num_runs: int 
 
 
 def _run_pytorch_baseline_in_subprocess(
-    model_name: str, num_threads: int, num_tokens: int,
+    model_name: str, num_threads: int, num_tokens: int, power: bool = False,
 ) -> "Dict | None":
     """
     Run run_pytorch_baseline() in a fresh Python subprocess.
@@ -426,7 +578,7 @@ def _run_pytorch_baseline_in_subprocess(
             "from benchmark_kernel import run_pytorch_baseline\n"
             "r = run_pytorch_baseline(\n"
             f"    model_name={model_name!r}, num_threads={num_threads!r},\n"
-            f"    num_tokens={num_tokens!r},\n"
+            f"    num_tokens={num_tokens!r}, power={power!r},\n"
             ")\n"
             f"json.dump(r if r is not None else {{}}, open({out_path!r}, 'w'))\n"
         )
@@ -548,6 +700,7 @@ def run_inference_benchmark(
     backend: str = 'torchless',
     embed_dtype: str = 'int4',
     mode: str = 'neon',
+    power: bool = False,
 ) -> Dict:
     """
     Run end-to-end inference benchmark (pp128 + tg128 style).
@@ -562,18 +715,19 @@ def run_inference_benchmark(
         return _run_inference_benchmark_torchless(
             model_name=model_name, num_threads=num_threads,
             num_tokens=num_tokens, embed_dtype=embed_dtype, mode=mode,
+            power=power,
         )
     elif backend == 'torch':
         return _run_inference_benchmark_torch(
             model_name=model_name, num_threads=num_threads,
-            num_tokens=num_tokens, mode=mode,
+            num_tokens=num_tokens, mode=mode, power=power,
         )
     else:
         raise ValueError(f"backend must be 'torchless' or 'torch', got {backend!r}")
 
 
 def _run_inference_benchmark_torchless(
-    model_name: str, num_threads: int, num_tokens: int, embed_dtype: str, mode: str,
+    model_name: str, num_threads: int, num_tokens: int, embed_dtype: str, mode: str, power: bool,
 ) -> Dict:
     """Torchless (numpy + native extern "C") inference benchmark path."""
     import gc
@@ -588,13 +742,17 @@ def _run_inference_benchmark_torchless(
     mem_before = get_current_rss_mb()
     if model_name == 'bitnet-2b':
         from litespark_inference.torchless import load_bitnet_2b, load_tokenizer
-        from litespark_inference.torchless.runtime import forward_one, init_state
+        from litespark_inference.torchless.runtime import (
+            forward_one, forward_prefill, init_state,
+        )
 
         model = load_bitnet_2b(embed_dtype=embed_dtype, mode=mode)
         tokenizer = load_tokenizer()
     elif model_name.startswith('falcon-edge-'):
         from litespark_inference.torchless import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
-        from litespark_inference.torchless.runtime import falcon_forward_one, init_state
+        from litespark_inference.torchless.runtime import (
+            falcon_forward_one, falcon_forward_prefill, init_state,
+        )
 
         if model_name not in FALCON_TORCHLESS_REPOS:
             raise ValueError(
@@ -641,14 +799,15 @@ def _run_inference_benchmark_torchless(
     print(f"Generate tokens: {num_tokens}")
 
     # Warmup: a full prefill so the dylib, OMP threads and allocator pool
-    # are stable before timing.
+    # are stable before timing. Uses the batched forward_prefill helper
+    # so prefill is amortised by the matmul_lut_mT kernel (one matmul call
+    # per projection per layer, instead of one per prompt token).
     print("\nWarming up...")
     state = init_state(model, t_max=t_max)
-    for tid in input_ids:
-        if model_name == 'bitnet-2b':
-            _ = forward_one(model, state, int(tid))
-        else:
-            _ = falcon_forward_one(model, state, int(tid))
+    if model_name == 'bitnet-2b':
+        _ = forward_prefill(model, state, list(input_ids))
+    else:
+        _ = falcon_forward_prefill(model, state, list(input_ids))
 
     # Prompt processing (pp): time a fresh prefill from scratch.
     print("\nPrompt Processing (pp):")
@@ -656,11 +815,10 @@ def _run_inference_benchmark_torchless(
     for _ in range(5):
         state = init_state(model, t_max=t_max)
         start = time.perf_counter()
-        for tid in input_ids:
-            if model_name == 'bitnet-2b':
-                _ = forward_one(model, state, int(tid))
-            else:
-                _ = falcon_forward_one(model, state, int(tid))
+        if model_name == 'bitnet-2b':
+            _ = forward_prefill(model, state, list(input_ids))
+        else:
+            _ = falcon_forward_prefill(model, state, list(input_ids))
         pp_times.append((time.perf_counter() - start) * 1000)
 
     pp_mean = statistics.mean(pp_times)
@@ -671,34 +829,43 @@ def _run_inference_benchmark_torchless(
 
     # Token generation (tg): greedy decode of num_tokens new tokens.
     print(f"\nToken Generation (tg{num_tokens}):")
+    power_samples = []
     tg_times = []
     for _ in range(3):
         if model_name == 'bitnet-2b':
             state = init_state(model, t_max=t_max)
-            logits = None
-            for tid in input_ids:
-                logits = forward_one(model, state, int(tid))
+            # Batched prefill -- returns the last-position logits, which is
+            # exactly what decode needs to pick the next token.
+            logits = forward_prefill(model, state, list(input_ids))
 
+            power_proc = start_power_monitor(power)
             start = time.perf_counter()
             for _ in range(num_tokens):
                 next_id = int(np.argmax(logits))
                 logits = forward_one(model, state, next_id)
+            elapsed = time.perf_counter() - start
+            power_sample = stop_power_monitor(power_proc, elapsed, num_tokens)
         else:
             state = init_state(model, t_max=t_max)
-            logits = None
-            for tid in input_ids:
-                logits = falcon_forward_one(model, state, int(tid))
+            logits = falcon_forward_prefill(model, state, list(input_ids))
+            power_proc = start_power_monitor(power)
             start = time.perf_counter()
             for _ in range(num_tokens):
                 next_id = int(np.argmax(logits))
                 logits = falcon_forward_one(model, state, next_id)
-        tg_times.append(time.perf_counter() - start)
+            elapsed = time.perf_counter() - start
+            power_sample = stop_power_monitor(power_proc, elapsed, num_tokens)
+        if power_sample is not None:
+            power_samples.append(power_sample)
+        tg_times.append(elapsed)
 
     tg_mean = statistics.mean(tg_times)
     tg_std = statistics.stdev(tg_times) if len(tg_times) > 1 else 0.0
     tg_throughput = num_tokens / tg_mean
+    power_metrics = summarize_power_samples(power_samples)
     print(f"  Time: {tg_mean*1000:.2f}±{tg_std*1000:.2f} ms")
     print(f"  Throughput: {tg_throughput:.2f} tokens/sec")
+    print_power_metrics(power_metrics, power)
 
     results = {
         'model': model_name,
@@ -720,6 +887,12 @@ def _run_inference_benchmark_torchless(
             'throughput_tps': tg_throughput,
         },
     }
+    if power_metrics is not None:
+        results['token_generation']['power'] = power_metrics
+    elif power:
+        results['token_generation']['power'] = {
+            'available': False,
+        }
     if mode == 'accelerate':
         results['mode'] = mode
 
@@ -729,7 +902,7 @@ def _run_inference_benchmark_torchless(
 
 
 def _run_inference_benchmark_torch(
-    model_name: str, num_threads: int, num_tokens: int, mode: str,
+    model_name: str, num_threads: int, num_tokens: int, mode: str, power: bool,
 ) -> Dict:
     """Legacy torch-backed inference benchmark (original behavior)."""
     torch = _lazy_torch()
@@ -792,18 +965,26 @@ def _run_inference_benchmark_torch(
 
     # Token generation (tg) benchmark
     print(f"\nToken Generation (tg{num_tokens}):")
+    power_samples = []
     tg_times = []
     with torch.no_grad():
         for _ in range(3):
+            power_proc = start_power_monitor(power)
             start = time.perf_counter()
             _ = model.generate(input_ids, max_new_tokens=num_tokens, temperature=0)
-            tg_times.append(time.perf_counter() - start)
+            elapsed = time.perf_counter() - start
+            power_sample = stop_power_monitor(power_proc, elapsed, num_tokens)
+            if power_sample is not None:
+                power_samples.append(power_sample)
+            tg_times.append(elapsed)
 
     tg_mean = statistics.mean(tg_times)
     tg_std = statistics.stdev(tg_times) if len(tg_times) > 1 else 0.0
     tg_throughput = num_tokens / tg_mean
+    power_metrics = summarize_power_samples(power_samples)
     print(f"  Time: {tg_mean*1000:.2f}±{tg_std*1000:.2f} ms")
     print(f"  Throughput: {tg_throughput:.2f} tokens/sec")
+    print_power_metrics(power_metrics, power)
 
     results = {
         'model': model_name,
@@ -824,6 +1005,12 @@ def _run_inference_benchmark_torch(
             'throughput_tps': tg_throughput,
         }
     }
+    if power_metrics is not None:
+        results['token_generation']['power'] = power_metrics
+    elif power:
+        results['token_generation']['power'] = {
+            'available': False,
+        }
     if mode == 'accelerate':
         results['mode'] = mode
 
@@ -834,7 +1021,7 @@ def _run_inference_benchmark_torch(
 
 
 def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
-                         num_tokens: int = 128) -> Dict:
+                         num_tokens: int = 128, power: bool = False) -> Dict:
     """
     Run PyTorch baseline inference benchmark for comparison.
 
@@ -941,19 +1128,27 @@ def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
 
     # Token generation benchmark
     print(f"\nToken Generation (tg{gen_tokens}):")
+    power_samples = []
     tg_times = []
     with torch.no_grad():
+        power_proc = start_power_monitor(power)
         start = time.perf_counter()
         _ = model.generate(
             input_ids, attention_mask=attention_mask,
             max_new_tokens=gen_tokens, do_sample=False,
         )
-        tg_times.append(time.perf_counter() - start)
+        elapsed = time.perf_counter() - start
+        power_sample = stop_power_monitor(power_proc, elapsed, gen_tokens)
+        if power_sample is not None:
+            power_samples.append(power_sample)
+        tg_times.append(elapsed)
 
     tg_mean = statistics.mean(tg_times)
     tg_throughput = gen_tokens / tg_mean
+    power_metrics = summarize_power_samples(power_samples)
     print(f"  Time: {tg_mean*1000:.2f} ms")
     print(f"  Throughput: {tg_throughput:.2f} tokens/sec")
+    print_power_metrics(power_metrics, power)
 
     results = {
         'model': model_name,
@@ -972,6 +1167,12 @@ def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
             'throughput_tps': tg_throughput,
         }
     }
+    if power_metrics is not None:
+        results['token_generation']['power'] = power_metrics
+    elif power:
+        results['token_generation']['power'] = {
+            'available': False,
+        }
 
     del model, tokenizer
     gc.collect()
@@ -979,7 +1180,7 @@ def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
     return results
 
 
-def print_comparison_table(litespark_results: Dict, pytorch_results: Dict) -> None:
+def print_comparison_table(litespark_results: Dict, pytorch_results: Dict, show_power: bool = False) -> None:
     """Print a side-by-side comparison table of Litespark vs PyTorch."""
     ls = litespark_results
     pt = pytorch_results
@@ -990,6 +1191,8 @@ def print_comparison_table(litespark_results: Dict, pytorch_results: Dict) -> No
     pt_ttft = pt['prompt_processing']['mean_ms']
     ls_tps = ls['token_generation']['throughput_tps']
     pt_tps = pt['token_generation']['throughput_tps']
+    ls_power = ls['token_generation'].get('power', {})
+    pt_power = pt['token_generation'].get('power', {})
 
     mem_speedup = pt_mem / ls_mem if ls_mem > 0 else 0
     ttft_speedup = pt_ttft / ls_ttft if ls_ttft > 0 else 0
@@ -999,12 +1202,101 @@ def print_comparison_table(litespark_results: Dict, pytorch_results: Dict) -> No
     print("COMPARISON: Litespark vs PyTorch")
     print(f"{'='*70}\n")
 
-    print(f"{'Metric':<22} {'PyTorch':>12} {'Litespark':>12} {'Speedup':>10}")
+    print(f"{'Metric':<22} {'PyTorch':>12} {'Litespark':>12} {'Improvement':>12}")
     print("-" * 58)
-    print(f"{'Memory (MB)':<22} {pt_mem:>12,.0f} {ls_mem:>12,.0f} {mem_speedup:>9.1f}x")
-    print(f"{'TTFT (ms)':<22} {pt_ttft:>12,.1f} {ls_ttft:>12,.1f} {ttft_speedup:>9.1f}x")
-    print(f"{'Throughput (tok/s)':<22} {pt_tps:>12.2f} {ls_tps:>12.2f} {tps_speedup:>9.1f}x")
+    print(f"{'Memory (MB)':<22} {pt_mem:>12,.0f} {ls_mem:>12,.0f} {mem_speedup:>11.1f}x")
+    print(f"{'TTFT (ms)':<22} {pt_ttft:>12,.1f} {ls_ttft:>12,.1f} {ttft_speedup:>11.1f}x")
+    print(f"{'Throughput (tok/s)':<22} {pt_tps:>12.2f} {ls_tps:>12.2f} {tps_speedup:>11.1f}x")
+    if show_power and ls_power.get('available') and pt_power.get('available'):
+        ls_energy = ls_power['energy_joules']
+        pt_energy = pt_power['energy_joules']
+        total_energy_speedup = pt_energy / ls_energy if ls_energy > 0 else 0
+        ls_jpt = ls_power['joules_per_token']
+        pt_jpt = pt_power['joules_per_token']
+        energy_speedup = pt_jpt / ls_jpt if ls_jpt > 0 else 0
+        print(f"{'Energy (J)':<22} {pt_energy:>12.2f} {ls_energy:>12.2f} {total_energy_speedup:>11.1f}x")
+        print(f"{'Energy/token (J)':<22} {pt_jpt:>12.4f} {ls_jpt:>12.4f} {energy_speedup:>11.1f}x")
     print("-" * 58)
+
+
+def _elevate_for_power_on_linux(args) -> None:
+    """If --power is requested on Linux and powercap counters aren't
+    readable as the current user, re-exec the script under sudo so the
+    energy_uj files become readable. Mirrors the macOS auto-sudo path
+    so the same `python benchmark_kernel.py ... --power ...` command
+    works out of the box on both platforms.
+
+    Preserves the venv (re-execs sys.executable with the same argv) and
+    forces HOME back to the invoking user's so HuggingFace caches resolve
+    to the user's ~/.cache, not /root/.cache.
+    """
+    import platform as _plat, os as _os, sys as _sys, glob as _glob
+    if not getattr(args, "power", False):
+        return
+    if _plat.system() != "Linux":
+        return
+    if hasattr(_os, "geteuid") and _os.geteuid() == 0:
+        return
+    counters = _glob.glob("/sys/class/powercap/intel-rapl*/energy_uj")
+    if counters and all(_os.access(p, _os.R_OK) for p in counters):
+        return  # udev rule / chmod already grants user read access
+    print(
+        "[--power] Linux powercap counters require elevated read access; "
+        "re-executing under sudo (you may be prompted for your password)...",
+        file=_sys.stderr, flush=True,
+    )
+    _os.execvp("sudo", [
+        "sudo", "-E",
+        f"HOME={_os.path.expanduser('~')}",
+        _sys.executable, *_sys.argv,
+    ])
+
+
+def _chown_back_if_sudo(path: str) -> None:
+    """If we re-execed under sudo, hand things back to the invoking user.
+
+    Two surfaces matter: (1) the benchmark output file we just wrote, and
+    (2) anything we wrote into the HuggingFace hub cache while downloading
+    the model as root -- without this fixup the user would need sudo to
+    manage their own model cache afterwards.
+
+    Best-effort: skips entries we can't stat/chown; never raises. Only
+    flips files that root actually wrote (st_uid == 0), so pre-existing
+    user-owned files stay untouched.
+    """
+    import os as _os
+    uid_str = _os.environ.get("SUDO_UID")
+    gid_str = _os.environ.get("SUDO_GID")
+    if uid_str is None or gid_str is None:
+        return
+    uid, gid = int(uid_str), int(gid_str)
+
+    def _try_chown(p):
+        try:
+            _os.chown(p, uid, gid)
+        except OSError:
+            pass
+
+    # 1. Benchmark output JSON.
+    if path and _os.path.exists(path):
+        _try_chown(path)
+
+    # 2. HF hub cache: walk once, flip only root-owned entries.
+    hub = _os.path.expanduser("~/.cache/huggingface/hub")
+    if _os.path.isdir(hub):
+        for current, _dirs, files in _os.walk(hub):
+            try:
+                if _os.stat(current).st_uid == 0:
+                    _try_chown(current)
+            except OSError:
+                pass
+            for name in files:
+                fp = _os.path.join(current, name)
+                try:
+                    if _os.stat(fp).st_uid == 0:
+                        _try_chown(fp)
+                except OSError:
+                    pass
 
 
 def main():
@@ -1020,7 +1312,10 @@ def main():
             "                   whenever the parent process will later load the torchless dylib,\n"
             "                   so each libomp runtime lives in its own process).\n"
             "  --inference    : end-to-end Litespark benchmark (pp128 + tg128).\n"
-            "  --all          : full benchmark sweep (matrix + scaling + inference)."
+            "  --all          : full benchmark sweep (matrix + scaling + inference).\n\n"
+            "Power:\n"
+            "  --power        : report token-generation energy; macOS needs sudo,\n"
+            "                   Linux needs readable powercap counters, Windows unsupported."
         ),
         epilog=(
             "Redirects / constraints:\n"
@@ -1029,10 +1324,14 @@ def main():
             "  - --all --backend torchless runs matrix, scaling, and inference -- the two\n"
             "    torch-backed kernel phases (matrix, scaling) live in isolated subprocesses\n"
             "    so torch's libomp never coexists with our dylib's libomp in one process.\n\n"
+            "Power measurement:\n"
+            "  - Use --power --no-matrix so raw kernel benchmarks do not heat the CPU first.\n"
+            "  - Keep other apps and background jobs idle for accurate energy numbers.\n\n"
             "Examples:\n"
             "  python benchmark_kernel.py --inference --no-matrix\n"
             "  python benchmark_kernel.py --inference --backend torch --pytorch --no-matrix\n"
             "  python benchmark_kernel.py --inference --backend torchless --pytorch\n"
+            "  sudo -v && python benchmark_kernel.py --inference --pytorch --no-matrix --power --power-cooldown 180\n"
             "  python benchmark_kernel.py --all\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1053,6 +1352,13 @@ def main():
                         help='Model name for inference benchmark (default: bitnet-2b)')
     parser.add_argument('--pytorch', action='store_true',
                         help='Include PyTorch baseline comparison (requires extra RAM, slow)')
+    parser.add_argument('--power', action='store_true',
+                        help='Report hardware energy for token generation. '
+                             'macOS requires sudo. Linux requires readable powercap counters. '
+                             'Unsupported on Windows.')
+    parser.add_argument('--power-cooldown', type=float, default=0.0,
+                        help='Seconds to idle between power-measured inference runs '
+                             '(used only with --power).')
     parser.add_argument('--backend', choices=['torchless', 'torch'], default='torchless',
                         help='Which Litespark runtime to benchmark in --inference: '
                              '"torchless" (default, numpy + extern "C" NEON, no torch) '
@@ -1074,6 +1380,21 @@ def main():
     args = parser.parse_args()
     if not hasattr(args, 'mode'):
         args.mode = 'neon'
+    if not args.power:
+        args.power_cooldown = 0.0
+
+    # Propagate --threads to OMP_NUM_THREADS BEFORE any C extension import.
+    # Without this, OpenMP defaults to 1 on most distros and the kernel
+    # silently runs single-threaded regardless of --threads. Must happen
+    # before the litespark_inference import below (and before
+    # `torch.set_num_threads(...)` calls in subprocess paths), because once
+    # libgomp/libomp is loaded, OMP_NUM_THREADS changes are ignored.
+    os.environ["OMP_NUM_THREADS"] = str(args.threads)
+
+    # On Linux, --power needs readable /sys/class/powercap/.../energy_uj.
+    # If we can't read them as the current user, re-exec under sudo so the
+    # same command works out of the box (matches the macOS auto-sudo path).
+    _elevate_for_power_on_linux(args)
 
     from litespark_inference.torchless import FALCON_TORCHLESS_REPOS
     torchless_supported_models = {'bitnet-2b', *FALCON_TORCHLESS_REPOS}
@@ -1171,15 +1492,16 @@ def main():
             inference_results = run_inference_benchmark(
                 model_name=args.model, num_threads=args.threads,
                 num_tokens=num_tokens, backend='torchless',
-                embed_dtype=args.embed_dtype, mode=args.mode,
+                embed_dtype=args.embed_dtype, mode=args.mode, power=args.power,
             )
             all_results['benchmarks']['inference'] = inference_results
             if args.pytorch:
                 # Subprocess-isolate the baseline so torch's libomp never
                 # coexists with our dylib's libomp in the same process.
+                power_cooldown(args.power, args.power_cooldown, "Litespark", "PyTorch")
                 pytorch_results = _run_pytorch_baseline_in_subprocess(
                     model_name=args.model, num_threads=args.threads,
-                    num_tokens=num_tokens,
+                    num_tokens=num_tokens, power=args.power,
                 )
                 if pytorch_results is not None:
                     all_results['benchmarks']['pytorch_baseline'] = pytorch_results
@@ -1189,19 +1511,20 @@ def main():
                 # so running the baseline in-process is fine (single libomp).
                 pytorch_results = run_pytorch_baseline(
                     model_name=args.model, num_threads=args.threads,
-                    num_tokens=num_tokens,
+                    num_tokens=num_tokens, power=args.power,
                 )
                 if pytorch_results is not None:
                     all_results['benchmarks']['pytorch_baseline'] = pytorch_results
+                power_cooldown(args.power, args.power_cooldown, "PyTorch", "Litespark")
             inference_results = run_inference_benchmark(
                 model_name=args.model, num_threads=args.threads,
                 num_tokens=num_tokens, backend='torch',
-                embed_dtype=args.embed_dtype, mode=args.mode,
+                embed_dtype=args.embed_dtype, mode=args.mode, power=args.power,
             )
             all_results['benchmarks']['inference'] = inference_results
 
         if inference_results is not None and pytorch_results is not None:
-            print_comparison_table(inference_results, pytorch_results)
+            print_comparison_table(inference_results, pytorch_results, show_power=args.power)
 
     elif args.pytorch:
         print("Warning: --pytorch requires --inference or --all to run.")
@@ -1211,6 +1534,9 @@ def main():
         with open(args.output, 'w') as f:
             json.dump(all_results, f, indent=2)
         print(f"\nResults saved to: {args.output}")
+        # If we re-execed under sudo for --power, hand the JSON back to
+        # the invoking user so they don't need sudo to manage it.
+        _chown_back_if_sudo(args.output)
 
     print("\n" + "="*70)
     print("BENCHMARK COMPLETE")
