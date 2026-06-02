@@ -40,12 +40,37 @@ _MACHINE = platform.machine().lower()
 _IS_ARM = _MACHINE in ("arm64", "aarch64")
 _IS_X86 = _MACHINE in ("x86_64", "amd64")
 
+
+def _x86_host_has_avx512() -> bool:
+    """Whether the running CPU supports the AVX-512 set this kernel uses.
+
+    Linux: parse /proc/cpuinfo. macOS Intel / Windows: assume yes (the
+    rare path; override with LITESPARK_KERNEL_TIER=avx512|avx2).
+    """
+    override = os.environ.get("LITESPARK_KERNEL_TIER", "").strip().lower()
+    if override in ("avx512", "avx2"):
+        return override == "avx512"
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                return "avx512f" in f.read()
+        except OSError:
+            return False
+    return True
+
+
 if _IS_ARM:
     _ARCH_TAG = "neon"
     _SRC = _HERE.parent / "kernels" / "arm64" / "matmul_lut_neon_extern_c.cpp"
 elif _IS_X86:
-    _ARCH_TAG = "avx512"
-    _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx512_extern_c.cpp"
+    # AVX-512 if the host supports it, else AVX2 scalar fallback. Pick the
+    # source path that matches so the JIT-rebuild path stays correct too.
+    if _x86_host_has_avx512():
+        _ARCH_TAG = "avx512"
+        _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx512_extern_c.cpp"
+    else:
+        _ARCH_TAG = "avx2"
+        _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx2_extern_c.cpp"
 else:
     _ARCH_TAG = "unknown"
     _SRC = _HERE  # nonexistent; load() will fail gracefully
@@ -131,12 +156,19 @@ def _compile() -> None:
         base += ["-mcpu=native"] if platform.system() == "Darwin" else [
             "-march=armv8.2-a+dotprod",
         ]
+        if platform.system() == "Darwin":
+            base += ["-framework", "Accelerate"]
     elif _IS_X86:
-        # Match setup.py: AVX-512F + BW + DQ + VNNI + VBMI + FMA.
-        base += [
-            "-mavx512f", "-mavx512bw", "-mavx512dq",
-            "-mavx512vnni", "-mavx512vbmi", "-mfma",
-        ]
+        # Match setup.py: AVX-512F + BW + DQ + VNNI + VBMI + FMA on AVX-512
+        # hosts; plain AVX2 + FMA on older CPUs (the avx2 source is scalar
+        # C++ written to auto-vectorize with these flags).
+        if _ARCH_TAG == "avx512":
+            base += [
+                "-mavx512f", "-mavx512bw", "-mavx512dq",
+                "-mavx512vnni", "-mavx512vbmi", "-mfma",
+            ]
+        else:
+            base += ["-mavx2", "-mfma"]
 
     omp = _omp_flags()
     cmd_omp = base + omp + [str(_SRC), "-o", str(_LIB_PATH)]
@@ -202,6 +234,10 @@ def _load() -> ctypes.CDLL:
     _alias("matmul_lut_m1", f"matmul_lut_{T}_m1",
            [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
            None)
+    if hasattr(lib, f"matmul_accelerate_f32_{T}_m1"):
+        _alias("matmul_accelerate_f32_m1", f"matmul_accelerate_f32_{T}_m1",
+               [_F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+               None)
     # Pre-unpacked-weights matmul: x86 only today (no NEON variant yet).
     if _IS_X86 and hasattr(lib, f"matmul_unpacked_{T}_m1"):
         _alias("matmul_unpacked_m1", f"matmul_unpacked_{T}_m1",
@@ -277,6 +313,8 @@ def _load() -> ctypes.CDLL:
            None)
     _alias("has_omp_probe", f"matmul_lut_{T}_has_omp", [], ctypes.c_int)
     _alias("max_threads_probe", f"matmul_lut_{T}_max_threads", [], ctypes.c_int)
+    if hasattr(lib, f"matmul_lut_{T}_has_accelerate"):
+        _alias("has_accelerate_probe", f"matmul_lut_{T}_has_accelerate", [], ctypes.c_int)
 
     _lib = lib
     return lib
@@ -288,6 +326,11 @@ def has_omp() -> bool:
 
 def max_threads() -> int:
     return int(_load().max_threads_probe())
+
+
+def has_accelerate() -> bool:
+    lib = _load()
+    return bool(getattr(lib, "has_accelerate_probe", lambda: 0)())
 
 
 # All wrappers below skip per-call dtype/shape asserts and just hand the
@@ -397,6 +440,17 @@ def matmul_packed_m1(
     if out is None:
         out = np.empty(N, dtype=np.float32)
     _load().matmul_lut_m1(x_int8, packed_w, w_scale, x_scale, out, N, K)
+    return out
+
+
+def matmul_accelerate_f32_m1(x_fp32: np.ndarray, w_float32: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
+    lib = _load()
+    if not hasattr(lib, "matmul_accelerate_f32_m1") or not has_accelerate():
+        raise RuntimeError("mode='accelerate' requires Apple Accelerate")
+    N, K = w_float32.shape
+    if out is None:
+        out = np.empty(N, dtype=np.float32)
+    lib.matmul_accelerate_f32_m1(x_fp32, w_float32, out, N, K)
     return out
 
 
