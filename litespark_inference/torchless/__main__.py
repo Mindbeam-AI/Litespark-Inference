@@ -155,13 +155,13 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     t0 = time.perf_counter()
     if args.model == "bitnet-2b":
         from . import load_bitnet_2b, load_tokenizer
-        from .runtime import forward_one, init_state
+        from .runtime import forward_one, forward_prefill, init_state
 
         model = load_bitnet_2b(embed_dtype=args.embed_dtype, mode=mode)
         tok = load_tokenizer()
     elif args.model.startswith("falcon-edge-"):
         from . import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
-        from .runtime import falcon_forward_one, init_state
+        from .runtime import falcon_forward_one, falcon_forward_prefill, init_state
 
         if args.model not in FALCON_TORCHLESS_REPOS:
             raise ValueError(
@@ -185,32 +185,31 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
 
     prompt = "The quick brown fox jumps over the lazy dog."
     ids = tok.encode(prompt)
+    prompt_token_ids = [int(t) for t in ids]
     print(f"\nBenchmarking with prompt: '{prompt}' ({len(ids)} tokens)")
     print("-" * 60)
+
+    _do_prefill = (
+        forward_prefill if args.model == "bitnet-2b" else falcon_forward_prefill
+    )
+    _do_step = (
+        forward_one if args.model == "bitnet-2b" else falcon_forward_one
+    )
 
     # Warmup
     print("Warming up...", flush=True)
     for _ in range(3):
         state = init_state(model, t_max=len(ids) + 1)
-        for tid in ids:
-            if args.model == "bitnet-2b":
-                _ = forward_one(model, state, int(tid))
-            else:
-                _ = falcon_forward_one(model, state, int(tid))
+        _ = _do_prefill(model, state, prompt_token_ids)
 
     # TTFT: time a fresh batched prefill of the whole prompt.
     print("\nTime to First Token (TTFT):")
     num_runs = 10
     times = []
-    prompt_token_ids = [int(t) for t in ids]
     for _ in range(num_runs):
         state = init_state(model, t_max=len(ids) + 1)
         t0 = time.perf_counter()
-        for tid in ids:
-            if args.model == "bitnet-2b":
-                _ = forward_one(model, state, int(tid))
-            else:
-                _ = falcon_forward_one(model, state, int(tid))
+        _ = _do_prefill(model, state, prompt_token_ids)
         times.append((time.perf_counter() - t0) * 1000)
     ttft_avg = sum(times) / len(times)
     ttft_min = min(times)
@@ -223,21 +222,12 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     times = []
     for _ in range(num_runs):
         state = init_state(model, t_max=len(ids) + args.tokens + 1)
-        # Prefill
-        logits = None
-        for tid in ids:
-            if args.model == "bitnet-2b":
-                logits = forward_one(model, state, int(tid))
-            else:
-                logits = falcon_forward_one(model, state, int(tid))
+        logits = _do_prefill(model, state, prompt_token_ids)
         # Generate
         t0 = time.perf_counter()
         for _ in range(args.tokens):
             next_id = int(np.argmax(logits))
-            if args.model == "bitnet-2b":
-                logits = forward_one(model, state, next_id)
-            else:
-                logits = falcon_forward_one(model, state, next_id)
+            logits = _do_step(model, state, next_id)
         times.append(time.perf_counter() - t0)
     gen_avg = sum(times) / len(times)
     tps = args.tokens / gen_avg
@@ -263,13 +253,15 @@ def cmd_chat(args: argparse.Namespace) -> int:
     mode = getattr(args, "mode", "neon")
     if model_name == "bitnet-2b":
         from . import load_bitnet_2b, load_tokenizer
-        from .runtime import forward_one, init_state
+        from .runtime import forward_one, forward_prefill, init_state
 
         model = load_bitnet_2b(embed_dtype=args.embed_dtype, mode=mode)
         tok = load_tokenizer()
+        _do_prefill = forward_prefill
+        _do_step = forward_one
     elif model_name.startswith("falcon-edge-"):
         from . import FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer
-        from .runtime import falcon_forward_one, init_state
+        from .runtime import falcon_forward_one, falcon_forward_prefill, init_state
 
         if model_name not in FALCON_TORCHLESS_REPOS:
             raise ValueError(
@@ -278,6 +270,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
         )
         model = load_falcon_edge(model_name, embed_dtype=args.embed_dtype, mode=mode)
         tok = load_tokenizer(FALCON_TORCHLESS_REPOS[model_name])
+        _do_prefill = falcon_forward_prefill
+        _do_step = falcon_forward_one
     else:
         raise ValueError(f"Unsupported torchless model {model_name!r}.")
 
@@ -325,13 +319,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
         t_max = len(prompt_ids) + args.max_tokens + 1
         state = init_state(model, t_max=t_max)
 
-        # Prefill
-        logits = None
-        for tid in prompt_ids:
-            if model_name == "bitnet-2b":
-                logits = forward_one(model, state, int(tid))
-            else:
-                logits = falcon_forward_one(model, state, int(tid))
+        # Batched prefill: one shot through the whole prompt.
+        logits = _do_prefill(model, state, [int(t) for t in prompt_ids])
 
         # Stream generate
         print("\nAssistant: ", end="", flush=True)
@@ -348,10 +337,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             if "\ufffd" not in text_now and text_now.startswith(streamed_text):
                 print(text_now[len(streamed_text):], end="", flush=True)
                 streamed_text = text_now
-            if model_name == "bitnet-2b":
-                logits = forward_one(model, state, next_id)
-            else:
-                logits = falcon_forward_one(model, state, next_id)
+            logits = _do_step(model, state, next_id)
         response = tok.decode(gen_ids)
         if response.startswith(streamed_text):
             print(response[len(streamed_text):], end="", flush=True)

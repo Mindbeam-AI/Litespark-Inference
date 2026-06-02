@@ -108,7 +108,7 @@ class BitNet:
         """
         from .runtime import (
             init_state, forward_prefill, forward_one,
-            generate as _greedy, generate_speculative,
+            generate_speculative,
         )
 
         if isinstance(prompt, str):
@@ -121,7 +121,6 @@ class BitNet:
         state = init_state(self._model, t_max=t_max)
 
         if speculative:
-            t_pre = time.perf_counter()
             # generate_speculative does its own prefill internally.
             t_gen_start = time.perf_counter()
             tokens, stats = generate_speculative(
@@ -133,18 +132,19 @@ class BitNet:
             prefill_dt = 0.0  # rolled into total gen time above
             spec_stats = stats
         else:
+            # Time prefill, keep the last-position logits, decode in-place.
+            # Doing prefill twice (once for timing, once via runtime.generate)
+            # would double end-to-end latency and lie about prefill_dt.
             t_pre = time.perf_counter()
-            forward_prefill(self._model, state, list(prompt_ids))
+            logits = forward_prefill(self._model, state, list(prompt_ids))
             prefill_dt = time.perf_counter() - t_pre
 
             tokens = []
             t_gen_start = time.perf_counter()
-            # Re-derive next-token logits via forward_prefill's last position;
-            # but our forward_prefill already consumed those, so emulate the
-            # CLI loop: argmax then forward_one for the rest. Cheaper to
-            # reuse runtime.generate which prefills again then loops.
-            tokens = _greedy(self._model, prompt_ids, max_new_tokens,
-                             state=init_state(self._model, t_max=t_max))
+            for _ in range(max_new_tokens):
+                next_id = int(np.argmax(logits))
+                tokens.append(next_id)
+                logits = forward_one(self._model, state, next_id)
             gen_dt = time.perf_counter() - t_gen_start
             spec_stats = None
 
