@@ -32,7 +32,7 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 def cmd_generate(args: argparse.Namespace) -> int:
     from . import load_bitnet_2b, load_tokenizer
-    from .runtime import forward_one, generate, init_state
+    from .runtime import forward_one, forward_prefill, generate, init_state
 
     print(f"Loading tokenizer...", flush=True)
     t0 = time.perf_counter()
@@ -52,12 +52,13 @@ def cmd_generate(args: argparse.Namespace) -> int:
     t_max = len(prompt_ids) + args.max_tokens + 1
     state = init_state(model, t_max=t_max)
 
-    # Prefill
+    # Prefill (batched for multi-token prompts; M=1 has nothing to batch).
     print("Prefill...", flush=True)
     t0 = time.perf_counter()
-    logits = None
-    for tid in prompt_ids:
-        logits = forward_one(model, state, int(tid))
+    if len(prompt_ids) > 1:
+        logits = forward_prefill(model, state, [int(t) for t in prompt_ids])
+    else:
+        logits = forward_one(model, state, int(prompt_ids[0]))
     prefill_t = time.perf_counter() - t0
     print(f"  {len(prompt_ids)} tokens in {prefill_t:.2f}s "
           f"({len(prompt_ids)/prefill_t:.2f} tok/s)")
@@ -93,7 +94,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     import numpy as np
 
     from . import load_bitnet_2b, load_tokenizer
-    from .runtime import forward_one, init_state
+    from .runtime import forward_one, forward_prefill, init_state
 
     print("Litespark-Inference Benchmark (torchless)")
     print("=" * 60)
@@ -130,15 +131,15 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         for tid in ids:
             _ = forward_one(model, state, int(tid))
 
-    # TTFT: time a fresh prefill.
+    # TTFT: time a fresh batched prefill of the whole prompt.
     print("\nTime to First Token (TTFT):")
     num_runs = 10
     times = []
+    prompt_token_ids = [int(t) for t in ids]
     for _ in range(num_runs):
         state = init_state(model, t_max=len(ids) + 1)
         t0 = time.perf_counter()
-        for tid in ids:
-            _ = forward_one(model, state, int(tid))
+        forward_prefill(model, state, prompt_token_ids)
         times.append((time.perf_counter() - t0) * 1000)
     ttft_avg = sum(times) / len(times)
     ttft_min = min(times)
@@ -152,9 +153,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     for _ in range(num_runs):
         state = init_state(model, t_max=len(ids) + args.tokens + 1)
         # Prefill
-        logits = None
-        for tid in ids:
-            logits = forward_one(model, state, int(tid))
+        logits = forward_prefill(model, state, prompt_token_ids)
         # Generate
         t0 = time.perf_counter()
         for _ in range(args.tokens):
@@ -181,7 +180,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     import numpy as np
 
     from . import load_bitnet_2b, load_tokenizer
-    from .runtime import forward_one, init_state
+    from .runtime import forward_one, forward_prefill, init_state
 
     print("Loading tokenizer + model...", flush=True)
     tok = load_tokenizer()
@@ -227,10 +226,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
         t_max = len(prompt_ids) + args.max_tokens + 1
         state = init_state(model, t_max=t_max)
 
-        # Prefill
-        logits = None
-        for tid in prompt_ids:
-            logits = forward_one(model, state, int(tid))
+        # Prefill (batched for multi-token prompts).
+        if len(prompt_ids) > 1:
+            logits = forward_prefill(model, state, [int(t) for t in prompt_ids])
+        else:
+            logits = forward_one(model, state, int(prompt_ids[0]))
 
         # Stream generate
         print("\nAssistant: ", end="", flush=True)

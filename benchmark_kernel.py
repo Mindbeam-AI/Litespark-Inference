@@ -551,7 +551,7 @@ def _run_inference_benchmark_torchless(
 ) -> Dict:
     """Torchless (numpy + extern "C" NEON) inference benchmark path."""
     from litespark_inference.torchless import load_bitnet_2b, load_tokenizer
-    from litespark_inference.torchless.runtime import forward_one, generate, init_state
+    from litespark_inference.torchless.runtime import forward_one, forward_prefill, generate, init_state
     import gc
 
     print(f"\n{'='*70}")
@@ -600,8 +600,7 @@ def _run_inference_benchmark_torchless(
     # are stable before timing.
     print("\nWarming up...")
     state = init_state(model, t_max=t_max)
-    for tid in input_ids:
-        _ = forward_one(model, state, int(tid))
+    _ = forward_prefill(model, state, list(input_ids))
 
     # Prompt processing (pp): time a fresh prefill from scratch.
     print("\nPrompt Processing (pp):")
@@ -609,8 +608,7 @@ def _run_inference_benchmark_torchless(
     for _ in range(5):
         state = init_state(model, t_max=t_max)
         start = time.perf_counter()
-        for tid in input_ids:
-            _ = forward_one(model, state, int(tid))
+        _ = forward_prefill(model, state, list(input_ids))
         pp_times.append((time.perf_counter() - start) * 1000)
 
     pp_mean = statistics.mean(pp_times)
@@ -624,9 +622,7 @@ def _run_inference_benchmark_torchless(
     tg_times = []
     for _ in range(3):
         state = init_state(model, t_max=t_max)
-        logits = None
-        for tid in input_ids:
-            logits = forward_one(model, state, int(tid))
+        logits = forward_prefill(model, state, list(input_ids))
 
         start = time.perf_counter()
         for _ in range(num_tokens):
