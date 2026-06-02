@@ -723,16 +723,13 @@ def matmul_packed_prefill(
             raise ValueError("out must be float32 [M, N]")
         out = np.ascontiguousarray(out)
 
+    # Route through the same arch-neutral alias the runtime uses so the
+    # ndpointer-typed argtypes are honoured (the per-arch symbol is the
+    # same function, but argtypes were registered on the alias name).
     lib = _load()
-    lib.matmul_lut_neon_prefill(
-        x_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        packed_w.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        ctypes.c_float(w_scale),
-        x_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(M),
-        ctypes.c_int(N),
-        ctypes.c_int(K),
+    lib.matmul_lut_prefill(
+        x_int8, packed_w, ctypes.c_float(w_scale), x_scale, out,
+        ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K),
     )
     return out
 
