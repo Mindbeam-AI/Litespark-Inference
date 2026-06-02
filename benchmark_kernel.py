@@ -24,7 +24,7 @@ import json
 import re
 import statistics
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import argparse
 import numpy as np
 
@@ -546,7 +546,7 @@ def run_thread_scaling_benchmark(thread_counts: List[int] = None, num_runs: int 
 
 
 def _run_pytorch_baseline_in_subprocess(
-    model_name: str, num_threads: int, num_tokens: int, power: bool = False,
+    model_name: str, num_threads: Optional[int], num_tokens: int, power: bool = False,
 ) -> "Dict | None":
     """
     Run run_pytorch_baseline() in a fresh Python subprocess.
@@ -661,9 +661,10 @@ def _rerun_in_subprocess(
     with _tf.NamedTemporaryFile(suffix=".json", delete=False) as _f:
         out_path = _f.name
     try:
+        benchmark_threads = args.threads if args.threads is not None else 1
         cmd = [
             sys.executable, "-u", _os.path.abspath(__file__),
-            "--threads", str(args.threads),
+            "--threads", str(benchmark_threads),
             "--runs", str(args.runs),
             "--output", out_path,
             *extra_flags,
@@ -695,7 +696,7 @@ def _rerun_in_subprocess(
 
 def run_inference_benchmark(
     model_name: str = 'bitnet-2b',
-    num_threads: int = 4,
+    num_threads: Optional[int] = None,
     num_tokens: int = 128,
     *,
     backend: str = 'torchless',
@@ -728,7 +729,7 @@ def run_inference_benchmark(
 
 
 def _run_inference_benchmark_torchless(
-    model_name: str, num_threads: int, num_tokens: int, embed_dtype: str, mode: str, power: bool,
+    model_name: str, num_threads: Optional[int], num_tokens: int, embed_dtype: str, mode: str, power: bool,
 ) -> Dict:
     """Torchless (numpy + native extern "C") inference benchmark path."""
     import gc
@@ -794,7 +795,7 @@ def _run_inference_benchmark_torchless(
     t_max = actual_prompt_tokens + num_tokens + 4
 
     print(f"Kernel: {_torchless_kernel_label(mode)}")
-    print(f"Threads: {num_threads}")
+    print(f"Threads: {num_threads if num_threads is not None else 'runtime default'}")
     print(f"Memory: {memory_mb:.0f} MB")
     print(f"Prompt tokens: {actual_prompt_tokens}")
     print(f"Generate tokens: {num_tokens}")
@@ -903,12 +904,15 @@ def _run_inference_benchmark_torchless(
 
 
 def _run_inference_benchmark_torch(
-    model_name: str, num_threads: int, num_tokens: int, mode: str, power: bool,
+    model_name: str, num_threads: Optional[int], num_tokens: int, mode: str, power: bool,
 ) -> Dict:
     """Legacy torch-backed inference benchmark (original behavior)."""
     torch = _lazy_torch()
     from litespark_inference.models import load_ternary_model, get_kernel_type
     import gc
+
+    if num_threads is not None:
+        torch.set_num_threads(num_threads)
 
     print(f"\n{'='*70}")
     print("INFERENCE BENCHMARK (pp128 + tg128) -- torch-backed")
@@ -938,7 +942,7 @@ def _run_inference_benchmark_torch(
     actual_prompt_tokens = input_ids.shape[1]
 
     print(f"Kernel: {kernel_type}")
-    print(f"Threads: {num_threads}")
+    print(f"Threads: {num_threads if num_threads is not None else 'runtime default'}")
     print(f"Memory: {memory_mb:.0f} MB")
     print(f"Prompt tokens: {actual_prompt_tokens}")
     print(f"Generate tokens: {num_tokens}")
@@ -1021,7 +1025,7 @@ def _run_inference_benchmark_torch(
     return results
 
 
-def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
+def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: Optional[int] = None,
                          num_tokens: int = 128, power: bool = False) -> Dict:
     """
     Run PyTorch baseline inference benchmark for comparison.
@@ -1059,9 +1063,10 @@ def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: int = 4,
     print(f"{'='*70}\n")
 
     print(f"Model: {model_name} ({hf_name})")
-    print(f"Threads: {num_threads}")
+    print(f"Threads: {num_threads if num_threads is not None else 'runtime default'}")
 
-    torch.set_num_threads(num_threads)
+    if num_threads is not None:
+        torch.set_num_threads(num_threads)
 
     # Load model in its native dtype and measure memory
     print("\nLoading PyTorch model...")
@@ -1337,8 +1342,8 @@ def main():
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument('--threads', '-t', type=int, default=1,
-                        help='Number of threads (default: 1)')
+    parser.add_argument('--threads', '-t', type=int, default=None,
+                        help='Number of threads (default: runtime/backend default)')
     parser.add_argument('--runs', '-r', type=int, default=20,
                         help='Number of runs per benchmark (default: 20)')
     parser.add_argument('--scaling', action='store_true',
@@ -1378,19 +1383,23 @@ def main():
 
     argv = sys.argv[1:]
     backend_explicit = any(arg == '--backend' or arg.startswith('--backend=') for arg in argv)
+    threads_explicit = any(arg == '--threads'
+        or arg == '-t'
+        or arg.startswith('--threads=')
+        or (arg.startswith('-t') and len(arg) > 2)
+        for arg in argv
+    )
     args = parser.parse_args()
     if not hasattr(args, 'mode'):
         args.mode = 'neon'
     if not args.power:
         args.power_cooldown = 0.0
 
-    # Propagate --threads to OMP_NUM_THREADS BEFORE any C extension import.
-    # Without this, OpenMP defaults to 1 on most distros and the kernel
-    # silently runs single-threaded regardless of --threads. Must happen
-    # before the litespark_inference import below (and before
-    # `torch.set_num_threads(...)` calls in subprocess paths), because once
-    # libgomp/libomp is loaded, OMP_NUM_THREADS changes are ignored.
-    os.environ["OMP_NUM_THREADS"] = str(args.threads)
+    # Propagate --threads to OMP_NUM_THREADS BEFORE any C extension import,
+    # but only when the user explicitly asked for a thread count. Otherwise
+    # each runtime keeps its out-of-the-box behavior.
+    if threads_explicit:
+        os.environ["OMP_NUM_THREADS"] = str(args.threads)
 
     # On Linux, --power needs readable /sys/class/powercap/.../energy_uj.
     # If we can't read them as the current user, re-exec under sudo so the
@@ -1452,7 +1461,8 @@ def main():
         if matrix_results is not None:
             all_results['benchmarks']['matrix'] = matrix_results
     else:
-        matrix_results = run_full_benchmark(num_threads=args.threads, num_runs=args.runs)
+        matrix_threads = args.threads if args.threads is not None else 1
+        matrix_results = run_full_benchmark(num_threads=matrix_threads, num_runs=args.runs)
         all_results['benchmarks']['matrix'] = matrix_results
 
     # Run thread scaling if requested. When we'll later load torchless
