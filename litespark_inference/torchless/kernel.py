@@ -675,6 +675,68 @@ def matmul_unpacked_m1(
     return out
 
 
+def matmul_packed_prefill(
+    x_int8: np.ndarray,
+    packed_w: np.ndarray,
+    w_scale: float,
+    x_scale: np.ndarray,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Batched ternary matmul for M>1 (prompt prefill).
+
+    Multiplies one packed weight matrix against M token activations at once,
+    unpacking each weight row a single time and reusing it across the token
+    tile. Mathematically identical, row by row, to looping matmul_packed_m1
+    over the M activations -- but far cheaper because weight unpack, weight
+    memory traffic, and the ctypes boundary are all amortized over M.
+
+    Args:
+        x_int8:   [M, K] int8 (per-row pre-quantized activations).
+        packed_w: [N, K/4] uint8 (output of pack_ternary_4_per_byte).
+        w_scale:  scalar float (BitNet b1.58 per-tensor absmean).
+        x_scale:  [M] float32 per-token activation scales.
+        out:      Optional [M, N] float32 buffer. If None, one is allocated.
+
+    Returns:
+        [M, N] float32 output.
+    """
+    assert x_int8.dtype == np.int8 and x_int8.ndim == 2
+    assert packed_w.dtype == np.uint8 and packed_w.ndim == 2
+
+    x_int8 = np.ascontiguousarray(x_int8)
+    packed_w = np.ascontiguousarray(packed_w)
+
+    M, K = x_int8.shape
+    N, Kb = packed_w.shape
+    if Kb * 4 != K:
+        raise ValueError(f"x K={K} != K={Kb * 4} implied by packed_w")
+
+    x_scale = np.ascontiguousarray(x_scale, dtype=np.float32)
+    if x_scale.shape != (M,):
+        raise ValueError(f"x_scale must be float32 [M={M}], got {x_scale.shape}")
+
+    if out is None:
+        out = np.empty((M, N), dtype=np.float32)
+    else:
+        if out.shape != (M, N) or out.dtype != np.float32:
+            raise ValueError("out must be float32 [M, N]")
+        out = np.ascontiguousarray(out)
+
+    lib = _load()
+    lib.matmul_lut_neon_prefill(
+        x_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+        packed_w.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        ctypes.c_float(w_scale),
+        x_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_int(M),
+        ctypes.c_int(N),
+        ctypes.c_int(K),
+    )
+    return out
+
+
 def ensure_built() -> Path:
     """Make sure the kernel is loadable; return the path that was loaded."""
     _load()

@@ -198,10 +198,11 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
             else:
                 _ = falcon_forward_one(model, state, int(tid))
 
-    # TTFT: time a fresh prefill.
+    # TTFT: time a fresh batched prefill of the whole prompt.
     print("\nTime to First Token (TTFT):")
     num_runs = 10
     times = []
+    prompt_token_ids = [int(t) for t in ids]
     for _ in range(num_runs):
         state = init_state(model, t_max=len(ids) + 1)
         t0 = time.perf_counter()
