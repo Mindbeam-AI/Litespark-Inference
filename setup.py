@@ -34,6 +34,14 @@ _ARM_KERNEL_SRC = Path("litespark_inference/kernels/arm64/matmul_lut_neon_extern
 _X86_AVX512_KERNEL_SRC = Path("litespark_inference/kernels/x86_64/matmul_lut_avx512_extern_c.cpp")
 _X86_AVX2_KERNEL_SRC = Path("litespark_inference/kernels/x86_64/matmul_lut_avx2_extern_c.cpp")
 
+# The NEON kernel source unconditionally includes <arm_neon.h>, so it can only
+# be compiled on ARM64. On x86_64 we skip the extension entirely; the package
+# still installs cleanly and the runtime falls back to the x86_64 kernels under
+# litespark_inference/kernels/x86_64/ (or to torch/transformers when those are
+# unavailable). Without this gate, `pip install` on Linux/macOS x86 fails with
+# "'arm_neon.h' file not found".
+_IS_ARM64 = platform.machine().lower() in ("arm64", "aarch64")
+
 
 def _host_has_avx512() -> bool:
     """Detect whether the host CPU supports the AVX-512 set this kernel uses.

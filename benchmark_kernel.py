@@ -26,6 +26,7 @@ import statistics
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 import argparse
+import numpy as np
 
 
 def _is_apple_silicon() -> bool:
