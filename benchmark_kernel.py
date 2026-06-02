@@ -661,6 +661,13 @@ def _rerun_in_subprocess(
     with _tf.NamedTemporaryFile(suffix=".json", delete=False) as _f:
         out_path = _f.name
     try:
+        env = dict(_os.environ)
+        ext_dir = env.get("TORCH_EXTENSIONS_DIR")
+        if not ext_dir:
+            ext_dir = _os.path.join(_tf.gettempdir(), "litespark_torch_extensions")
+            env["TORCH_EXTENSIONS_DIR"] = ext_dir
+        _os.makedirs(ext_dir, exist_ok=True)
+
         benchmark_threads = args.threads if args.threads is not None else 1
         cmd = [
             sys.executable, "-u", _os.path.abspath(__file__),
@@ -671,7 +678,7 @@ def _rerun_in_subprocess(
             # Omit --inference / --pytorch / --backend so the subprocess does
             # only the requested torch-backed kernel benchmark and exits.
         ]
-        proc = _sp.run(cmd, capture_output=True, text=True)
+        proc = _sp.run(cmd, capture_output=True, text=True, env=env)
         if proc.stdout:
             print(proc.stdout, end="")
         if proc.returncode != 0:
