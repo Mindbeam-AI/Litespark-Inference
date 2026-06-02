@@ -243,10 +243,15 @@ def _load() -> ctypes.CDLL:
         _alias("matmul_unpacked_m1", f"matmul_unpacked_{T}_m1",
                [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
                None)
-    # Batched (M=T) matmul for prefill: x86 only today.
+    # Batched (M=T) matmul for prefill.
     if _IS_X86 and hasattr(lib, f"matmul_lut_{T}_mT"):
         _alias("matmul_lut_mT", f"matmul_lut_{T}_mT",
                [_I8, _F32, _U8, ctypes.c_float, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
+    if _IS_ARM and hasattr(lib, f"matmul_lut_{T}_prefill"):
+        _alias("matmul_lut_prefill", f"matmul_lut_{T}_prefill",
+               [_I8, _U8, ctypes.c_float, _F32, _F32,
                 ctypes.c_int, ctypes.c_int, ctypes.c_int],
                None)
     # AMX matmul + load-time transposer (Sapphire Rapids only).
@@ -464,8 +469,9 @@ def has_unpacked_matmul() -> bool:
 
 
 def has_batched_matmul() -> bool:
-    """Return True if the kernel has the M>T (batched-prefill) matmul."""
-    return hasattr(_load(), "matmul_lut_mT")
+    """Return True if the kernel has the M=T (batched-prefill) matmul."""
+    lib = _load()
+    return hasattr(lib, "matmul_lut_mT") or hasattr(lib, "matmul_lut_prefill")
 
 
 def has_batched_helpers() -> bool:
@@ -635,7 +641,13 @@ def matmul_packed_mT(
     assert Kb * 4 == K, f"K mismatch: {K} vs Kb*4={Kb*4}"
     if out is None:
         out = np.empty((T, N), dtype=np.float32)
-    _load().matmul_lut_mT(x_int8, x_scales, packed_w, w_scale, out, T, N, K)
+    lib = _load()
+    if hasattr(lib, "matmul_lut_mT"):
+        lib.matmul_lut_mT(x_int8, x_scales, packed_w, w_scale, out, T, N, K)
+    elif hasattr(lib, "matmul_lut_prefill"):
+        lib.matmul_lut_prefill(x_int8, packed_w, w_scale, x_scales, out, T, N, K)
+    else:
+        raise RuntimeError("batched matmul kernel is not available")
     return out
 
 

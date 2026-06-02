@@ -174,6 +174,142 @@ void matmul_accelerate_f32_neon_m1(
         0.0f, y, N);
 }
 
+// Batched ternary matmul for M>1 (prompt prefill).
+//
+// Same packed-weight format and arithmetic as matmul_lut_neon_m1, but it
+// multiplies one weight matrix against M token activations at once. The key
+// win over looping the M=1 kernel M times: each 16-byte packed block is
+// unpacked ONCE per row and reused across a register-resident tile of MR
+// tokens, and the whole weight matrix is streamed ~ceil(M/MR) times instead
+// of M times. Unpack cost, weight memory traffic, and the per-call ctypes
+// boundary all drop by ~MR, which is what makes prefill (TTFT) cheap.
+//
+// x:        int8 [M, K]   (row-major; one quantized activation vector per row)
+// packed_w: uint8 [N, K/4]
+// w_scale:  fp32 scalar (per-tensor, as in the M=1 path)
+// x_scale:  fp32 [M]      (per-token activation scale)
+// y:        fp32 [M, N]   (row-major output, caller-allocated)
+void matmul_lut_neon_prefill(
+    const int8_t*  __restrict__ x,
+    const uint8_t* __restrict__ packed_w,
+    float w_scale,
+    const float*   __restrict__ x_scale,
+    float* __restrict__ y,
+    int M,
+    int N,
+    int K
+) {
+    const int Kb = K >> 2;  // K / 4
+    constexpr int MR = 8;   // token tile held in registers
+
+#pragma omp parallel for if(N >= 64) schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* row = packed_w + static_cast<ptrdiff_t>(n) * Kb;
+
+        // Full tiles of MR tokens: unpack each weight block once, fan out
+        // across the MR activations.
+        int m0 = 0;
+        for (; m0 + MR <= M; m0 += MR) {
+            int32x4_t acc[MR];
+            for (int i = 0; i < MR; ++i) acc[i] = vdupq_n_s32(0);
+
+            int kb = 0;
+            for (; kb + 16 <= Kb; kb += 16) {
+                const uint8x16_t packed = vld1q_u8(row + kb);
+                int8x16_t w0, w1, w2, w3;
+                unpack_16_bytes(packed, &w0, &w1, &w2, &w3);
+                const int k = kb << 2;
+                for (int i = 0; i < MR; ++i) {
+                    const int8_t* xi = x + static_cast<ptrdiff_t>(m0 + i) * K + k;
+                    acc[i] = vdotq_s32(acc[i], w0, vld1q_s8(xi + 0));
+                    acc[i] = vdotq_s32(acc[i], w1, vld1q_s8(xi + 16));
+                    acc[i] = vdotq_s32(acc[i], w2, vld1q_s8(xi + 32));
+                    acc[i] = vdotq_s32(acc[i], w3, vld1q_s8(xi + 48));
+                }
+            }
+            for (; kb + 4 <= Kb; kb += 4) {
+                uint32_t p4;
+                std::memcpy(&p4, row + kb, sizeof(p4));
+                alignas(16) int8_t unp[16];
+                for (int j = 0; j < 4; ++j) {
+                    const uint8_t b = static_cast<uint8_t>((p4 >> (j * 8)) & 0xFFu);
+                    unp[j * 4 + 0] = static_cast<int8_t>((b >> 0) & 0x3) - 1;
+                    unp[j * 4 + 1] = static_cast<int8_t>((b >> 2) & 0x3) - 1;
+                    unp[j * 4 + 2] = static_cast<int8_t>((b >> 4) & 0x3) - 1;
+                    unp[j * 4 + 3] = static_cast<int8_t>((b >> 6) & 0x3) - 1;
+                }
+                const int8x16_t w_vec = vld1q_s8(unp);
+                const int k = kb << 2;
+                for (int i = 0; i < MR; ++i) {
+                    acc[i] = vdotq_s32(acc[i], w_vec,
+                                       vld1q_s8(x + static_cast<ptrdiff_t>(m0 + i) * K + k));
+                }
+            }
+
+            int32_t tail_acc[MR];
+            for (int i = 0; i < MR; ++i) tail_acc[i] = vaddvq_s32(acc[i]);
+            for (; kb < Kb; ++kb) {
+                const uint8_t b = row[kb];
+                const int k = kb << 2;
+                const int32_t w_0 = static_cast<int32_t>((b >> 0) & 0x3) - 1;
+                const int32_t w_1 = static_cast<int32_t>((b >> 2) & 0x3) - 1;
+                const int32_t w_2 = static_cast<int32_t>((b >> 4) & 0x3) - 1;
+                const int32_t w_3 = static_cast<int32_t>((b >> 6) & 0x3) - 1;
+                for (int i = 0; i < MR; ++i) {
+                    const int8_t* xi = x + static_cast<ptrdiff_t>(m0 + i) * K + k;
+                    tail_acc[i] += w_0 * xi[0] + w_1 * xi[1] + w_2 * xi[2] + w_3 * xi[3];
+                }
+            }
+            for (int i = 0; i < MR; ++i) {
+                const int m = m0 + i;
+                y[static_cast<ptrdiff_t>(m) * N + n] =
+                    static_cast<float>(tail_acc[i]) * (x_scale[m] * w_scale);
+            }
+        }
+
+        // Remainder tokens (M % MR): fall back to the single-token path.
+        for (int m = m0; m < M; ++m) {
+            const int8_t* xm = x + static_cast<ptrdiff_t>(m) * K;
+            int32x4_t acc_v = vdupq_n_s32(0);
+            int kb = 0;
+            for (; kb + 16 <= Kb; kb += 16) {
+                const uint8x16_t packed = vld1q_u8(row + kb);
+                int8x16_t w0, w1, w2, w3;
+                unpack_16_bytes(packed, &w0, &w1, &w2, &w3);
+                const int k = kb << 2;
+                acc_v = vdotq_s32(acc_v, w0, vld1q_s8(xm + k + 0));
+                acc_v = vdotq_s32(acc_v, w1, vld1q_s8(xm + k + 16));
+                acc_v = vdotq_s32(acc_v, w2, vld1q_s8(xm + k + 32));
+                acc_v = vdotq_s32(acc_v, w3, vld1q_s8(xm + k + 48));
+            }
+            for (; kb + 4 <= Kb; kb += 4) {
+                uint32_t p4;
+                std::memcpy(&p4, row + kb, sizeof(p4));
+                alignas(16) int8_t unp[16];
+                for (int j = 0; j < 4; ++j) {
+                    const uint8_t b = static_cast<uint8_t>((p4 >> (j * 8)) & 0xFFu);
+                    unp[j * 4 + 0] = static_cast<int8_t>((b >> 0) & 0x3) - 1;
+                    unp[j * 4 + 1] = static_cast<int8_t>((b >> 2) & 0x3) - 1;
+                    unp[j * 4 + 2] = static_cast<int8_t>((b >> 4) & 0x3) - 1;
+                    unp[j * 4 + 3] = static_cast<int8_t>((b >> 6) & 0x3) - 1;
+                }
+                acc_v = vdotq_s32(acc_v, vld1q_s8(unp), vld1q_s8(xm + (kb << 2)));
+            }
+            int32_t acc = vaddvq_s32(acc_v);
+            for (; kb < Kb; ++kb) {
+                const uint8_t b = row[kb];
+                const int k = kb << 2;
+                acc += (static_cast<int32_t>((b >> 0) & 0x3) - 1) * static_cast<int32_t>(xm[k + 0]);
+                acc += (static_cast<int32_t>((b >> 2) & 0x3) - 1) * static_cast<int32_t>(xm[k + 1]);
+                acc += (static_cast<int32_t>((b >> 4) & 0x3) - 1) * static_cast<int32_t>(xm[k + 2]);
+                acc += (static_cast<int32_t>((b >> 6) & 0x3) - 1) * static_cast<int32_t>(xm[k + 3]);
+            }
+            y[static_cast<ptrdiff_t>(m) * N + n] =
+                static_cast<float>(acc) * (x_scale[m] * w_scale);
+        }
+    }
+}
+
 // Per-tensor absmax quantization of an fp32 activation vector to int8.
 // Returns the scale (dequantized = int8 * scale). Caller provides the
 // int8 output buffer, sized >= K. Two passes over x_fp32, both vectorized.
