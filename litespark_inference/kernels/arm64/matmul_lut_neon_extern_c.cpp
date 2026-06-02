@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include <Accelerate/Accelerate.h>
+
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -156,6 +158,20 @@ void matmul_lut_neon_m1(
 
         y[n] = static_cast<float>(acc) * out_scale;
     }
+}
+
+void matmul_accelerate_f32_neon_m1(
+    const float* __restrict__ x,
+    const float* __restrict__ w_float32,
+    float*       __restrict__ y,
+    int N,
+    int K
+) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+        1, N, K,
+        1.0f, x, K,
+        w_float32, K,
+        0.0f, y, N);
 }
 
 // Batched ternary matmul for M>1 (prompt prefill).
@@ -659,6 +675,14 @@ int matmul_lut_neon_has_omp(void) {
 int matmul_lut_neon_max_threads(void) {
 #if defined(_OPENMP)
     return omp_get_max_threads();
+#else
+    return 0;
+#endif
+}
+
+int matmul_lut_neon_has_accelerate(void) {
+#if defined(__APPLE__)
+    return 1;
 #else
     return 0;
 #endif

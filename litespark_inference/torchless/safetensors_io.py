@@ -37,6 +37,7 @@ class SafetensorsFile:
     mm: "mmap.mmap | None"
     header: dict
     data_start: int
+    path: str = ""
 
     def close_mmap(self) -> bool:
         """Drop the mmap only, keep the fd (so pread-based get() still works).
@@ -84,14 +85,31 @@ class SafetensorsFile:
 
     def get(self, name: str) -> tuple[np.ndarray, str]:
         """
-        Copy-read: pread into a fresh bytes object and return a numpy view
-        over it. Use for tensors that get consumed and dropped quickly so
-        the 626 MB+ of embedding weights don't stay resident twice.
+        Copy-read into a fresh bytes object and return a numpy view over it.
+        Use for tensors that get consumed and dropped quickly so the 626 MB+
+        of embedding weights don't stay resident twice.
+
+        Uses os.pread on POSIX for atomicity; falls back to lseek + read on
+        Windows (which lacks pread). The loader is single-threaded, so the
+        seek-position side-effect of the fallback is safe.
         """
         shape, dtype, off0, off1 = self._meta(name)
         nbytes = off1 - off0
         np_store = _NP_STORE[dtype]
-        buf = os.pread(self.fd, nbytes, self.data_start + off0)
+        offset = self.data_start + off0
+        if hasattr(os, "pread"):
+            buf = os.pread(self.fd, nbytes, offset)
+        elif self.mm is not None:
+            # Windows + still-open mmap: slice it directly. Same profile
+            # as pread (caller-owned bytes, no fd-state mutation).
+            buf = bytes(self.mm[offset:offset + nbytes])
+        else:
+            # Windows + close_mmap() was already called: re-open a tiny
+            # mmap for this read. Stays inexpensive because Windows
+            # mmap is mapped lazily by page.
+            with open(self.path, "rb") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm2:
+                    buf = bytes(mm2[offset:offset + nbytes])
         return np.frombuffer(buf, dtype=np_store).reshape(shape), dtype
 
     def view(self, name: str) -> tuple[np.ndarray, str]:
@@ -117,7 +135,14 @@ class SafetensorsFile:
 def open_safetensors(path: str) -> SafetensorsFile:
     fd = os.open(path, os.O_RDONLY)
     size = os.fstat(fd).st_size
-    mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
+    # POSIX uses prot=PROT_READ; Windows uses access=ACCESS_READ. Pick the
+    # right keyword so the mmap is read-only on both platforms.
+    if hasattr(mmap, "PROT_READ"):
+        mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
+    else:
+        mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
     header_len = int.from_bytes(mm[:8], "little")
     header = json.loads(bytes(mm[8:8 + header_len]).decode())
-    return SafetensorsFile(fd=fd, mm=mm, header=header, data_start=8 + header_len)
+    return SafetensorsFile(
+        fd=fd, mm=mm, header=header, data_start=8 + header_len, path=path,
+    )

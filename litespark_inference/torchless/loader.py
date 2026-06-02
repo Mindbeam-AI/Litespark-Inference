@@ -10,12 +10,13 @@ from __future__ import annotations
 import ctypes
 import gc
 import json
+import os
 import platform
 from pathlib import Path
 
-from .model import BitNetConfig, PackedBitNetModel, PackedLayer, PackedProjection
+from .model import BitNetConfig, PackedBitNetModel, PackedLayer, PackedProjection, FalconTernaryConfig, PackedFalconLayer, PackedFalconModel
 from .pack import pack_ternary_4_per_byte
-from .quantize import bf16_u16_to_fp32, quantize_ternary_absmean
+from .quantize import bf16_u16_to_fp32, quantize_ternary_absmean, quantize_ternary_absmean_f32
 from .safetensors_io import open_safetensors
 
 
@@ -82,19 +83,64 @@ def _resolve_hf_snapshot(repo: str) -> tuple[Path, Path]:
     return config_path, model_path
 
 
-def _load_proj(sf, prefix: str, suffix: str) -> PackedProjection:
+_PREUNPACK = os.environ.get("LITESPARK_PREUNPACK", "0") == "1"
+_AMX = os.environ.get("LITESPARK_AMX", "0") == "1"
+
+
+def _validate_projection_mode(mode: str) -> None:
+    if mode not in ("neon", "accelerate"):
+        raise ValueError(f"mode must be 'neon' or 'accelerate', got {mode!r}")
+    if mode == "accelerate":
+        from .kernel import has_accelerate
+        if not has_accelerate():
+            raise RuntimeError("torchless mode='accelerate' requires Apple Accelerate")
+
+
+def _load_proj(sf, prefix: str, suffix: str, mode: str) -> PackedProjection:
     w_u16, _ = sf.get(prefix + suffix)          # bf16 (uint16 view)
     N, K = w_u16.shape
+    if mode == "accelerate":
+        w_float32, scale = quantize_ternary_absmean_f32(w_u16)
+        del w_u16
+        _release_pages()
+        return PackedProjection(
+            w_packed=None,
+            w_sum=None,
+            scale=scale,
+            in_features=K,
+            out_features=N,
+            w_float32=w_float32,
+        )
+
     w_int8, scale = quantize_ternary_absmean(w_u16)   # scale is scalar
     # Drop the bf16 bytes buffer as soon as possible -- gate/up weights are
     # ~35 MB each and we don't need them after quantization.
     del w_u16
     w_sum = w_int8.sum(axis=1, dtype="int32")
     w_packed = pack_ternary_4_per_byte(w_int8)
+    # If LITESPARK_PREUNPACK=1, also keep an unpacked copy in [0,1,2]
+    # form (4x memory, but the matmul kernel skips the whole port-5
+    # unpack chain). Costs ~3 GB of RAM for BitNet-2B vs ~700 MB packed.
+    w_unpacked = (w_int8 + 1).astype(np.uint8) if _PREUNPACK else None
+    # If LITESPARK_AMX=1 and the kernel has AMX support, build the
+    # AMX-VNNI transposed layout up front. Same 4x memory hit as
+    # LITESPARK_PREUNPACK but in [-1, 0, +1] signed form and pre-
+    # transposed for direct AMX TILELOADD.
+    w_amx = None
+    if _AMX:
+        try:
+            from .kernel import has_amx, transpose_packed_to_amx_vnni
+            if has_amx():
+                w_amx = np.empty((K // 4, N, 4), dtype=np.int8)
+                transpose_packed_to_amx_vnni(w_packed, w_amx, N, K)
+        except Exception:
+            w_amx = None
     del w_int8
     proj = PackedProjection(
         w_packed=w_packed, w_sum=w_sum, scale=scale,
         in_features=K, out_features=N,
+        w_unpacked=w_unpacked,
+        w_amx=w_amx,
     )
     # Return freed transient blocks to the OS every projection, not just
     # every layer. ~210 pressure-relief calls is cheap and keeps peak
@@ -177,6 +223,7 @@ def load_bitnet_2b(
     repo: str = _DEFAULT_HF_REPO,
     *,
     embed_dtype: str = "int4",
+    mode: str = "neon",
 ) -> PackedBitNetModel:
     """
     Load bitnet-2b torchless.
@@ -189,6 +236,7 @@ def load_bitnet_2b(
         "int4" - quantize per-row, 2 nibbles/byte (~156 MB + 0.5 MB scale).
                  Larger drift; top-1 needs verification per prompt.
     """
+    _validate_projection_mode(mode)
     config_path, st_path = _resolve_hf_snapshot(repo)
 
     with open(config_path) as f:
@@ -250,13 +298,13 @@ def load_bitnet_2b(
     for i in range(config.num_layers):
         prefix = f"model.layers.{i}"
         L = PackedLayer(
-            q_proj=_load_proj(sf, prefix, ".self_attn.q_proj.weight"),
-            k_proj=_load_proj(sf, prefix, ".self_attn.k_proj.weight"),
-            v_proj=_load_proj(sf, prefix, ".self_attn.v_proj.weight"),
-            o_proj=_load_proj(sf, prefix, ".self_attn.o_proj.weight"),
-            gate_proj=_load_proj(sf, prefix, ".mlp.gate_proj.weight"),
-            up_proj=_load_proj(sf, prefix, ".mlp.up_proj.weight"),
-            down_proj=_load_proj(sf, prefix, ".mlp.down_proj.weight"),
+            q_proj=_load_proj(sf, prefix, ".self_attn.q_proj.weight", mode),
+            k_proj=_load_proj(sf, prefix, ".self_attn.k_proj.weight", mode),
+            v_proj=_load_proj(sf, prefix, ".self_attn.v_proj.weight", mode),
+            o_proj=_load_proj(sf, prefix, ".self_attn.o_proj.weight", mode),
+            gate_proj=_load_proj(sf, prefix, ".mlp.gate_proj.weight", mode),
+            up_proj=_load_proj(sf, prefix, ".mlp.up_proj.weight", mode),
+            down_proj=_load_proj(sf, prefix, ".mlp.down_proj.weight", mode),
             input_norm=sf.get(f"{prefix}.input_layernorm.weight")[0].copy(),
             post_attn_norm=sf.get(f"{prefix}.post_attention_layernorm.weight")[0].copy(),
             attn_sub_norm=sf.get(f"{prefix}.self_attn.attn_sub_norm.weight")[0].copy(),
@@ -272,7 +320,9 @@ def load_bitnet_2b(
     model = PackedBitNetModel(
         config=config,
         embed_tokens=emb_bf16,
-        final_norm=final_norm, layers=layers,
+        final_norm=final_norm,
+        projection_backend=mode,
+        layers=layers,
         embed_int8=emb_int8,
         embed_int4=emb_int4,
         embed_scale=emb_scale,
@@ -294,3 +344,157 @@ def load_bitnet_2b(
         model._emb_mm_length = emb_off1 - emb_off0
 
     return model
+
+
+FALCON_TORCHLESS_REPOS = {
+    "falcon-edge-1b": "tiiuae/Falcon-E-1B-Base",
+    "falcon-edge-1b-instruct": "tiiuae/Falcon-E-1B-Instruct",
+    "falcon-edge-3b": "tiiuae/Falcon-E-3B-Base",
+    "falcon-edge-3b-instruct": "tiiuae/Falcon-E-3B-Instruct",
+}
+
+
+def _check_dtype(a: np.ndarray) -> np.ndarray:
+    if a.dtype == np.uint16:
+        return bf16_u16_to_fp32(a)
+    if a.dtype == np.float32:
+        return a
+    return a.astype(np.float32)
+
+
+def _unpack_hf_packed_bitnet(packed: np.ndarray, out_features: int) -> np.ndarray:
+    """Unpack HF uint8 BitNet packing into int8 {-1, 0, 1} rows."""
+    if packed.ndim == 1:
+        packed = packed[:, None]
+    n, cols = packed.shape
+    out = np.empty((n * 4, cols), dtype=np.uint8)
+    for i in range(4):
+        out[i * n:(i + 1) * n] = (packed >> (2 * i)) & 0x3
+    return out[:out_features].astype(np.int8) - 1
+
+
+def _load_falcon_proj(sf, key: str, out_features: int, mode: str) -> PackedProjection:
+    raw, _dtype = sf.get(key)
+    scale_key = key + "_scale"
+    if raw.dtype != np.uint8:
+        raise ValueError(f"Expected packed uint8 Falcon projection {key}, got {raw.dtype}")
+    w_int8 = _unpack_hf_packed_bitnet(raw, out_features)
+    if scale_key in sf.header:
+        scale_arr, _ = sf.get(scale_key)
+        scale = float(1.0 / _check_dtype(scale_arr).reshape(-1)[0])
+    else:
+        scale = 1.0
+    N, K = w_int8.shape
+    if mode == "accelerate":
+        w_float32 = w_int8.astype(np.float32)
+        w_float32 *= scale
+        del raw, w_int8
+        _release_pages()
+        return PackedProjection(
+            w_packed=None,
+            w_sum=None,
+            scale=scale,
+            in_features=K,
+            out_features=N,
+            w_float32=w_float32,
+        )
+
+    w_sum = w_int8.sum(axis=1, dtype=np.int32)
+    w_packed = pack_ternary_4_per_byte(w_int8)
+    del raw, w_int8
+    _release_pages()
+    return PackedProjection(
+        w_packed=w_packed,
+        w_sum=w_sum,
+        scale=scale,
+        in_features=K,
+        out_features=N,
+    )
+
+
+def _load_dense_matrix(sf, key: str, embed_dtype: str) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    raw, _ = sf.get(key)
+    if raw.dtype != np.uint16:
+        raise ValueError(f"Falcon dense tensor {key} must be BF16/uint16, got {raw.dtype}")
+    if embed_dtype == "bf16":
+        return raw.copy(), None, None, None
+    if embed_dtype == "int8":
+        q, scale = _quantize_embedding_int8(raw)
+        return None, q, None, scale
+    if embed_dtype == "int4":
+        q, scale = _quantize_embedding_int4(raw)
+        return None, None, q, scale
+    raise ValueError(f"embed_dtype must be 'bf16', 'int8', or 'int4', got {embed_dtype!r}")
+
+
+def load_falcon_edge(model_name: str, *, embed_dtype: str = "int4", mode: str = "neon") -> PackedFalconModel:
+    _validate_projection_mode(mode)
+    repo = FALCON_TORCHLESS_REPOS.get(model_name, model_name)
+    config_path, model_path = _resolve_hf_snapshot(repo)
+
+    with open(config_path) as f:
+        hf_config = json.load(f)
+    eos_raw = hf_config.get("eos_token_id", 2)
+    eos_ids = tuple(eos_raw) if isinstance(eos_raw, list) else (int(eos_raw),)
+    config = FalconTernaryConfig(
+        hidden_size=hf_config["hidden_size"],
+        num_layers=hf_config["num_hidden_layers"],
+        num_heads=hf_config["num_attention_heads"],
+        num_kv_heads=hf_config.get("num_key_value_heads", hf_config["num_attention_heads"]),
+        intermediate_size=hf_config["intermediate_size"],
+        vocab_size=hf_config["vocab_size"],
+        max_position_embeddings=hf_config.get("max_position_embeddings", 2048),
+        rms_norm_eps=hf_config.get("rms_norm_eps", 1e-5),
+        rope_theta=hf_config.get("rope_theta", 10000.0),
+        eos_token_ids=eos_ids,
+    )
+
+    sf = open_safetensors(str(model_path))
+    try:
+        emb_bf16, emb_int8, emb_int4, emb_scale = _load_dense_matrix(sf, "model.embed_tokens.weight", embed_dtype)
+        _release_pages()
+
+        if "lm_head.weight" in sf.header:
+            lm_bf16, lm_int8, lm_int4, lm_scale = _load_dense_matrix(sf, "lm_head.weight", embed_dtype)
+        else:
+            lm_bf16, lm_int8, lm_int4, lm_scale = emb_bf16, emb_int8, emb_int4, emb_scale
+        _release_pages()
+
+        final_norm = sf.get("model.norm.weight")[0].copy()
+        layers: list[PackedFalconLayer] = []
+        for i in range(config.num_layers):
+            prefix = f"model.layers.{i}"
+            kv_out = config.num_kv_heads * (config.hidden_size // config.num_heads)
+            layers.append(
+                PackedFalconLayer(
+                    q_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.q_proj.weight", config.hidden_size, mode),
+                    k_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.k_proj.weight", kv_out, mode),
+                    v_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.v_proj.weight", kv_out, mode),
+                    o_proj=_load_falcon_proj(sf, f"{prefix}.self_attn.o_proj.weight", config.hidden_size, mode),
+                    gate_proj=_load_falcon_proj(sf, f"{prefix}.mlp.gate_proj.weight", config.intermediate_size, mode),
+                    up_proj=_load_falcon_proj(sf, f"{prefix}.mlp.up_proj.weight", config.intermediate_size, mode),
+                    down_proj=_load_falcon_proj(sf, f"{prefix}.mlp.down_proj.weight", config.hidden_size, mode),
+                    input_norm=sf.get(f"{prefix}.input_layernorm.weight")[0].copy(),
+                    post_attn_norm=sf.get(f"{prefix}.post_attention_layernorm.weight")[0].copy(),
+                )
+            )
+            _release_pages()
+
+        return PackedFalconModel(
+            config=config,
+            embed_tokens=emb_bf16,
+            projection_backend=mode,
+            embed_int8=emb_int8,
+            embed_int4=emb_int4,
+            embed_scale=emb_scale,
+            lm_head_tokens=lm_bf16,
+            lm_head_int8=lm_int8,
+            lm_head_int4=lm_int4,
+            lm_head_scale=lm_scale,
+            final_norm=final_norm,
+            layers=layers,
+        )
+    finally:
+        sf.close()
+        gc.collect()
+        _release_pages()

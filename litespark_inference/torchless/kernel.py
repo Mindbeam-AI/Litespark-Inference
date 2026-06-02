@@ -1,17 +1,22 @@
 """
-ctypes bindings for the torchless extern "C" NEON kernel.
+ctypes bindings for the torchless extern "C" matmul kernel.
 
-Build path (preferred): the C++ source under
-litespark_inference/kernels/arm64/matmul_lut_neon_extern_c.cpp is compiled
-at install time by setup.py into a Python-extension-shaped shared library
-that lands next to this file. We locate it by globbing for any
-`_matmul_lut_neon*.{so,dylib}` artefact.
+Build path (preferred): the per-arch C++ source under
+  litespark_inference/kernels/arm64/matmul_lut_neon_extern_c.cpp     (NEON)
+  litespark_inference/kernels/x86_64/matmul_lut_avx512_extern_c.cpp  (AVX-512)
+is compiled at install time by setup.py into a Python-extension-shaped
+shared library that lands next to this file. We locate it by globbing
+for any `_matmul_lut_{neon,avx512}*.{so,dylib}` artefact.
 
 Fallback: if the shared library is missing (e.g. someone cloned the repo
 without `pip install`-ing it, or copied just the package directory), we
 JIT-compile via clang and write the dylib next to this file. The JIT path
 is purely a developer convenience -- a `pip install` produces the
 extension during install and never invokes the JIT.
+
+The C-side symbols are arch-suffixed (`*_neon` / `*_avx512`) so an
+accidental cross-arch load surfaces immediately. The Python-side wrappers
+below expose arch-neutral names that runtime.py imports.
 
 Deliberately does not import torch.
 """
@@ -30,7 +35,47 @@ import numpy as np
 
 
 _HERE = Path(__file__).resolve().parent
-_SRC = _HERE.parent / "kernels" / "arm64" / "matmul_lut_neon_extern_c.cpp"
+
+_MACHINE = platform.machine().lower()
+_IS_ARM = _MACHINE in ("arm64", "aarch64")
+_IS_X86 = _MACHINE in ("x86_64", "amd64")
+
+
+def _x86_host_has_avx512() -> bool:
+    """Whether the running CPU supports the AVX-512 set this kernel uses.
+
+    Linux: parse /proc/cpuinfo. macOS Intel / Windows: assume yes (the
+    rare path; override with LITESPARK_KERNEL_TIER=avx512|avx2).
+    """
+    override = os.environ.get("LITESPARK_KERNEL_TIER", "").strip().lower()
+    if override in ("avx512", "avx2"):
+        return override == "avx512"
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                return "avx512f" in f.read()
+        except OSError:
+            return False
+    return True
+
+
+if _IS_ARM:
+    _ARCH_TAG = "neon"
+    _SRC = _HERE.parent / "kernels" / "arm64" / "matmul_lut_neon_extern_c.cpp"
+elif _IS_X86:
+    # AVX-512 if the host supports it, else AVX2 scalar fallback. Pick the
+    # source path that matches so the JIT-rebuild path stays correct too.
+    if _x86_host_has_avx512():
+        _ARCH_TAG = "avx512"
+        _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx512_extern_c.cpp"
+    else:
+        _ARCH_TAG = "avx2"
+        _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx2_extern_c.cpp"
+else:
+    _ARCH_TAG = "unknown"
+    _SRC = _HERE  # nonexistent; load() will fail gracefully
+
+_LIB_PREFIX = f"_matmul_lut_{_ARCH_TAG}"
 
 _lib: Optional[ctypes.CDLL] = None
 
@@ -44,12 +89,12 @@ def _find_built_extension() -> Optional[Path]:
 
     setuptools writes the artefact with a Python ABI tag, e.g.
     `_matmul_lut_neon.cpython-311-darwin.so` or
-    `_matmul_lut_neon.cpython-311-aarch64-linux-gnu.so`. We accept any
-    file matching the prefix, falling back to the legacy bare-name dylib
-    that the JIT path produces.
+    `_matmul_lut_avx512.cpython-311-x86_64-linux-gnu.so`. We accept any
+    file matching the per-arch prefix, falling back to a legacy bare-name
+    dylib that the JIT path produces.
     """
     candidates: list[Path] = []
-    for pattern in ("_matmul_lut_neon*.so", "_matmul_lut_neon*.dylib"):
+    for pattern in (f"{_LIB_PREFIX}*.so", f"{_LIB_PREFIX}*.dylib", f"{_LIB_PREFIX}*.pyd"):
         candidates.extend(_HERE.glob(pattern))
     if not candidates:
         return None
@@ -59,10 +104,12 @@ def _find_built_extension() -> Optional[Path]:
     return candidates[0]
 
 
-_LIB_SUFFIX = {"Darwin": ".dylib", "Linux": ".so"}.get(platform.system(), ".so")
+_LIB_SUFFIX = {"Darwin": ".dylib", "Linux": ".so", "Windows": ".dll"}.get(
+    platform.system(), ".so"
+)
 # Path the JIT fallback writes to. The pip-installed extension will have a
 # different (ABI-tagged) name and will be preferred by _find_built_extension.
-_LIB_PATH = _HERE / f"_matmul_lut_neon{_LIB_SUFFIX}"
+_LIB_PATH = _HERE / f"{_LIB_PREFIX}{_LIB_SUFFIX}"
 
 
 _HOMEBREW_LIBOMP = Path("/opt/homebrew/opt/libomp")
@@ -92,7 +139,7 @@ def _omp_flags() -> list[str]:
 
 
 def _compile() -> None:
-    """Compile the extern "C" kernel into a shared library via clang."""
+    """Compile the extern "C" kernel into a shared library via clang/gcc."""
     compiler = os.environ.get("CXX", "clang++")
     base = [
         compiler,
@@ -103,12 +150,25 @@ def _compile() -> None:
         "-Wall",
         "-Wno-unused-function",
     ]
-    if platform.machine() in ("arm64", "aarch64"):
+    if _IS_ARM:
         # Apple clang accepts -mcpu=native; Linux clang/gcc want -march.
         # NEON + SDOT ("dotprod") are required by the SIMD path.
         base += ["-mcpu=native"] if platform.system() == "Darwin" else [
             "-march=armv8.2-a+dotprod",
         ]
+        if platform.system() == "Darwin":
+            base += ["-framework", "Accelerate"]
+    elif _IS_X86:
+        # Match setup.py: AVX-512F + BW + DQ + VNNI + VBMI + FMA on AVX-512
+        # hosts; plain AVX2 + FMA on older CPUs (the avx2 source is scalar
+        # C++ written to auto-vectorize with these flags).
+        if _ARCH_TAG == "avx512":
+            base += [
+                "-mavx512f", "-mavx512bw", "-mavx512dq",
+                "-mavx512vnni", "-mavx512vbmi", "-mfma",
+            ]
+        else:
+            base += ["-mavx2", "-mfma"]
 
     omp = _omp_flags()
     cmd_omp = base + omp + [str(_SRC), "-o", str(_LIB_PATH)]
@@ -152,112 +212,137 @@ def _load() -> ctypes.CDLL:
         _compile()
         lib_path = _LIB_PATH
     lib = ctypes.CDLL(str(lib_path))
-    lib.matmul_lut_neon_m1.argtypes = [
-        ctypes.POINTER(ctypes.c_int8),
-        ctypes.POINTER(ctypes.c_uint8),
-        ctypes.c_float,
-        ctypes.c_float,
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-        ctypes.c_int,
-    ]
-    lib.matmul_lut_neon_m1.restype = None
-    # Batched ternary matmul (prompt prefill, M>1).
-    lib.matmul_lut_neon_prefill.argtypes = [
-        ctypes.POINTER(ctypes.c_int8),    # x [M, K]
-        ctypes.POINTER(ctypes.c_uint8),   # packed_w [N, K/4]
-        ctypes.c_float,                   # w_scale
-        ctypes.POINTER(ctypes.c_float),   # x_scale [M]
-        ctypes.POINTER(ctypes.c_float),   # y [M, N]
-        ctypes.c_int,                     # M
-        ctypes.c_int,                     # N
-        ctypes.c_int,                     # K
-    ]
-    lib.matmul_lut_neon_prefill.restype = None
-    # NEON activation quantize
-    lib.quantize_activation_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_int8),
-        ctypes.c_int,
-    ]
-    lib.quantize_activation_neon.restype = ctypes.c_float
-    # Tied LM head matmul with bf16 weights (no fp32 cache needed).
-    lib.lm_head_bf16_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_uint16),  # emb [V, H] bf16 as u16
-        ctypes.POINTER(ctypes.c_float),   # x [H]
-        ctypes.POINTER(ctypes.c_float),   # logits [V]
-        ctypes.c_int,                     # V
-        ctypes.c_int,                     # H
-    ]
-    lib.lm_head_bf16_fp32_neon.restype = None
-    # Tied LM head matmul with int8 per-row-quantized embeddings.
-    lib.lm_head_int8_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_int8),    # emb [V, H] int8
-        ctypes.POINTER(ctypes.c_float),   # emb_scale [V]
-        ctypes.POINTER(ctypes.c_float),   # x [H]
-        ctypes.POINTER(ctypes.c_float),   # logits [V]
-        ctypes.c_int,                     # V
-        ctypes.c_int,                     # H
-    ]
-    lib.lm_head_int8_fp32_neon.restype = None
-    # Tied LM head matmul with int4 per-row-quantized embeddings (2 nibbles/byte).
-    lib.lm_head_int4_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_uint8),   # emb [V, H/2] packed int4
-        ctypes.POINTER(ctypes.c_float),   # emb_scale [V]
-        ctypes.POINTER(ctypes.c_float),   # x [H]
-        ctypes.POINTER(ctypes.c_float),   # logits [V]
-        ctypes.c_int,                     # V
-        ctypes.c_int,                     # H
-    ]
-    lib.lm_head_int4_fp32_neon.restype = None
-    # RMSNorm with bf16 gamma.
-    lib.rmsnorm_bf16gamma_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),   # x [K]
-        ctypes.POINTER(ctypes.c_uint16),  # gamma [K] bf16
-        ctypes.POINTER(ctypes.c_float),   # out [K]
-        ctypes.c_int,                     # K
-        ctypes.c_float,                   # eps
-    ]
-    lib.rmsnorm_bf16gamma_fp32_neon.restype = None
-    # RMSNorm with fp32 gamma.
-    lib.rmsnorm_fp32gamma_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-        ctypes.c_float,
-    ]
-    lib.rmsnorm_fp32gamma_fp32_neon.restype = None
-    # Fused relu2(gate) * up.
-    lib.relu2_mul_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-    ]
-    lib.relu2_mul_fp32_neon.restype = None
-    # In-place fp32 vector add.
-    lib.add_inplace_fp32_neon.argtypes = [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int,
-    ]
-    lib.add_inplace_fp32_neon.restype = None
-    # Informational probes
-    lib.matmul_lut_neon_has_omp.argtypes = []
-    lib.matmul_lut_neon_has_omp.restype = ctypes.c_int
-    lib.matmul_lut_neon_max_threads.argtypes = []
-    lib.matmul_lut_neon_max_threads.restype = ctypes.c_int
+
+    # Resolve arch-tagged C symbols and re-attach under arch-neutral names.
+    # Use numpy.ctypeslib.ndpointer for array args -- it lets callers pass
+    # numpy arrays directly (no per-call .ctypes.data_as allocation), and
+    # enforces dtype + C-contiguity at type-check time so wrappers can
+    # skip np.ascontiguousarray on the hot path.
+    from numpy import ctypeslib as _npct
+    _F32 = _npct.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")
+    _I8  = _npct.ndpointer(dtype=np.int8,    flags="C_CONTIGUOUS")
+    _U8  = _npct.ndpointer(dtype=np.uint8,   flags="C_CONTIGUOUS")
+    _U16 = _npct.ndpointer(dtype=np.uint16,  flags="C_CONTIGUOUS")
+
+    def _alias(neutral_name: str, c_name: str, argtypes, restype):
+        fn = getattr(lib, c_name)
+        fn.argtypes = argtypes
+        fn.restype = restype
+        setattr(lib, neutral_name, fn)
+
+    T = _ARCH_TAG
+    _alias("matmul_lut_m1", f"matmul_lut_{T}_m1",
+           [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    if hasattr(lib, f"matmul_accelerate_f32_{T}_m1"):
+        _alias("matmul_accelerate_f32_m1", f"matmul_accelerate_f32_{T}_m1",
+               [_F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+               None)
+    # Pre-unpacked-weights matmul: x86 only today (no NEON variant yet).
+    if _IS_X86 and hasattr(lib, f"matmul_unpacked_{T}_m1"):
+        _alias("matmul_unpacked_m1", f"matmul_unpacked_{T}_m1",
+               [_I8, _U8, ctypes.c_float, ctypes.c_float, _F32, ctypes.c_int, ctypes.c_int],
+               None)
+    # Batched (M=T) matmul for prefill.
+    if _IS_X86 and hasattr(lib, f"matmul_lut_{T}_mT"):
+        _alias("matmul_lut_mT", f"matmul_lut_{T}_mT",
+               [_I8, _F32, _U8, ctypes.c_float, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
+    if _IS_ARM and hasattr(lib, f"matmul_lut_{T}_prefill"):
+        _alias("matmul_lut_prefill", f"matmul_lut_{T}_prefill",
+               [_I8, _U8, ctypes.c_float, _F32, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
+    # AMX matmul + load-time transposer (Sapphire Rapids only).
+    if _IS_X86 and hasattr(lib, "matmul_amx_int8_mT"):
+        _alias("matmul_amx_int8_mT", "matmul_amx_int8_mT",
+               [_I8, _F32, _I8, ctypes.c_float, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
+        _alias("matmul_amx_int8_mT_v2", "matmul_amx_int8_mT_v2",
+               [_I8, _F32, _I8, ctypes.c_float, _F32,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int],
+               None)
+        _alias("transpose_packed_to_amx_vnni", "transpose_packed_to_amx_vnni",
+               [_U8, _I8, ctypes.c_int, ctypes.c_int],
+               None)
+        _alias("amx_request_permission", "amx_request_permission",
+               [], ctypes.c_int)
+    # Fused rmsnorm+quantize (single pass + single ctypes call). x86 only.
+    if _IS_X86 and hasattr(lib, f"rmsnorm_quantize_bf16gamma_{T}"):
+        _alias("rmsnorm_quantize_bf16gamma", f"rmsnorm_quantize_bf16gamma_{T}",
+               [_F32, _U16, _I8, _F32, ctypes.c_int, ctypes.c_float],
+               ctypes.c_float)
+        _alias("rmsnorm_quantize_bf16gamma_batched", f"rmsnorm_quantize_bf16gamma_batched_{T}",
+               [_F32, _U16, _I8, _F32, _F32, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+               None)
+    # Batched per-row helpers (rmsnorm, quantize, relu2_mul) that fold
+    # the prefill's T-loop into a single C call. x86 only today.
+    if _IS_X86 and hasattr(lib, f"rmsnorm_bf16gamma_fp32_batched_{T}"):
+        _alias("rmsnorm_bf16gamma_fp32_batched", f"rmsnorm_bf16gamma_fp32_batched_{T}",
+               [_F32, _U16, _F32, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+               None)
+        _alias("rmsnorm_fp32gamma_fp32_batched", f"rmsnorm_fp32gamma_fp32_batched_{T}",
+               [_F32, _F32, _F32, ctypes.c_int, ctypes.c_int, ctypes.c_float],
+               None)
+        _alias("quantize_activation_batched", f"quantize_activation_batched_{T}",
+               [_F32, _I8, _F32, ctypes.c_int, ctypes.c_int],
+               None)
+        _alias("relu2_mul_fp32_batched", f"relu2_mul_fp32_batched_{T}",
+               [_F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+               None)
+    _alias("quantize_activation", f"quantize_activation_{T}",
+           [_F32, _I8, ctypes.c_int],
+           ctypes.c_float)
+    _alias("lm_head_bf16_fp32", f"lm_head_bf16_fp32_{T}",
+           [_U16, _F32, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    _alias("lm_head_int8_fp32", f"lm_head_int8_fp32_{T}",
+           [_I8, _F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    _alias("lm_head_int4_fp32", f"lm_head_int4_fp32_{T}",
+           [_U8, _F32, _F32, _F32, ctypes.c_int, ctypes.c_int],
+           None)
+    _alias("rmsnorm_bf16gamma_fp32", f"rmsnorm_bf16gamma_fp32_{T}",
+           [_F32, _U16, _F32, ctypes.c_int, ctypes.c_float],
+           None)
+    _alias("rmsnorm_fp32gamma_fp32", f"rmsnorm_fp32gamma_fp32_{T}",
+           [_F32, _F32, _F32, ctypes.c_int, ctypes.c_float],
+           None)
+    _alias("relu2_mul_fp32", f"relu2_mul_fp32_{T}",
+           [_F32, _F32, _F32, ctypes.c_int],
+           None)
+    _alias("add_inplace_fp32", f"add_inplace_fp32_{T}",
+           [_F32, _F32, ctypes.c_int],
+           None)
+    _alias("has_omp_probe", f"matmul_lut_{T}_has_omp", [], ctypes.c_int)
+    _alias("max_threads_probe", f"matmul_lut_{T}_max_threads", [], ctypes.c_int)
+    if hasattr(lib, f"matmul_lut_{T}_has_accelerate"):
+        _alias("has_accelerate_probe", f"matmul_lut_{T}_has_accelerate", [], ctypes.c_int)
+
     _lib = lib
     return lib
 
 
 def has_omp() -> bool:
-    return bool(_load().matmul_lut_neon_has_omp())
+    return bool(_load().has_omp_probe())
 
 
 def max_threads() -> int:
-    return int(_load().matmul_lut_neon_max_threads())
+    return int(_load().max_threads_probe())
+
+
+def has_accelerate() -> bool:
+    lib = _load()
+    return bool(getattr(lib, "has_accelerate_probe", lambda: 0)())
+
+
+# All wrappers below skip per-call dtype/shape asserts and just hand the
+# arrays to ctypes -- ndpointer-typed argtypes raise TypeError on mismatch
+# and enforce C-contiguity, so the ascontiguousarray + assert calls that
+# used to live in each wrapper are now redundant (and were measured at
+# ~5% of forward-pass time).
 
 
 def lm_head_int4(
@@ -267,34 +352,9 @@ def lm_head_int4(
     out_fp32: np.ndarray,
     H: int,
 ) -> np.ndarray:
-    """
-    Tied LM head via NEON int4xfp32 matmul (2 nibbles/byte).
-
-    emb_packed: [V, H/2] uint8, each byte = low_nibble | (high_nibble << 4),
-                nibbles are signed 4-bit in [-7, +7] per-row absmax-quant.
-    emb_scale:  [V] fp32 (= absmax / 7).
-    x_fp32:     [H] fp32 contiguous.
-    out_fp32:   [V] fp32 contiguous scratch.
-    H:          un-packed feature width (vocab rows are H/2 bytes wide).
-    """
-    assert emb_packed.dtype == np.uint8 and emb_packed.ndim == 2
-    assert emb_scale.dtype == np.float32 and emb_scale.ndim == 1
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
-    V, H_half = emb_packed.shape
-    assert H_half == H // 2
-    assert emb_scale.shape[0] == V
-    assert x_fp32.shape[0] == H
-    assert out_fp32.shape[0] == V
-    lib = _load()
-    lib.lm_head_int4_fp32_neon(
-        emb_packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        emb_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(V),
-        ctypes.c_int(H),
-    )
+    """Tied LM head via int4xfp32 matmul (2 nibbles/byte; H must be even)."""
+    V = emb_packed.shape[0]
+    _load().lm_head_int4_fp32(emb_packed, emb_scale, x_fp32, out_fp32, V, H)
     return out_fp32
 
 
@@ -304,31 +364,9 @@ def lm_head_int8(
     x_fp32: np.ndarray,
     out_fp32: np.ndarray,
 ) -> np.ndarray:
-    """
-    Tied LM head via NEON int8xfp32 matmul with per-row fp32 scale.
-
-    emb_int8:  [V, H] int8 (per-row absmax quant of bf16 embedding).
-    emb_scale: [V]    fp32 dequant factor (typically absmax/127).
-    x_fp32:    [H]    fp32 contiguous.
-    out_fp32:  [V]    fp32 contiguous scratch.
-    """
-    assert emb_int8.dtype == np.int8 and emb_int8.ndim == 2
-    assert emb_scale.dtype == np.float32 and emb_scale.ndim == 1
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
+    """Tied LM head via int8xfp32 matmul with per-row fp32 scale."""
     V, H = emb_int8.shape
-    assert emb_scale.shape[0] == V
-    assert x_fp32.shape[0] == H
-    assert out_fp32.shape[0] == V
-    lib = _load()
-    lib.lm_head_int8_fp32_neon(
-        emb_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        emb_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(V),
-        ctypes.c_int(H),
-    )
+    _load().lm_head_int8_fp32(emb_int8, emb_scale, x_fp32, out_fp32, V, H)
     return out_fp32
 
 
@@ -337,27 +375,9 @@ def lm_head_bf16(
     x_fp32: np.ndarray,
     out_fp32: np.ndarray,
 ) -> np.ndarray:
-    """
-    Tied LM head via NEON bf16xfp32 matmul.
-
-    emb_u16:   [V, H] uint16 (bf16 bits).
-    x_fp32:    [H] fp32 contiguous.
-    out_fp32:  [V] fp32 contiguous (caller-owned scratch to avoid alloc).
-    """
-    assert emb_u16.dtype == np.uint16 and emb_u16.ndim == 2
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
+    """Tied LM head via bf16xfp32 matmul (emb_u16 holds bf16 bits)."""
     V, H = emb_u16.shape
-    assert x_fp32.shape[0] == H
-    assert out_fp32.shape[0] == V
-    lib = _load()
-    lib.lm_head_bf16_fp32_neon(
-        emb_u16.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(V),
-        ctypes.c_int(H),
-    )
+    _load().lm_head_bf16_fp32(emb_u16, x_fp32, out_fp32, V, H)
     return out_fp32
 
 
@@ -367,29 +387,13 @@ def rmsnorm_into(
     out_fp32: np.ndarray,
     eps: float = 1e-5,
 ) -> np.ndarray:
-    """
-    RMSNorm x -> out in-place (caller-owned out). Dispatches on gamma dtype:
-    uint16 (bf16 bits) or fp32 are both accepted.
-    """
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
-    K = int(x_fp32.shape[0])
-    assert out_fp32.shape[0] == K and gamma.shape[0] == K
+    """RMSNorm x -> out (caller-owned). gamma may be uint16 (bf16) or fp32."""
+    K = x_fp32.shape[0]
     lib = _load()
     if gamma.dtype == np.uint16:
-        lib.rmsnorm_bf16gamma_fp32_neon(
-            x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            gamma.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.c_int(K), ctypes.c_float(eps),
-        )
+        lib.rmsnorm_bf16gamma_fp32(x_fp32, gamma, out_fp32, K, eps)
     elif gamma.dtype == np.float32:
-        lib.rmsnorm_fp32gamma_fp32_neon(
-            x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            gamma.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.c_int(K), ctypes.c_float(eps),
-        )
+        lib.rmsnorm_fp32gamma_fp32(x_fp32, gamma, out_fp32, K, eps)
     else:
         raise TypeError(f"gamma dtype must be uint16 or float32, got {gamma.dtype}")
     return out_fp32
@@ -401,55 +405,19 @@ def relu2_mul_into(
     out_fp32: np.ndarray,
 ) -> np.ndarray:
     """out = max(gate, 0)^2 * up (caller-owned out)."""
-    assert gate_fp32.dtype == np.float32 and gate_fp32.ndim == 1
-    assert up_fp32.dtype == np.float32 and up_fp32.ndim == 1
-    assert out_fp32.dtype == np.float32 and out_fp32.ndim == 1
-    K = int(gate_fp32.shape[0])
-    assert up_fp32.shape[0] == K and out_fp32.shape[0] == K
-    _load().relu2_mul_fp32_neon(
-        gate_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        up_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(K),
-    )
+    _load().relu2_mul_fp32(gate_fp32, up_fp32, out_fp32, gate_fp32.shape[0])
     return out_fp32
 
 
 def add_inplace(a_fp32: np.ndarray, b_fp32: np.ndarray) -> np.ndarray:
     """a += b in-place (both fp32 1-D)."""
-    assert a_fp32.dtype == np.float32 and a_fp32.ndim == 1
-    assert b_fp32.dtype == np.float32 and b_fp32.ndim == 1
-    K = int(a_fp32.shape[0])
-    assert b_fp32.shape[0] == K
-    _load().add_inplace_fp32_neon(
-        a_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        b_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(K),
-    )
+    _load().add_inplace_fp32(a_fp32, b_fp32, a_fp32.shape[0])
     return a_fp32
 
 
-def quantize_activation(
-    x_fp32: np.ndarray,
-    out_int8: np.ndarray,
-) -> float:
-    """
-    Per-tensor absmax int8 quantization via NEON, in-place into `out_int8`.
-
-    x_fp32:   [K] contiguous float32.
-    out_int8: [K] contiguous int8 scratch buffer (must be preallocated).
-
-    Returns the scalar scale (dequantized = int8 * scale).
-    """
-    assert x_fp32.dtype == np.float32 and x_fp32.ndim == 1
-    assert out_int8.dtype == np.int8 and out_int8.ndim == 1
-    assert out_int8.shape[0] >= x_fp32.shape[0]
-    lib = _load()
-    return float(lib.quantize_activation_neon(
-        x_fp32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        ctypes.c_int(int(x_fp32.shape[0])),
-    ))
+def quantize_activation(x_fp32: np.ndarray, out_int8: np.ndarray) -> float:
+    """Per-tensor absmax int8 quantization in-place. Returns the scale."""
+    return float(_load().quantize_activation(x_fp32, out_int8, x_fp32.shape[0]))
 
 
 def matmul_packed_m1(
@@ -472,34 +440,238 @@ def matmul_packed_m1(
     Returns:
         [N] float32 output.
     """
-    assert x_int8.dtype == np.int8 and x_int8.ndim == 1
-    assert packed_w.dtype == np.uint8 and packed_w.ndim == 2
-
-    x_int8 = np.ascontiguousarray(x_int8)
-    packed_w = np.ascontiguousarray(packed_w)
-
     N, Kb = packed_w.shape
     K = Kb * 4
-    if x_int8.shape[0] != K:
-        raise ValueError(f"x length {x_int8.shape[0]} != K={K} implied by packed_w")
-
     if out is None:
         out = np.empty(N, dtype=np.float32)
-    else:
-        if out.shape != (N,) or out.dtype != np.float32:
-            raise ValueError("out must be float32 [N]")
-        out = np.ascontiguousarray(out)
+    _load().matmul_lut_m1(x_int8, packed_w, w_scale, x_scale, out, N, K)
+    return out
 
+
+def matmul_accelerate_f32_m1(x_fp32: np.ndarray, w_float32: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
     lib = _load()
-    lib.matmul_lut_neon_m1(
-        x_int8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-        packed_w.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        ctypes.c_float(w_scale),
-        ctypes.c_float(x_scale),
-        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(N),
-        ctypes.c_int(K),
+    if not hasattr(lib, "matmul_accelerate_f32_m1") or not has_accelerate():
+        raise RuntimeError("mode='accelerate' requires Apple Accelerate")
+    N, K = w_float32.shape
+    if out is None:
+        out = np.empty(N, dtype=np.float32)
+    lib.matmul_accelerate_f32_m1(x_fp32, w_float32, out, N, K)
+    return out
+
+
+def has_unpacked_matmul() -> bool:
+    """Return True if the loaded kernel has a pre-unpacked-weights matmul.
+
+    Available on x86 builds today. Use this to gate
+    `LITESPARK_PREUNPACK=1` storage on whether the runtime can use it.
+    """
+    return hasattr(_load(), "matmul_unpacked_m1")
+
+
+def has_batched_matmul() -> bool:
+    """Return True if the kernel has the M=T (batched-prefill) matmul."""
+    lib = _load()
+    return hasattr(lib, "matmul_lut_mT") or hasattr(lib, "matmul_lut_prefill")
+
+
+def has_batched_helpers() -> bool:
+    """True if rmsnorm/quantize/relu2_mul have batched (T-folded) versions."""
+    return hasattr(_load(), "rmsnorm_bf16gamma_fp32_batched")
+
+
+def has_fused_rmsnorm_quantize() -> bool:
+    """True if the fused rmsnorm+quantize kernel is available."""
+    return hasattr(_load(), "rmsnorm_quantize_bf16gamma")
+
+
+def rmsnorm_quantize_into(
+    x_fp32: np.ndarray,    # [K]
+    gamma: np.ndarray,     # [K] uint16 (bf16) only for now
+    x_int8_out: np.ndarray,# [K]
+    tmp_fp32: np.ndarray,  # [K] scratch (reused buffer)
+    eps: float = 1e-5,
+) -> float:
+    """Fused RMSNorm + per-tensor absmax int8 quantize. bf16 gamma only."""
+    K = x_fp32.shape[0]
+    return float(_load().rmsnorm_quantize_bf16gamma(
+        x_fp32, gamma, x_int8_out, tmp_fp32, K, eps,
+    ))
+
+
+def rmsnorm_quantize_batched(
+    x_fp32: np.ndarray,    # [T, K]
+    gamma: np.ndarray,     # [K] uint16
+    x_int8_out: np.ndarray,# [T, K]
+    scales_out: np.ndarray,# [T]
+    tmp_fp32: np.ndarray,  # [T, K] scratch
+    eps: float = 1e-5,
+) -> np.ndarray:
+    T, K = x_fp32.shape
+    _load().rmsnorm_quantize_bf16gamma_batched(
+        x_fp32, gamma, x_int8_out, scales_out, tmp_fp32, T, K, eps,
     )
+    return scales_out
+
+
+_amx_perm_requested = False
+
+
+def has_amx() -> bool:
+    """True if the loaded kernel has AMX TMUL ternary matmul.
+
+    Requires the build to have been done with LITESPARK_BUILD_AMX=1
+    AND the host CPU to have amx_tile + amx_int8 (Sapphire Rapids+).
+    Also performs the one-time Linux arch_prctl opt-in so the first
+    TILELOADD doesn't SIGILL.
+    """
+    global _amx_perm_requested
+    lib = _load()
+    if not hasattr(lib, "matmul_amx_int8_mT"):
+        return False
+    if not _amx_perm_requested:
+        # Linux requires arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)
+        # before any AMX instruction. Older kernels or non-AMX CPUs return 0.
+        ok = lib.amx_request_permission()
+        _amx_perm_requested = True
+        if not ok:
+            return False
+    return True
+
+
+def transpose_packed_to_amx_vnni(
+    w_packed: np.ndarray, w_amx_out: np.ndarray, N: int, K: int,
+) -> np.ndarray:
+    """One-shot load-time helper: convert [N, K/4] packed ternary into
+    [K/4, N, 4] int8 AMX-VNNI layout. The output array must already be
+    allocated by the caller (4*K*N bytes)."""
+    _load().transpose_packed_to_amx_vnni(w_packed, w_amx_out, N, K)
+    return w_amx_out
+
+
+def matmul_amx_mT(
+    x_int8: np.ndarray,         # [T, K] int8, T <= 16
+    x_scales: np.ndarray,       # [T] fp32
+    w_amx: np.ndarray,          # [K/4, N, 4] int8 (AMX-VNNI layout)
+    w_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """AMX TMUL ternary matmul for M=T (T <= 16)."""
+    T, K = x_int8.shape
+    Kg, N, four = w_amx.shape
+    assert four == 4 and Kg == K // 4
+    if out is None:
+        out = np.empty((T, N), dtype=np.float32)
+    _load().matmul_amx_int8_mT(x_int8, x_scales, w_amx, w_scale, out, T, N, K)
+    return out
+
+
+def matmul_amx_mT_padded(
+    x_int8_padded: np.ndarray,  # [T_padded, K] int8, T_padded multiple of 16, <= 64
+    x_scales_padded: np.ndarray,# [T_padded] fp32 (pad rows can be 0)
+    w_amx: np.ndarray,
+    w_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Phase 10 AMX kernel: T must be 16-multiple. Caller pads."""
+    T_padded, K = x_int8_padded.shape
+    Kg, N, four = w_amx.shape
+    assert four == 4 and Kg == K // 4
+    assert T_padded % 16 == 0 and 0 < T_padded <= 64
+    if out is None:
+        out = np.empty((T_padded, N), dtype=np.float32)
+    _load().matmul_amx_int8_mT_v2(
+        x_int8_padded, x_scales_padded, w_amx, w_scale, out, T_padded, N, K,
+    )
+    return out
+
+
+def rmsnorm_into_batched(
+    x_fp32: np.ndarray,    # [T, K]
+    gamma: np.ndarray,
+    out_fp32: np.ndarray,  # [T, K]
+    eps: float = 1e-5,
+) -> np.ndarray:
+    T, K = x_fp32.shape
+    lib = _load()
+    if gamma.dtype == np.uint16:
+        lib.rmsnorm_bf16gamma_fp32_batched(x_fp32, gamma, out_fp32, T, K, eps)
+    elif gamma.dtype == np.float32:
+        lib.rmsnorm_fp32gamma_fp32_batched(x_fp32, gamma, out_fp32, T, K, eps)
+    else:
+        raise TypeError(f"gamma dtype must be uint16 or float32, got {gamma.dtype}")
+    return out_fp32
+
+
+def quantize_activation_batched(
+    x_fp32: np.ndarray,   # [T, K]
+    out_int8: np.ndarray, # [T, K]
+    out_scales: np.ndarray,  # [T]
+) -> np.ndarray:
+    T, K = x_fp32.shape
+    _load().quantize_activation_batched(x_fp32, out_int8, out_scales, T, K)
+    return out_scales
+
+
+def relu2_mul_into_batched(
+    gate_fp32: np.ndarray,  # [T, K]
+    up_fp32: np.ndarray,    # [T, K]
+    out_fp32: np.ndarray,   # [T, K]
+) -> np.ndarray:
+    T, K = gate_fp32.shape
+    _load().relu2_mul_fp32_batched(gate_fp32, up_fp32, out_fp32, T, K)
+    return out_fp32
+
+
+def matmul_packed_mT(
+    x_int8: np.ndarray,         # [T, K] int8
+    x_scales: np.ndarray,       # [T] fp32
+    packed_w: np.ndarray,       # [N, K/4] uint8
+    w_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Batched ternary matmul for M=T (prefill).
+
+    Returns y of shape [T, N] fp32. The kernel unpacks each weight row
+    once and reuses it across the T tokens, amortizing both the unpack
+    cost and the weight memory read.
+    """
+    T, K = x_int8.shape
+    N, Kb = packed_w.shape
+    assert Kb * 4 == K, f"K mismatch: {K} vs Kb*4={Kb*4}"
+    if out is None:
+        out = np.empty((T, N), dtype=np.float32)
+    lib = _load()
+    if hasattr(lib, "matmul_lut_mT"):
+        lib.matmul_lut_mT(x_int8, x_scales, packed_w, w_scale, out, T, N, K)
+    elif hasattr(lib, "matmul_lut_prefill"):
+        lib.matmul_lut_prefill(x_int8, packed_w, w_scale, x_scales, out, T, N, K)
+    else:
+        raise RuntimeError("batched matmul kernel is not available")
+    return out
+
+
+def matmul_unpacked_m1(
+    x_int8: np.ndarray,
+    w_u8: np.ndarray,
+    w_scale: float,
+    x_scale: float,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Ternary matmul for M=1 with PRE-UNPACKED weights.
+
+    Args:
+        x_int8:   [K] int8.
+        w_u8:     [N, K] uint8 in [0, 1, 2] (one byte per ternary weight).
+        w_scale:  scalar float (per-tensor absmean).
+        x_scale:  scalar activation scale.
+        out:      Optional [N] float32 buffer.
+    """
+    N, K = w_u8.shape
+    if out is None:
+        out = np.empty(N, dtype=np.float32)
+    _load().matmul_unpacked_m1(x_int8, w_u8, w_scale, x_scale, out, N, K)
     return out
 
 
