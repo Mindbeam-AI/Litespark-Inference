@@ -40,12 +40,37 @@ _MACHINE = platform.machine().lower()
 _IS_ARM = _MACHINE in ("arm64", "aarch64")
 _IS_X86 = _MACHINE in ("x86_64", "amd64")
 
+
+def _x86_host_has_avx512() -> bool:
+    """Whether the running CPU supports the AVX-512 set this kernel uses.
+
+    Linux: parse /proc/cpuinfo. macOS Intel / Windows: assume yes (the
+    rare path; override with LITESPARK_KERNEL_TIER=avx512|avx2).
+    """
+    override = os.environ.get("LITESPARK_KERNEL_TIER", "").strip().lower()
+    if override in ("avx512", "avx2"):
+        return override == "avx512"
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                return "avx512f" in f.read()
+        except OSError:
+            return False
+    return True
+
+
 if _IS_ARM:
     _ARCH_TAG = "neon"
     _SRC = _HERE.parent / "kernels" / "arm64" / "matmul_lut_neon_extern_c.cpp"
 elif _IS_X86:
-    _ARCH_TAG = "avx512"
-    _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx512_extern_c.cpp"
+    # AVX-512 if the host supports it, else AVX2 scalar fallback. Pick the
+    # source path that matches so the JIT-rebuild path stays correct too.
+    if _x86_host_has_avx512():
+        _ARCH_TAG = "avx512"
+        _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx512_extern_c.cpp"
+    else:
+        _ARCH_TAG = "avx2"
+        _SRC = _HERE.parent / "kernels" / "x86_64" / "matmul_lut_avx2_extern_c.cpp"
 else:
     _ARCH_TAG = "unknown"
     _SRC = _HERE  # nonexistent; load() will fail gracefully
@@ -134,11 +159,16 @@ def _compile() -> None:
         if platform.system() == "Darwin":
             base += ["-framework", "Accelerate"]
     elif _IS_X86:
-        # Match setup.py: AVX-512F + BW + DQ + VNNI + VBMI + FMA.
-        base += [
-            "-mavx512f", "-mavx512bw", "-mavx512dq",
-            "-mavx512vnni", "-mavx512vbmi", "-mfma",
-        ]
+        # Match setup.py: AVX-512F + BW + DQ + VNNI + VBMI + FMA on AVX-512
+        # hosts; plain AVX2 + FMA on older CPUs (the avx2 source is scalar
+        # C++ written to auto-vectorize with these flags).
+        if _ARCH_TAG == "avx512":
+            base += [
+                "-mavx512f", "-mavx512bw", "-mavx512dq",
+                "-mavx512vnni", "-mavx512vbmi", "-mfma",
+            ]
+        else:
+            base += ["-mavx2", "-mfma"]
 
     omp = _omp_flags()
     cmd_omp = base + omp + [str(_SRC), "-o", str(_LIB_PATH)]
