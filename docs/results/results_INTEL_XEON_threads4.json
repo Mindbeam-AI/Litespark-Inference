@@ -1,0 +1,35 @@
+{
+  "system": {
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+    "cpu_cores": 16,
+    "architecture": "x86_64",
+    "simd_features": {
+      "avx512f": true,
+      "avx512vnni": true,
+      "avx_vnni": true,
+      "neon": false
+    }
+  },
+  "benchmarks": {
+    "inference": {
+      "model": "bitnet-2b",
+      "kernel": "avx512-torchless",
+      "backend": "torchless",
+      "embed_dtype": "int4",
+      "threads": 4,
+      "memory_mb": 775.546875,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 1138.9509338000607,
+        "std_ms": 6.351419866997434,
+        "throughput_tps": 112.38412138873578
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 7558.824532666525,
+        "std_ms": 26.350730612283318,
+        "throughput_tps": 16.9338498925104
+      }
+    }
+  }
+}

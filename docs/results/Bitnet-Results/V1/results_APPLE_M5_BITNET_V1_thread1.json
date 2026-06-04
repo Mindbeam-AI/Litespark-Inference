@@ -1,0 +1,6 @@
+| model                          |       size |     params | backend    | ngl | threads | n_batch |          test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ------: | ------: | ------------: | -------------------: |
+| bitnet-b1.58 2B I2_S - 2 bpw ternary |   1.71 GiB |     2.74 B | Metal      |   0 |       1 |       1 |         pp128 |         16.02 ± 0.02 |
+| bitnet-b1.58 2B I2_S - 2 bpw ternary |   1.71 GiB |     2.74 B | Metal      |   0 |       1 |       1 |         tg128 |         16.05 ± 0.01 |
+
+build: 1f86f058 (3962)

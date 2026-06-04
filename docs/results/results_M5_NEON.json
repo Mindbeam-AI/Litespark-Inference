@@ -1,0 +1,52 @@
+{
+  "system": {
+    "cpu_model": "Apple M5 Max",
+    "cpu_cores": 18,
+    "architecture": "arm64",
+    "simd_features": {
+      "avx512f": false,
+      "avx512vnni": false,
+      "avx_vnni": false,
+      "neon": true
+    }
+  },
+  "benchmarks": {
+    "inference": {
+      "model": "bitnet-2b",
+      "kernel": "neon-torchless",
+      "backend": "torchless",
+      "embed_dtype": "int4",
+      "threads": null,
+      "memory_mb": 793.34375,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 474.43643347360194,
+        "std_ms": 5.482059043187839,
+        "throughput_tps": 269.7937826208746
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 3253.095513675362,
+        "std_ms": 19.71544657206336,
+        "throughput_tps": 39.34713858290162
+      }
+    },
+    "pytorch_baseline": {
+      "model": "bitnet-2b",
+      "hf_name": "microsoft/bitnet-b1.58-2B-4T-bf16",
+      "threads": null,
+      "memory_mb": 4601.5478515625,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 3160.1324301833906,
+        "std_ms": 399.91474838020224,
+        "throughput_tps": 40.50463163424193
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 40879.33062505908,
+        "throughput_tps": 3.131166730052469
+      }
+    }
+  }
+}

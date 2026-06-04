@@ -1,0 +1,35 @@
+{
+  "system": {
+    "cpu_model": "Apple M5 Max",
+    "cpu_cores": 18,
+    "architecture": "arm64",
+    "simd_features": {
+      "avx512f": false,
+      "avx512vnni": false,
+      "avx_vnni": false,
+      "neon": true
+    }
+  },
+  "benchmarks": {
+    "inference": {
+      "model": "bitnet-2b",
+      "kernel": "neon-torchless",
+      "backend": "torchless",
+      "embed_dtype": "int4",
+      "threads": 16,
+      "memory_mb": 793.765625,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 487.44611660949886,
+        "std_ms": 3.185658056634448,
+        "throughput_tps": 262.59312699077856
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 3375.825861313691,
+        "std_ms": 5.9580120091583835,
+        "throughput_tps": 37.9166477355527
+      }
+    }
+  }
+}

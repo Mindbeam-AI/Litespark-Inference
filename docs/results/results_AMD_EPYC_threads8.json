@@ -1,0 +1,35 @@
+{
+  "system": {
+    "cpu_model": "AMD EPYC 9R14",
+    "cpu_cores": 16,
+    "architecture": "x86_64",
+    "simd_features": {
+      "avx512f": true,
+      "avx512vnni": true,
+      "avx_vnni": false,
+      "neon": false
+    }
+  },
+  "benchmarks": {
+    "inference": {
+      "model": "bitnet-2b",
+      "kernel": "avx512-torchless",
+      "backend": "torchless",
+      "embed_dtype": "int4",
+      "threads": 8,
+      "memory_mb": 769.2265625,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 241.7997262000199,
+        "std_ms": 6.535634561815977,
+        "throughput_tps": 529.3637094283421
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 3160.9897850000075,
+        "std_ms": 12.542662364103547,
+        "throughput_tps": 40.49364556867737
+      }
+    }
+  }
+}

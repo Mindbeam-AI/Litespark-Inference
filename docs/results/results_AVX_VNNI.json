@@ -1,0 +1,52 @@
+{
+  "system": {
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+    "cpu_cores": 16,
+    "architecture": "x86_64",
+    "simd_features": {
+      "avx512f": true,
+      "avx512vnni": true,
+      "avx_vnni": true,
+      "neon": false
+    }
+  },
+  "benchmarks": {
+    "inference": {
+      "model": "bitnet-2b",
+      "kernel": "avx512-torchless",
+      "backend": "torchless",
+      "embed_dtype": "int4",
+      "threads": null,
+      "memory_mb": 775.83984375,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 1134.479559957981,
+        "std_ms": 17.69847167450122,
+        "throughput_tps": 112.82706583514019
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 4803.839354620625,
+        "std_ms": 37.806472912588056,
+        "throughput_tps": 26.6453539660692
+      }
+    },
+    "pytorch_baseline": {
+      "model": "bitnet-2b",
+      "hf_name": "microsoft/bitnet-b1.58-2B-4T-bf16",
+      "threads": null,
+      "memory_mb": 4601.5478515625,
+      "prompt_processing": {
+        "tokens": 128,
+        "mean_ms": 7173.054436997821,
+        "std_ms": 7841.864544365595,
+        "throughput_tps": 17.844559960369207
+      },
+      "token_generation": {
+        "tokens": 128,
+        "mean_ms": 314590.70674097165,
+        "throughput_tps": 0.40687788055161117
+      }
+    }
+  }
+}
