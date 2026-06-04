@@ -50,7 +50,7 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 |--------|---------|----------|-------------|
 | Memory (MB) | 4,601.55 | 775.84 | 5.93x |
 | TTFT (ms) | 7,173.05 | 1,134.48 | 6.32x |
-| Throughput (tok/s) | 0.41 | 26.65 | 65.00x |
+| Throughput (tok/s) | 0.41 | 39.96 | 97.46x |
 
 </div>
 
@@ -145,6 +145,7 @@ The paper follows Microsoft's `e2e_benchmark.py` script for this setup; "V2" ref
 - **Intel Ice Lake+** — AVX-512 VNNI instructions
 - **AMD Zen4+** — AVX-512 VNNI instructions
 - **Intel Core Ultra** — AVX-VNNI (256-bit) instructions
+- **AMD Zen 2–3 / pre-Skylake-X Intel** — AVX2 + FMA fallback (256-bit, no VNNI fast path)
 
 ## Installation
 
