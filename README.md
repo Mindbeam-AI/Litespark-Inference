@@ -10,15 +10,15 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 ![Performance on Apple Silicon](docs/figures/apple_silicon_summary_v3.png)
 
-*Performance comparison on Apple Silicon M5. Litespark-Inference achieves ~5.8x memory reduction, 6.66x faster TTFT, and 12.57x higher throughput compared to PyTorch. Accelerate is an Apple-only float32 accuracy mode and uses more memory than the packed NEON path.*
+*Performance comparison on Apple Silicon M5 Max. Litespark-Inference achieves 6.03x memory reduction, 7.15x faster TTFT, and 18.15x higher throughput compared to PyTorch.*
 
 <div align="center">
 
-| Metric | PyTorch | NEON | Accelerate |
-|--------|---------|------|------------|
-| Memory (MB) | 4,601.55 | 793.34 | 8,558.44 |
-| TTFT (ms) | 3,160.13 | 474.44 | 8,399.13 |
-| Throughput (tok/s) | 3.13 | 39.35 | 14.79 |
+| Metric | PyTorch | NEON | Improvement |
+|--------|---------|------|-------------|
+| Memory (MB) | 4,868.22 | 806.81 | 6.03x |
+| TTFT (ms) | 4,213.92 | 589.02 | 7.15x |
+| Throughput (tok/s) | 2.20 | 39.92 | 18.15x |
 
 </div>
 
@@ -32,9 +32,9 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 | Metric | PyTorch | AVX-512 VNNI | Improvement |
 |--------|---------|--------------|-------------|
-| Memory (MB) | 4,601.55 | 775.84 | 5.93x |
-| TTFT (ms) | 6,933.36 | 1,126.12 | 6.16x |
-| Throughput (tok/s) | 0.41 | 27.16 | 66.24x |
+| Memory (MB) | 4,892.38 | 789.88 | 6.19x |
+| TTFT (ms) | 6,647.18 | 1,167.26 | 5.69x |
+| Throughput (tok/s) | 0.43 | 41.20 | 95.81x |
 
 </div>
 
@@ -62,9 +62,9 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 ### Energy Consumption
 
-![Apple M5 Energy Comparison](docs/figures/power_comparison_apple_m5_v2.png)
+![Apple M5 Energy Comparison](docs/figures/power_comparison_apple_m5_v3.png)
 
-![AMD Ryzen Threadripper Energy Comparison](docs/figures/power_comparison_amd_threadripper_5965wx_v2.png)
+![AMD Ryzen Threadripper Energy Comparison](docs/figures/power_comparison_amd_threadripper_5965wx_v3.png)
 
 <div align="center">
 
@@ -77,54 +77,45 @@ Litespark-Inference is a pip-installable Python library that enables efficient i
 
 </div>
 
-## Comparison with BitNet.cpp v2
+## Thread Scaling
 
-We benchmarked Litespark-Inference against Microsoft's BitNet.cpp v2 using their pp128+tg128 methodology (128-token prompt processing + 128-token generation), batch size 1.
-The paper follows Microsoft's `e2e_benchmark.py` script for this setup; "V2" refers to Microsoft's 01/15/2026 BitNet CPU Inference Optimization update.
+We also measured Litespark-Inference with the pp128+tg128 protocol across thread counts, separating prompt prefill from autoregressive token generation.
 
 ### AMD EPYC 9R14 (AWS c7a.4xlarge)
 
-![AMD EPYC Comparison](docs/figures/performance_comparison_amd_epyc_9r14_user_v3.png)
-
-*Scaling behavior on AMD EPYC 9R14. Litespark-Inference leads both BitNet.cpp Original and BitNet.cpp V2 across the tested thread counts.*
-
 <div align="center">
 
-| Threads | Prefill Original | Prefill V2 | Prefill Litespark | Gen Original | Gen V2 | Gen Litespark |
-|---------|------------------|------------|-------------------|--------------|--------|---------------|
-| 1 | 1.40 | 1.67 | **520.96** | 1.42 | 1.67 | **7.67** |
-| 2 | 2.70 | 3.22 | **492.16** | 2.72 | 3.22 | **14.56** |
-| 4 | 4.82 | 5.98 | **513.08** | 4.83 | 5.96 | **25.42** |
-| 8 | 9.45 | 10.11 | **529.36** | 9.48 | 10.13 | **40.49** |
-| 10 | 11.36 | 13.05 | **523.91** | 11.27 | 13.02 | **44.86** |
-| 16 | 15.47 | 18.35 | **521.59** | 15.96 | 17.89 | **52.49** |
+| Threads | Prefill pp128 (tok/s) | Generation tg128 (tok/s) |
+|---------|-----------------------|--------------------------|
+| 1 | 520.96 | 7.67 |
+| 2 | 492.16 | 14.56 |
+| 4 | 513.08 | 25.42 |
+| 8 | 529.36 | 40.49 |
+| 10 | 523.91 | 44.86 |
+| 16 | 521.59 | 52.49 |
 
 </div>
 
 ### Intel Xeon Platinum 8488C (AWS c7i.4xlarge)
 
-![Intel Xeon Comparison](docs/figures/performance_comparison_intel_xeon_8488c_user_v3.png)
-
-*Scaling behavior on Intel Xeon Platinum 8488C. Litespark-Inference maintains higher prefill and token-generation throughput across the tested thread counts.*
-
 <div align="center">
 
-| Threads | Prefill Original | Prefill V2 | Prefill Litespark | Gen Original | Gen V2 | Gen Litespark |
-|---------|------------------|------------|-------------------|--------------|--------|---------------|
-| 1 | 1.84 | 1.82 | **102.30** | 1.92 | 1.93 | **6.32** |
-| 2 | 3.52 | 3.51 | **105.11** | 3.51 | 3.48 | **11.02** |
-| 4 | 6.47 | 6.47 | **112.38** | 6.44 | 6.50 | **16.93** |
-| 8 | 11.44 | 11.49 | **120.44** | 11.44 | 11.46 | **25.70** |
-| 10 | 8.61 | 8.18 | **135.73** | 8.78 | 8.26 | **23.25** |
-| 16 | 12.32 | 11.89 | **131.43** | 12.40 | 11.88 | **30.43** |
+| Threads | Prefill pp128 (tok/s) | Generation tg128 (tok/s) |
+|---------|-----------------------|--------------------------|
+| 1 | 102.30 | 6.32 |
+| 2 | 105.11 | 11.02 |
+| 4 | 112.38 | 16.93 |
+| 8 | 120.44 | 25.70 |
+| 10 | 135.73 | 23.25 |
+| 16 | 131.43 | 30.43 |
 
 </div>
 
-### Apple M5 (MacBook Pro)
+### Apple M5 Max (MacBook Pro)
 
 ![Apple M5 Scaling](docs/figures/performance_comparison_apple_m5_user_v3.png)
 
-*Litespark-Inference scaling on Apple M5. Prefill throughput continues scaling through 16 threads, while token generation gains quickly and then flattens out.*
+*Litespark-Inference scaling on Apple M5 Max. Prefill throughput continues scaling through 16 threads, while token generation gains quickly and then flattens out.*
 
 <div align="center">
 
@@ -188,16 +179,16 @@ python -m litespark_inference.torchless generate "Hello, how are you?" --max-tok
 python -m litespark_inference.torchless info
 ```
 
-### Headline numbers vs the PyTorch baseline (Apple Silicon M5, bitnet-2b)
+### Headline numbers vs the PyTorch baseline (Apple Silicon M5 Max, bitnet-2b)
 
 Same prompt, same workload (pp128 + tg128), measured with
 `benchmark_kernel.py --inference --pytorch`:
 
 | Metric | PyTorch bf16 | **Litespark torchless (int4)** | Speedup |
 |---|---|---|---|
-| Peak RSS | 4,601.55 MB | **793.34 MB** | **5.80×** |
-| TTFT (pp128) | 3.16 s | **0.47 s** | **6.66×** |
-| Throughput (tg128) | 3.13 tok/s | **39.35 tok/s** | **12.57×** |
+| Peak RSS | 4,868.22 MB | **806.81 MB** | **6.03×** |
+| TTFT (pp128) | 4.21 s | **0.59 s** | **7.15×** |
+| Throughput (tg128) | 2.20 tok/s | **39.92 tok/s** | **18.15×** |
 
 Torchless generation is greedy-only today. Sampling flags are accepted by the
 CLI for compatibility but ignored on torchless routes; set
@@ -250,22 +241,18 @@ print(tokenizer.decode(output[0]))
 falcon_model, falcon_tokenizer = load_model("falcon-edge-1b-instruct")
 ```
 
-### Kernel Modes (Apple Silicon)
+### Kernel Mode (Apple Silicon)
 
-Two inference modes are available on Apple Silicon:
+NEON is the default optimized path on Apple Silicon:
 
 ```bash
 # NEON mode (default) — packed torchless inference, ~0.8 GB on BitNet-2B
 litespark-inference generate "Hello" --mode neon
-
-# Accelerate mode — Apple-only float32 accuracy mode, higher memory
-litespark-inference generate "Hello" --mode accelerate
 ```
 
 ```python
 # In Python
-model, tokenizer = load_model("bitnet-2b", mode="neon")       # default, fast
-model, tokenizer = load_model("bitnet-2b", mode="accelerate") # accurate
+model, tokenizer = load_model("bitnet-2b", mode="neon") # default, fast
 ```
 
 ## How It Works
