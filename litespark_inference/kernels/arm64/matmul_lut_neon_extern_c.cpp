@@ -20,7 +20,13 @@
 #include <cstdint>
 #include <cstring>
 
+// Accelerate (cblas_sgemm) is macOS-only and backs the optional float32
+// "accelerate mode" exclusively. Guard it so the kernel also compiles on
+// Linux/arm64 (e.g. AWS Graviton), where that mode is never selected
+// (matmul_lut_neon_has_accelerate() returns 0).
+#if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
+#endif
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -167,11 +173,24 @@ void matmul_accelerate_f32_neon_m1(
     int N,
     int K
 ) {
+#if defined(__APPLE__)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
         1, N, K,
         1.0f, x, K,
         w_float32, K,
         0.0f, y, N);
+#else
+    // Portable BLAS-free fallback (Linux/arm64). Computes the same
+    // y[n] = sum_k x[k] * w_float32[n, k] with B treated as row-major and
+    // transposed, matching the cblas_sgemm call above. Not perf-critical:
+    // "accelerate mode" is only ever dispatched on Apple platforms.
+    for (int n = 0; n < N; ++n) {
+        float acc = 0.0f;
+        const float* wr = w_float32 + static_cast<size_t>(n) * K;
+        for (int k = 0; k < K; ++k) acc += x[k] * wr[k];
+        y[n] = acc;
+    }
+#endif
 }
 
 // Batched ternary matmul for M>1 (prompt prefill).
