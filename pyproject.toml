@@ -4,17 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litespark-inference"
-version = "0.1.5"
+version = "1.0.0"
 description = "Efficient CPU inference for ternary language models"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    {name = "Litespark-Inference Contributors"}
+    {name = "Nii Osae Osae Dade", email = "stark@mindbeam.ai"},
+    {name = "Tony Morri", email = "tony.morri@mindbeam.ai"},
+    {name = "Sayandip Pal", email = "dip.pal@mindbeam.ai"},
+]
+maintainers = [
+    {name = "Tony Morri", email = "tony.morri@mindbeam.ai"},
+    {name = "Sayandip Pal", email = "dip.pal@mindbeam.ai"},
+    {name = "Nii Osae Osae Dade", email = "stark@mindbeam.ai"},
 ]
 keywords = ["bitnet", "llm", "inference", "cpu", "simd", "ternary", "litespark"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS :: MacOS X",
