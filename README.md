@@ -182,7 +182,7 @@ python -m litespark_inference.torchless info
 ### Headline numbers vs the PyTorch baseline (Apple Silicon M5 Max, bitnet-2b)
 
 Same prompt, same workload (pp128 + tg128), measured with
-`benchmark_kernel.py --inference --pytorch`:
+`litespark-benchmark --inference --pytorch`:
 
 | Metric | PyTorch bf16 | **Litespark torchless (int4)** | Speedup |
 |---|---|---|---|
@@ -308,23 +308,24 @@ Run the built-in benchmark to measure performance on your hardware:
 litespark-inference benchmark
 ```
 
-Repo-level benchmarks for detailed profiling:
+The `litespark-benchmark` command (installed with the package) runs the
+detailed profiling benchmarks:
 
 ```bash
 # Litespark (torchless by default for bitnet-2b) vs the PyTorch baseline,
 # pp128 + tg128, both runtimes' RSS captured. ~6 min total.
-python benchmark_kernel.py --inference --pytorch
+litespark-benchmark --inference --pytorch
 
 # Quick torchless-only inference benchmark, no PyTorch baseline.
-python benchmark_kernel.py --inference --no-matrix
+litespark-benchmark --inference --no-matrix
 
 # Full sweep: matrix + thread-scaling + inference (each torch-backed
 # kernel phase runs in its own subprocess so torch's libomp never
 # coexists with our libomp).
-python benchmark_kernel.py --all
+litespark-benchmark --all
 
 # Raw kernel benchmarks (matrix shapes, scaling) standalone.
-python benchmark_kernel.py
+litespark-benchmark
 ```
 
 ## Citation
