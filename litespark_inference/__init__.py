@@ -15,7 +15,7 @@ Usage:
     print(tokenizer.decode(output[0]))
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Lazy top-level imports. `.models` pulls torch; we don't want to drag torch
 # into sibling subpackages like `.torchless` that must stay torch-free.

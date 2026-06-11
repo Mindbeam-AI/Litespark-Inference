@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litespark-inference"
-version = "1.0.0"
+version = "1.0.1"
 description = "Efficient CPU inference for ternary language models"
 readme = "README.md"
 license = "Apache-2.0"
@@ -63,6 +63,7 @@ dev = [
 
 [project.scripts]
 litespark-inference = "litespark_inference.cli:main"
+litespark-benchmark = "litespark_inference.benchmark_kernel:main"
 
 [project.urls]
 Homepage = "https://github.com/Mindbeam-AI/Litespark-Inference"

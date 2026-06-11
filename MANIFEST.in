@@ -14,6 +14,3 @@ include setup.py
 # AVX-512 / AVX2 / VNNI fallbacks). setup.py compiles the one matching the
 # install host.
 recursive-include litespark_inference/kernels *.cpp *.h *.hpp
-
-# Test suite (lets users run the bundled tests against an installed copy).
-recursive-include tests *.py
