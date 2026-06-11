@@ -327,22 +327,6 @@ python benchmark_kernel.py --all
 python benchmark_kernel.py
 ```
 
-### ARM compatibility tests
-
-The `tests/arm_compat/` folder ships ARM's three validation scripts
-(`benchmark_litespark.py`, `benchmark_transformers.py`,
-`benchmark_repeat_v2.py`) plus their original instructions. After
-`pip install -e .` they run with no environment variables and no edits:
-
-```bash
-python tests/arm_compat/benchmark_repeat_v2.py
-```
-
-This produces the canonical ARM "transformers vs litespark" comparison
-under `/usr/bin/time` (Darwin or Linux), aggregated across 5 runs, with
-`.log` and `.csv` artefacts dropped in `benchmark_logs/`. See
-[`tests/arm_compat/README.md`](tests/arm_compat/README.md) for details.
-
 ## Citation
 
 If you use Litespark-Inference in your research, please cite:
