@@ -1236,7 +1236,7 @@ def _elevate_for_power_on_linux(args) -> None:
     """If --power is requested on Linux and powercap counters aren't
     readable as the current user, re-exec the script under sudo so the
     energy_uj files become readable. Mirrors the macOS auto-sudo path
-    so the same `python benchmark_kernel.py ... --power ...` command
+    so the same `litespark-benchmark ... --power ...` command
     works out of the box on both platforms.
 
     Preserves the venv (re-execs sys.executable with the same argv) and
@@ -1341,11 +1341,11 @@ def main():
             "  - Use --power --no-matrix so raw kernel benchmarks do not heat the CPU first.\n"
             "  - Keep other apps and background jobs idle for accurate energy numbers.\n\n"
             "Examples:\n"
-            "  python benchmark_kernel.py --inference --no-matrix\n"
-            "  python benchmark_kernel.py --inference --backend torch --pytorch --no-matrix\n"
-            "  python benchmark_kernel.py --inference --backend torchless --pytorch\n"
-            "  sudo -v && python benchmark_kernel.py --inference --pytorch --no-matrix --power --power-cooldown 180\n"
-            "  python benchmark_kernel.py --all\n"
+            "  litespark-benchmark --inference --no-matrix\n"
+            "  litespark-benchmark --inference --backend torch --pytorch --no-matrix\n"
+            "  litespark-benchmark --inference --backend torchless --pytorch\n"
+            "  sudo -v && litespark-benchmark --inference --pytorch --no-matrix --power --power-cooldown 180\n"
+            "  litespark-benchmark --all\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
