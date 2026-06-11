@@ -226,20 +226,42 @@ litespark-inference info
 
 ### Python API
 
+The torchless runtime is the recommended path — pure numpy plus the native
+SIMD kernels, with **no `torch` import at inference**.
+
+**BitNet-2B** has a high-level class:
+
 ```python
-from litespark_inference import load_model
+from litespark_inference.torchless import BitNet
 
-# Load the default BitNet 2B model (auto-downloads from Hugging Face)
-model, tokenizer = load_model("bitnet-2b")
-
-# Generate text
-input_ids = tokenizer.encode("Hello, world!", return_tensors="pt")
-output = model.generate(input_ids, max_new_tokens=100)
-print(tokenizer.decode(output[0]))
-
-# Load a Falcon Edge instruct model
-falcon_model, falcon_tokenizer = load_model("falcon-edge-1b-instruct")
+# Auto-downloads from Hugging Face on first use
+bn = BitNet.from_pretrained("bitnet-2b")
+print(bn.generate("Hello, world!", max_new_tokens=100))
 ```
+
+**Falcon Edge** uses the lower-level torchless functions (no high-level
+class yet):
+
+```python
+from litespark_inference.torchless import (
+    FALCON_TORCHLESS_REPOS, load_falcon_edge, load_tokenizer,
+)
+from litespark_inference.torchless.runtime import falcon_generate
+
+name = "falcon-edge-1b-instruct"
+model = load_falcon_edge(name)                          # auto-downloads
+tokenizer = load_tokenizer(FALCON_TORCHLESS_REPOS[name])
+
+ids = tokenizer.encode("What is the capital of France?")
+out = falcon_generate(model, ids, max_new_tokens=64)
+print(tokenizer.decode(out))
+```
+
+> `from litespark_inference import load_model` is the **legacy torch-backed**
+> path — it imports PyTorch and runs the dense float baseline. Prefer the
+> torchless API above for fast, low-memory CPU inference; reach for
+> `load_model` (or `LITESPARK_FORCE_TORCH=1`) only when you specifically
+> need the torch path, e.g. for sampling.
 
 ### Kernel Mode (Apple Silicon)
 
@@ -251,8 +273,9 @@ litespark-inference generate "Hello" --mode neon
 ```
 
 ```python
-# In Python
-model, tokenizer = load_model("bitnet-2b", mode="neon") # default, fast
+# In Python — NEON is automatic; BitNet.from_pretrained() already uses it.
+from litespark_inference.torchless import BitNet
+bn = BitNet.from_pretrained("bitnet-2b")   # NEON SDOT kernel, ~0.8 GB
 ```
 
 ## How It Works
