@@ -236,7 +236,10 @@ from litespark_inference.torchless import BitNet
 
 # Auto-downloads from Hugging Face on first use
 bn = BitNet.from_pretrained("bitnet-2b")
-print(bn.generate("Hello, world!", max_new_tokens=100))
+
+# chat=True applies the system + chat template and strips the prompt,
+# giving a clean instruction-following answer (omit it for raw continuation).
+print(bn.generate("Write a short poem about Austin", max_new_tokens=100, chat=True))
 ```
 
 **Falcon Edge** uses the lower-level torchless functions (no high-level
@@ -252,7 +255,9 @@ name = "falcon-edge-1b-instruct"
 model = load_falcon_edge(name)                          # auto-downloads
 tokenizer = load_tokenizer(FALCON_TORCHLESS_REPOS[name])
 
-ids = tokenizer.encode("What is the capital of France?")
+# format_chat applies the system + chat template for the instruct models
+prompt = tokenizer.format_chat("What is the capital of France?")
+ids = tokenizer.encode(prompt)
 out = falcon_generate(model, ids, max_new_tokens=64)
 print(tokenizer.decode(out))
 ```
