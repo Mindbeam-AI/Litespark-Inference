@@ -301,8 +301,13 @@ def get_kernel():
                         extra_cflags = ['-O3', '-march=native', '-DDISABLE_OPENMP']
                         extra_ldflags = ['-framework', 'Accelerate']
                 else:
-                    # Linux ARM64 (non-Graviton)
-                    extra_cflags = ['-O3', '-march=native', '-fopenmp']
+                    # Linux ARM64 (non-Graviton). The kernel uses vdotq_s32
+                    # (ARM SDOT), which needs the dotprod feature. Request it
+                    # explicitly rather than relying on -march=native: under
+                    # container emulation (e.g. an arm64 image on QEMU) g++'s
+                    # -march=native can resolve to a baseline without dotprod,
+                    # and the build fails. Matches the Graviton path above.
+                    extra_cflags = ['-O3', '-march=armv8.2-a+dotprod', '-fopenmp']
                     extra_ldflags = ['-fopenmp']
 
                 _kernel = load(
