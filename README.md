@@ -159,6 +159,16 @@ during `pip install`. No JIT compile happens at first inference; you
 do need a C++ compiler available at install time (Xcode CLT on macOS,
 `build-essential` on Linux).
 
+**From source (development):**
+```bash
+git clone https://github.com/Mindbeam-AI/Litespark-Inference.git
+cd Litespark-Inference
+pip install -e .
+```
+An editable install lets you modify the Python runtime and kernels in place. The
+native extension still builds at install time, so re-run `pip install -e .` after
+changing the C++ kernel sources.
+
 ## Torchless Runtime
 
 `litespark-inference` ships with a **torchless** runtime for the supported
@@ -307,6 +317,12 @@ Run the built-in benchmark to measure performance on your hardware:
 ```bash
 litespark-inference benchmark
 ```
+
+> **Note:** `litespark-inference benchmark` is the quick built-in benchmark; it
+> only accepts `--model`, `--tokens`, and `--mode`. The detailed profiling flags
+> (`--inference`, `--pytorch`, `--all`, `--no-matrix`, …) belong to the separate
+> **`litespark-benchmark`** command and are *not* recognized by
+> `litespark-inference benchmark`.
 
 The `litespark-benchmark` command (installed with the package) runs the
 detailed profiling benchmarks:
