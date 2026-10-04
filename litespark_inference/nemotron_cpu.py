@@ -2,7 +2,8 @@
 
 Routed experts stay packed in file mappings. Dense decode uses the existing
 BF16 NEON GEMV, prefill uses Accelerate, and Transformers supplies the hybrid
-block structure and recurrent-state reference operations. CPU only.
+block structure. Native recurrent decode preserves the FP32 state cache and
+BF16 intermediate products; prefill uses the reference scan. CPU only.
 """
 import argparse
 import ctypes
@@ -47,6 +48,10 @@ class NativeKernels:
         self.lib.nemotron_causal_conv_neon.restype = None
         self.lib.nemotron_dense_int4_neon.argtypes = [u8, u16, f32, f32] + [integer]*4
         self.lib.nemotron_dense_int4_neon.restype = None
+        self.lib.nemotron_state_update_neon.argtypes = [f32, u16, u16, u16, f32, f32, f32, f32] + [integer]*5
+        self.lib.nemotron_state_update_neon.restype = None
+        self.lib.nemotron_causal_conv_update_neon.argtypes = [u16, u16, u16, f32, f32] + [integer]*3
+        self.lib.nemotron_causal_conv_update_neon.restype = None
 
     def dense(self, weight, x):
         x = np.ascontiguousarray(x, dtype=np.float32)
@@ -82,13 +87,13 @@ class NativeKernels:
 
 
 def _native_convolution(mixer, kernels):
-    """Bind native convolution to this mixer's forward, leaving HF globals intact.
+    """Bind native convolution and decode state update to this mixer's forward.
 
-    Retain Transformers' cache and recurrent-state implementation. Binding a
+    Retain Transformers' cache structure and prefill scan. Binding a
     private copy of the forward's globals avoids changing any other model.
     """
     original = inspect.unwrap(type(mixer).forward)
-    required = {"causal_conv1d_fn", "causal_conv1d_update"}
+    required = {"causal_conv1d_fn", "causal_conv1d_update", "mamba2_selective_state_update"}
     if not required.issubset(original.__globals__):
         raise RuntimeError("Unsupported Nemotron forward; install litespark-inference[nemotron]")
     if mixer.activation not in ("silu", "swish"):
@@ -98,11 +103,55 @@ def _native_convolution(mixer, kernels):
         return kernels.causal_conv(hidden_states, weight, bias, hidden_states.shape[-1])
 
     def update(hidden_states, conv_state, weight, bias=None, activation=None):
+        if (hidden_states.ndim == 3 and hidden_states.shape[-1] == 1 and
+                all(t.dtype == torch.bfloat16 and t.device.type == "cpu" for t in (hidden_states, conv_state, weight)) and
+                conv_state.is_contiguous() and weight.is_contiguous() and
+                conv_state.shape[:2] == hidden_states.shape[:2] and
+                weight.shape == conv_state.shape[1:]):
+            batches, channels, width = conv_state.shape
+            biases = np.zeros(channels, dtype=np.float32) if bias is None else bias.float().contiguous().numpy()
+            output = np.empty(hidden_states.shape, dtype=np.float32)
+            kernels.lib.nemotron_causal_conv_update_neon(conv_state.view(torch.uint16).numpy(),
+                hidden_states.contiguous().view(torch.uint16).numpy(), weight.view(torch.uint16).numpy(),
+                biases, output, batches, channels, width)
+            return torch.from_numpy(output).to(hidden_states.dtype)
         combined = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
         conv_state.copy_(combined[:, :, -conv_state.shape[-1]:])
         return kernels.causal_conv(combined, weight, bias, hidden_states.shape[-1])
 
-    namespace = dict(original.__globals__, causal_conv1d_fn=prefill, causal_conv1d_update=update)
+    reference_state_update = original.__globals__["mamba2_selective_state_update"]
+
+    def state_update(state, hidden_states, dt, A, B, C, D=None, dt_bias=None,
+                     dt_softplus=False, z=None, **kwargs):
+        # The fused path covers the mixer's BF16 decode with FP32 cache. Other
+        # dtypes/layouts retain the reference rather than altering semantics.
+        if (state.device.type != "cpu" or state.dtype != torch.float32 or not state.is_contiguous() or
+                hidden_states.ndim != 3 or B.ndim != 3 or C.shape != B.shape or
+                any(t.dtype != torch.bfloat16 or t.device.type != "cpu" for t in (hidden_states, dt, B, C)) or
+                A.ndim != 3 or A.dtype != torch.float32 or A.device.type != "cpu" or
+                A.stride(-1) != 0 or A.stride(-2) != 0 or dt.stride(-1) != 0 or
+                D is None or D.dtype != torch.bfloat16 or D.device.type != "cpu" or D.ndim != 2 or D.stride(-1) != 0 or
+                dt_bias is None or dt_bias.dtype != torch.bfloat16 or dt_bias.device.type != "cpu" or dt_bias.ndim != 2 or
+                dt_bias.stride(-1) != 0 or not dt_softplus or z is not None):
+            return reference_state_update(state, hidden_states, dt, A, B, C, D,
+                dt_bias=dt_bias, dt_softplus=dt_softplus, z=z, **kwargs)
+        batches, heads, dim = hidden_states.shape
+        groups, size = B.shape[1:]
+        if (state.shape != (batches, heads, dim, size) or B.shape[0] != batches or
+                groups < 1 or heads % groups or dt.shape != hidden_states.shape or A.shape != (heads, dim, size) or
+                D.shape != (heads, dim) or dt_bias.shape != (heads, dim)):
+            raise ValueError("Invalid native recurrent state dimensions")
+        step = torch.nn.functional.softplus(dt[:, :, 0] + dt_bias[:, 0]).float()
+        decay = torch.exp(step * A[:, 0, 0])
+        output = np.empty((batches, heads, dim), dtype=np.float32)
+        bits = lambda t: t.contiguous().view(torch.uint16).numpy()
+        kernels.lib.nemotron_state_update_neon(state.numpy(), bits(hidden_states), bits(B), bits(C),
+            step.contiguous().numpy(), decay.contiguous().numpy(), D[:, 0].float().contiguous().numpy(),
+            output, batches, heads, dim, size, groups)
+        return torch.from_numpy(output).to(hidden_states.dtype)
+
+    namespace = dict(original.__globals__, causal_conv1d_fn=prefill, causal_conv1d_update=update,
+                     mamba2_selective_state_update=state_update)
     forward = FunctionType(original.__code__, namespace, original.__name__,
                            original.__defaults__, original.__closure__)
     forward.__kwdefaults__ = original.__kwdefaults__
@@ -310,7 +359,7 @@ def main():
     parser.add_argument("--dense-int4", help="Path to a grouped INT4 dense-weight overlay")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    report = {"backend": "public Litespark ARM/NEON + Accelerate; CPU recurrent reference",
+    report = {"backend": "public Litespark ARM/NEON + Accelerate; native recurrent decode and reference prefill scan",
               "prompt": args.prompt, "threads": args.threads, "platform": platform.platform()}
     started = time.monotonic()
     model = load_nemotron(args.model, args.threads, report, args.dense_int4)

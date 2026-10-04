@@ -23,7 +23,17 @@ activations. Packed experts remain memory-mapped. Dense decode uses the
 public NEON BF16 GEMV; prefill uses Accelerate. Native packed-expert and
 causal-convolution kernels avoid expanded expert banks and per-channel
 PyTorch convolution dispatch. Transformers supplies attention, routing,
-normalization, recurrent state updates, and the model/cache structure.
+normalization, the prefill scan, and the model/cache structure.
+
+Packed experts decode BF16 weight bytes through lookup tables while retaining
+the original FP32 accumulation order. On CPUs with BF16 dot-product support,
+INT4 decode caches scale lookup tables and unpacks 32 weights per iteration.
+Neither path quantizes activations to INT8.
+Single-token Mamba decode fuses the recurrent state update and updates the
+convolution cache in place. The recurrent kernel preserves FP32 cache state
+and the reference BF16 intermediate products; unsupported layouts/dtypes
+retain the reference implementation. Floating-point reduction order can
+differ between kernels, so output equivalence is checked numerically.
 
 Text generation is supported. Vision inputs and speculative MTP decoding
 are not implemented by this loader. It requires ARM64 and runs on the CPU.

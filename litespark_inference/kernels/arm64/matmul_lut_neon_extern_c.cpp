@@ -21,6 +21,7 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <array>
 
 // Accelerate (cblas_sgemm) is macOS-only and backs the optional float32
 // "accelerate mode" exclusively. Guard it so the kernel also compiles on
@@ -730,23 +731,30 @@ static inline float nemotron_grouped_row(const float* x, const uint8_t* codes,
     const int shift=2*(row/planes);
     const int8x16_t shifts=vdupq_n_s8(-shift);
     const uint8x16_t mask=vdupq_n_u8(3);
-    const int8x16_t one=vdupq_n_s8(1);
     float32x4_t a=vdupq_n_f32(0), b=a, c=a, d=a;
     float tail=0;
     for(int g=0;g<groups;++g) {
         float16_t half;
         std::memcpy(&half,scales+static_cast<size_t>(row)*groups+g,2);
         const float scale=nemotron_bf16_round(static_cast<float>(half));
-        const float32x4_t s=vdupq_n_f32(scale);
+        // Lookup the two BF16 bytes of {-scale, 0, scale}. The four FMA
+        // accumulators retain the reference FP32 summation order exactly.
+        uint32_t bits;
+        std::memcpy(&bits,&scale,4);
+        const uint64_t lo=(bits>>16)&255, hi=bits>>24;
+        const uint8x16_t low=vreinterpretq_u8_u64(vdupq_n_u64(lo|(lo<<16)));
+        const uint8x16_t high=vreinterpretq_u8_u64(vdupq_n_u64((hi^128)|(hi<<16)));
         int col=g*group;
         const int end=std::min(cols,col+group);
         for(;col+16<=end;col+=16) {
-            const int8x16_t q=vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vld1q_u8(packed+col),shifts),mask)),one);
-            const int16x8_t lo=vmovl_s8(vget_low_s8(q)), hi=vmovl_s8(vget_high_s8(q));
-            const float32x4_t q0=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),s);
-            const float32x4_t q1=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))),s);
-            const float32x4_t q2=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),s);
-            const float32x4_t q3=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))),s);
+            const uint8x16_t q=vandq_u8(vshlq_u8(vld1q_u8(packed+col),shifts),mask);
+            const uint8x16_t low_bytes=vqtbl1q_u8(low,q),high_bytes=vqtbl1q_u8(high,q);
+            const uint16x8_t w0=vreinterpretq_u16_u8(vzip1q_u8(low_bytes,high_bytes));
+            const uint16x8_t w1=vreinterpretq_u16_u8(vzip2q_u8(low_bytes,high_bytes));
+            const float32x4_t q0=vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w0),16));
+            const float32x4_t q1=vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(w0),16));
+            const float32x4_t q2=vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w1),16));
+            const float32x4_t q3=vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(w1),16));
             a=vfmaq_f32(a,q0,vld1q_f32(x+col));
             b=vfmaq_f32(b,q1,vld1q_f32(x+col+4));
             c=vfmaq_f32(c,q2,vld1q_f32(x+col+8));
@@ -776,6 +784,25 @@ static inline uint8x16x2_t nemotron_int4_table(float scale) {
     return table;
 }
 
+// There are only 65536 possible FP16 scales. Reuse their exact BF16 tables
+// across matrices/tokens instead of rebuilding sixteen products per group.
+// This immutable 2 MiB table is initialized once, safely across threads.
+static const uint16_t* nemotron_int4_tables() {
+    static const auto tables=[] {
+        std::array<uint16_t,65536*16> result{};
+        for(uint32_t bits=0;bits<65536;++bits) {
+            const uint16_t value=bits;
+            float16_t half;
+            std::memcpy(&half,&value,2);
+            const auto table=nemotron_int4_table(static_cast<float>(half));
+            vst1q_u16(result.data()+bits*16,vreinterpretq_u16_u8(table.val[0]));
+            vst1q_u16(result.data()+bits*16+8,vreinterpretq_u16_u8(table.val[1]));
+        }
+        return result;
+    }();
+    return tables.data();
+}
+
 static inline void nemotron_int4_bf16_weights16(const uint8_t* packed, uint8x16x2_t table,
                                                 uint16x8_t* lo, uint16x8_t* hi) {
     const uint8x8_t bytes=vld1_u8(packed);
@@ -797,6 +824,22 @@ static inline void nemotron_int4_weights16(const uint8_t* packed, uint8x16x2_t t
     *w3=vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(hi),16));
 }
 
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+static inline void nemotron_int4_bfdot32(const uint8_t* packed, const uint16_t* x,
+                                        uint8x16_t low, uint8x16_t high,
+                                        float32x4_t& a, float32x4_t& b) {
+    const uint8x16_t bytes=vld1q_u8(packed);
+    const uint8x16_t even=vandq_u8(bytes,vdupq_n_u8(15)),odd=vshrq_n_u8(bytes,4);
+    const uint8x16_t q0=vzip1q_u8(even,odd),q1=vzip2q_u8(even,odd);
+    const uint8x16_t l0=vqtbl1q_u8(low,q0),h0=vqtbl1q_u8(high,q0);
+    const uint8x16_t l1=vqtbl1q_u8(low,q1),h1=vqtbl1q_u8(high,q1);
+    a=vbfdotq_f32(a,vreinterpretq_bf16_u8(vzip1q_u8(l0,h0)),vreinterpretq_bf16_u16(vld1q_u16(x)));
+    b=vbfdotq_f32(b,vreinterpretq_bf16_u8(vzip2q_u8(l0,h0)),vreinterpretq_bf16_u16(vld1q_u16(x+8)));
+    a=vbfdotq_f32(a,vreinterpretq_bf16_u8(vzip1q_u8(l1,h1)),vreinterpretq_bf16_u16(vld1q_u16(x+16)));
+    b=vbfdotq_f32(b,vreinterpretq_bf16_u8(vzip2q_u8(l1,h1)),vreinterpretq_bf16_u16(vld1q_u16(x+24)));
+}
+#endif
+
 extern "C" {
 
 // Grouped INT4 with the same BF16 reconstructed weights as the evaluation
@@ -806,6 +849,7 @@ void nemotron_dense_int4_neon(const uint8_t* packed, const uint16_t* scales,
                               const float* x, float* output, int tokens,
                               int rows, int cols, int group) {
     const int groups=(cols+group-1)/group, stride=(cols+1)/2;
+    const uint16_t* tables=nemotron_int4_tables();
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
     std::vector<uint16_t> x_bf16;
     bool exact_bf16=tokens==1;
@@ -833,7 +877,9 @@ void nemotron_dense_int4_neon(const uint8_t* packed, const uint16_t* scales,
                 float16_t half;
                 std::memcpy(&half,scales+static_cast<size_t>(row)*groups+g,2);
                 const float scale=static_cast<float>(half);
-                const uint8x16x2_t table=nemotron_int4_table(scale);
+                const uint16_t* entries=tables+static_cast<size_t>(scales[static_cast<size_t>(row)*groups+g])*16;
+                const uint8x16x2_t table={{vreinterpretq_u8_u16(vld1q_u16(entries)),
+                                         vreinterpretq_u8_u16(vld1q_u16(entries+8))}};
                 int col=g*group;
                 const int end=std::min(cols,col+group);
                 for(;col+16<=end;col+=16) {
@@ -856,11 +902,17 @@ void nemotron_dense_int4_neon(const uint8_t* packed, const uint16_t* scales,
                 float16_t half;
                 std::memcpy(&half,scales+static_cast<size_t>(row)*groups+g,2);
                 const float scale=static_cast<float>(half);
-                const uint8x16x2_t table=nemotron_int4_table(scale);
+                const uint16_t* entries=tables+static_cast<size_t>(scales[static_cast<size_t>(row)*groups+g])*16;
+                const uint8x16x2_t table={{vreinterpretq_u8_u16(vld1q_u16(entries)),
+                                         vreinterpretq_u8_u16(vld1q_u16(entries+8))}};
                 int col=g*group;
                 const int end=std::min(cols,col+group);
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
                 if(exact_bf16) {
+                    const uint8x16_t low=vuzp1q_u8(table.val[0],table.val[1]);
+                    const uint8x16_t high=vuzp2q_u8(table.val[0],table.val[1]);
+                    for(;col+32<=end;col+=32)
+                        nemotron_int4_bfdot32(codes+col/2,x_bf16.data()+col,low,high,a,b);
                     for(;col+16<=end;col+=16) {
                         uint16x8_t lo,hi;
                         nemotron_int4_bf16_weights16(codes+col/2,table,&lo,&hi);
@@ -896,9 +948,96 @@ void nemotron_set_threads_neon(int threads) {
 #endif
 }
 
+// One recurrent decode step with FP32 persistent state and BF16 operands.
+// dt and decay are computed once per head by the same PyTorch operations as
+// the reference. Preserve both BF16 intermediate products and the separate
+// FP32 multiply/add used when updating the recurrent state.
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
+void nemotron_state_update_neon(float* state, const uint16_t* hidden,
+                                const uint16_t* B, const uint16_t* C,
+                                const float* dt, const float* decay,
+                                const float* D, float* output,
+                                int batches, int heads, int dim, int size, int groups) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+#pragma omp parallel for schedule(static)
+    for(int job=0;job<batches*heads;++job) {
+        const int batch=job/heads,head=job%heads;
+        const size_t bc=(static_cast<size_t>(batch)*groups+head/(heads/groups))*size;
+        std::vector<float> dB(size);
+        for(int s=0;s<size;++s) {
+            uint32_t bits=uint32_t(B[bc+s])<<16;
+            float value;
+            std::memcpy(&value,&bits,4);
+            dB[s]=nemotron_bf16_round(dt[job]*value);
+        }
+        for(int channel=0;channel<dim;++channel) {
+            const size_t index=static_cast<size_t>(job)*dim+channel;
+            uint32_t bits=uint32_t(hidden[index])<<16;
+            float x;
+            std::memcpy(&x,&bits,4);
+            float* row=state+index*size;
+            float32x4_t a=vdupq_n_f32(0),b=a;
+            int s=0;
+            for(;s+8<=size;s+=8) {
+                const float32x4_t dx0=nemotron_bf16_round4(vmulq_n_f32(vld1q_f32(dB.data()+s),x));
+                const float32x4_t dx1=nemotron_bf16_round4(vmulq_n_f32(vld1q_f32(dB.data()+s+4),x));
+                const float32x4_t next0=vaddq_f32(vmulq_n_f32(vld1q_f32(row+s),decay[job]),dx0);
+                const float32x4_t next1=vaddq_f32(vmulq_n_f32(vld1q_f32(row+s+4),decay[job]),dx1);
+                vst1q_f32(row+s,next0); vst1q_f32(row+s+4,next1);
+                const float32x4_t q0=nemotron_bf16_round4(next0),q1=nemotron_bf16_round4(next1);
+                const uint16x8_t c=vld1q_u16(C+bc+s);
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+                const uint16x8_t rounded=vcombine_u16(vshrn_n_u32(vreinterpretq_u32_f32(q0),16),
+                                                      vshrn_n_u32(vreinterpretq_u32_f32(q1),16));
+                a=vbfdotq_f32(a,vreinterpretq_bf16_u16(rounded),vreinterpretq_bf16_u16(c));
+#else
+                a=vfmaq_f32(a,q0,vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(c),16)));
+                b=vfmaq_f32(b,q1,vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(c),16)));
+#endif
+            }
+            float tail=0;
+            for(;s<size;++s) {
+                row[s]=row[s]*decay[job]+nemotron_bf16_round(dB[s]*x);
+                uint32_t cbits=uint32_t(C[bc+s])<<16;
+                float c;
+                std::memcpy(&c,&cbits,4);
+                tail+=nemotron_bf16_round(row[s])*c;
+            }
+            const float sum=nemotron_bf16_round(tail+vaddvq_f32(vaddq_f32(a,b)));
+            output[index]=nemotron_bf16_round(sum+nemotron_bf16_round(x*D[head]));
+        }
+    }
+}
+
 // Depthwise causal convolution: one channel per worker instead of thousands
 // of individual grouped-convolution dispatches. x/out are batch-channel-time.
 // Match the BF16 convolution boundary before applying SiLU.
+void nemotron_causal_conv_update_neon(uint16_t* state, const uint16_t* x,
+                                      const uint16_t* weight, const float* bias,
+                                      float* out, int batches, int channels, int width) {
+#pragma omp parallel for schedule(static)
+    for(int job=0;job<batches*channels;++job) {
+        const int channel=job%channels;
+        uint16_t* cache=state+static_cast<size_t>(job)*width;
+        const uint16_t* w=weight+static_cast<size_t>(channel)*width;
+        float sum=bias[channel];
+        for(int k=0;k<width;++k) {
+            const uint16_t value=k+1<width ? cache[k+1] : x[job];
+            cache[k]=value;
+            uint32_t xbits=uint32_t(value)<<16,wbits=uint32_t(w[k])<<16;
+            float input,coefficient;
+            std::memcpy(&input,&xbits,4); std::memcpy(&coefficient,&wbits,4);
+            sum+=input*coefficient;
+        }
+        const float value=nemotron_bf16_round(sum);
+        out[job]=nemotron_bf16_round(value/(1.f+std::exp(-value)));
+    }
+}
+
 void nemotron_causal_conv_neon(const float* x, const float* weight, const float* bias,
                                float* out, int batches, int channels, int tokens,
                                int width, int output_tokens) {
