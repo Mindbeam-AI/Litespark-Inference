@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "litespark-inference"
 version = "1.0.3"
 description = "Efficient CPU inference for ternary language models"
-readme = "README.md"
+readme = {file = "README.txt", content-type = "text/plain"}
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
@@ -55,6 +55,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+nemotron = ["transformers>=5.18.0,<6"]
 dev = [
     "pytest>=7.0.0",
     "black>=23.0.0",
@@ -62,12 +63,12 @@ dev = [
 ]
 
 [project.scripts]
+litespark-nemotron = "litespark_inference.nemotron_cpu:main"
 litespark-inference = "litespark_inference.cli:main"
 litespark-benchmark = "litespark_inference.benchmark_kernel:main"
 
 [project.urls]
 Homepage = "https://github.com/Mindbeam-AI/Litespark-Inference"
-Documentation = "https://github.com/Mindbeam-AI/Litespark-Inference#readme"
 Repository = "https://github.com/Mindbeam-AI/Litespark-Inference"
 
 [tool.setuptools.packages.find]

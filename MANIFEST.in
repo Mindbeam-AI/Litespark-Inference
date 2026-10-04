@@ -6,7 +6,6 @@
 # arm64 would only carry the NEON source and fail to compile on x86_64.
 
 include LICENSE
-include README.md
 include pyproject.toml
 include setup.py
 
@@ -14,3 +13,4 @@ include setup.py
 # AVX-512 / AVX2 / VNNI fallbacks). setup.py compiles the one matching the
 # install host.
 recursive-include litespark_inference/kernels *.cpp *.h *.hpp
+include README.txt

@@ -19,6 +19,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
+#include <algorithm>
 
 // Accelerate (cblas_sgemm) is macOS-only and backs the optional float32
 // "accelerate mode" exclusively. Guard it so the kernel also compiles on
@@ -708,3 +710,151 @@ int matmul_lut_neon_has_accelerate(void) {
 }
 
 }  // extern "C"
+
+// Distillery's Nemotron format packs four OUTPUT-row planes per byte, with
+// FP16 scales for each input-column group. Keep its BF16 activation contract:
+// the BitNet SDOT entry points above deliberately have a different contract.
+static inline float nemotron_bf16_round(float x) {
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+    std::memcpy(&x, &bits, 4);
+    return x;
+}
+
+static inline float nemotron_grouped_row(const float* x, const uint8_t* codes,
+                                         const uint16_t* scales, int row,
+                                         int rows, int cols, int group) {
+    const int planes=(rows+3)/4, groups=(cols+group-1)/group;
+    const uint8_t* packed=codes+static_cast<size_t>(row%planes)*cols;
+    const int shift=2*(row/planes);
+    const int8x16_t shifts=vdupq_n_s8(-shift);
+    const uint8x16_t mask=vdupq_n_u8(3);
+    const int8x16_t one=vdupq_n_s8(1);
+    float32x4_t a=vdupq_n_f32(0), b=a, c=a, d=a;
+    float tail=0;
+    for(int g=0;g<groups;++g) {
+        float16_t half;
+        std::memcpy(&half,scales+static_cast<size_t>(row)*groups+g,2);
+        const float scale=nemotron_bf16_round(static_cast<float>(half));
+        const float32x4_t s=vdupq_n_f32(scale);
+        int col=g*group;
+        const int end=std::min(cols,col+group);
+        for(;col+16<=end;col+=16) {
+            const int8x16_t q=vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vld1q_u8(packed+col),shifts),mask)),one);
+            const int16x8_t lo=vmovl_s8(vget_low_s8(q)), hi=vmovl_s8(vget_high_s8(q));
+            const float32x4_t q0=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),s);
+            const float32x4_t q1=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))),s);
+            const float32x4_t q2=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),s);
+            const float32x4_t q3=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))),s);
+            a=vfmaq_f32(a,q0,vld1q_f32(x+col));
+            b=vfmaq_f32(b,q1,vld1q_f32(x+col+4));
+            c=vfmaq_f32(c,q2,vld1q_f32(x+col+8));
+            d=vfmaq_f32(d,q3,vld1q_f32(x+col+12));
+        }
+        for(;col<end;++col) tail+=(int((packed[col]>>shift)&3)-1)*scale*x[col];
+    }
+    return tail+vaddvq_f32(vaddq_f32(vaddq_f32(a,b),vaddq_f32(c,d)));
+}
+
+extern "C" {
+
+void nemotron_set_threads_neon(int threads) {
+#if defined(_OPENMP)
+    omp_set_num_threads(threads);
+#endif
+}
+
+// Depthwise causal convolution: one channel per worker instead of thousands
+// of individual grouped-convolution dispatches. x/out are batch-channel-time.
+// Match the BF16 convolution boundary before applying SiLU.
+void nemotron_causal_conv_neon(const float* x, const float* weight, const float* bias,
+                               float* out, int batches, int channels, int tokens,
+                               int width, int output_tokens) {
+#pragma omp parallel for schedule(static)
+    for(int job=0;job<batches*channels;++job) {
+        const int channel=job%channels;
+        const float* input=x+static_cast<size_t>(job)*tokens;
+        const float* w=weight+static_cast<size_t>(channel)*width;
+        float* output=out+static_cast<size_t>(job)*output_tokens;
+        for(int t=0;t<output_tokens;++t) {
+            const int position=t+tokens-output_tokens;
+            float sum=bias[channel];
+            for(int k=0;k<width;++k) {
+                const int source=position+k-width+1;
+                if(source>=0) sum+=input[source]*w[k];
+            }
+            const float value=nemotron_bf16_round(sum);
+            output[t]=nemotron_bf16_round(value/(1.f+std::exp(-value)));
+        }
+    }
+}
+
+// Reuse the existing BF16 NEON GEMV for decode. Accelerate SGEMM handles
+// prefill; its temporary FP32 matrix lives only for this call.
+void nemotron_dense_bf16_neon(const uint16_t* weight, const float* x,
+                              float* out, int tokens, int rows, int cols) {
+    if(tokens==1) {
+        lm_head_bf16_fp32_neon(weight,x,out,rows,cols);
+        return;
+    }
+#if defined(__APPLE__)
+    std::vector<float> expanded(static_cast<size_t>(rows)*cols);
+#pragma omp parallel for schedule(static)
+    for(int row=0;row<rows;++row) {
+        int col=0;
+        const size_t offset=static_cast<size_t>(row)*cols;
+        for(;col+8<=cols;col+=8) {
+            const uint16x8_t v=vld1q_u16(weight+offset+col);
+            vst1q_f32(expanded.data()+offset+col,vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v),16)));
+            vst1q_f32(expanded.data()+offset+col+4,vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(v),16)));
+        }
+        for(;col<cols;++col) {
+            uint32_t bits=uint32_t(weight[offset+col])<<16;
+            std::memcpy(expanded.data()+offset+col,&bits,4);
+        }
+    }
+    cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,tokens,rows,cols,
+                1.f,x,cols,expanded.data(),cols,0.f,out,rows);
+#else
+    for(int token=0;token<tokens;++token)
+        lm_head_bf16_fp32_neon(weight,x+static_cast<size_t>(token)*cols,
+                               out+static_cast<size_t>(token)*rows,rows,cols);
+#endif
+}
+
+// One call handles all selected experts and routing reduction. Packed banks
+// are read directly from checkpoint mappings; no dense expert is created.
+void nemotron_experts_neon(const float* input, const int64_t* ids, const float* routing,
+                           const uint8_t* const* up, const uint16_t* const* up_scales,
+                           const uint8_t* const* down, const uint16_t* const* down_scales,
+                           float* hidden, float* partial, float* output,
+                           int tokens, int dim, int intermediate, int topk, int group) {
+    const int slots=tokens*topk;
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+        for(int job=0;job<slots*intermediate;++job) {
+            const int slot=job/intermediate,row=job%intermediate,expert=ids[slot];
+            const float sum=nemotron_grouped_row(input+static_cast<size_t>(slot/topk)*dim,
+                up[expert],up_scales[expert],row,intermediate,dim,group);
+            const float value=std::max(nemotron_bf16_round(sum),0.f);
+            hidden[job]=nemotron_bf16_round(value*value);
+        }
+#pragma omp for schedule(static)
+        for(int job=0;job<slots*dim;++job) {
+            const int slot=job/dim,row=job%dim,expert=ids[slot];
+            const float sum=nemotron_grouped_row(hidden+static_cast<size_t>(slot)*intermediate,
+                down[expert],down_scales[expert],row,dim,intermediate,group);
+            partial[job]=nemotron_bf16_round(sum)*routing[slot];
+        }
+#pragma omp for schedule(static)
+        for(int job=0;job<tokens*dim;++job) {
+            const int token=job/dim,row=job%dim;
+            float sum=0;
+            for(int k=0;k<topk;++k) sum+=partial[(static_cast<size_t>(token)*topk+k)*dim+row];
+            output[job]=nemotron_bf16_round(sum);
+        }
+    }
+}
+} // extern "C"

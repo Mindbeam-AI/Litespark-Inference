@@ -24,6 +24,7 @@ Deliberately does not import torch.
 from __future__ import annotations
 
 import ctypes
+import importlib.util
 import os
 import platform
 import subprocess
@@ -115,6 +116,16 @@ _LIB_PATH = _HERE / f"{_LIB_PREFIX}{_LIB_SUFFIX}"
 _HOMEBREW_LIBOMP = Path("/opt/homebrew/opt/libomp")
 
 
+def _torch_omp_dir() -> Optional[Path]:
+    """Share PyTorch's runtime when installed, without importing torch."""
+    spec = importlib.util.find_spec("torch")
+    if spec is not None and spec.origin:
+        directory = Path(spec.origin).parent / "lib"
+        if (directory / "libomp.dylib").exists():
+            return directory
+    return None
+
+
 def _omp_flags() -> list[str]:
     """Return compiler/linker flags to enable OpenMP, or [] if not found.
 
@@ -123,11 +134,12 @@ def _omp_flags() -> list[str]:
     we silently compile without OMP (the #pragma omp line becomes a no-op).
     """
     if platform.system() == "Darwin" and _HOMEBREW_LIBOMP.exists():
+        runtime = _torch_omp_dir() or _HOMEBREW_LIBOMP / "lib"
         return [
             "-Xpreprocessor", "-fopenmp",
             f"-I{_HOMEBREW_LIBOMP / 'include'}",
-            f"-L{_HOMEBREW_LIBOMP / 'lib'}",
-            f"-Wl,-rpath,{_HOMEBREW_LIBOMP / 'lib'}",
+            f"-L{runtime}",
+            f"-Wl,-rpath,{runtime}",
             "-lomp",
         ]
     # Non-macOS: trust -fopenmp if available. A CalledProcessError will
@@ -192,6 +204,17 @@ def _load() -> ctypes.CDLL:
     if _lib is not None:
         return _lib
     built = _find_built_extension()
+    # Older macOS builds link Homebrew's absolute install name. Loading that
+    # beside torch's bundled OpenMP aborts the process; rebuild against the
+    # shared runtime instead of enabling KMP_DUPLICATE_LIB_OK.
+    if built is not None and platform.system() == "Darwin" and _torch_omp_dir():
+        dependencies = subprocess.check_output(["otool", "-L", str(built)], text=True)
+        if "/libomp/" in dependencies or "/Cellar/libomp/" in dependencies:
+            built = None
+            if _LIB_PATH.exists() and _LIB_PATH.stat().st_mtime >= _SRC.stat().st_mtime:
+                dependencies = subprocess.check_output(["otool", "-L", str(_LIB_PATH)], text=True)
+                if "/libomp/" not in dependencies and "/Cellar/libomp/" not in dependencies:
+                    built = _LIB_PATH
     if built is not None and (
         not _SRC.exists() or built.stat().st_mtime >= _SRC.stat().st_mtime
     ):

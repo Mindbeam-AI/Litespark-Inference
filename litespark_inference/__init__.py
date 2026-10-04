@@ -20,6 +20,7 @@ __version__ = "1.0.3"
 # Lazy top-level imports. `.models` pulls torch; we don't want to drag torch
 # into sibling subpackages like `.torchless` that must stay torch-free.
 _TORCH_BACKED = {
+    "load_nemotron": ("litespark_inference.nemotron_cpu", "load_nemotron"),
     "load_model": ("litespark_inference.models", "load_ternary_model"),
     "get_arch_info": ("litespark_inference.models", "get_arch_info"),
     "get_kernel_type": ("litespark_inference.models", "get_kernel_type"),
@@ -37,6 +38,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "load_nemotron",
     "__version__",
     "load_model",
     "get_arch_info",

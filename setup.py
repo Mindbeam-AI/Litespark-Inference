@@ -22,6 +22,7 @@ litespark_inference.torchless.kernel loads it via ctypes.
 from __future__ import annotations
 
 import os
+import importlib.util
 import platform
 from pathlib import Path
 from typing import Optional
@@ -183,13 +184,19 @@ def _platform_compile_args(compiler_type: str) -> tuple[list[str], list[str]]:
         ]
         omp_root = next((p for p in candidates if p.exists()), None)
         if omp_root is not None:
+            runtime = omp_root / "lib"
+            torch_spec = importlib.util.find_spec("torch")
+            if torch_spec is not None and torch_spec.origin:
+                torch_lib = Path(torch_spec.origin).parent / "lib"
+                if (torch_lib / "libomp.dylib").exists():
+                    runtime = torch_lib
             compile_args += [
                 "-Xpreprocessor", "-fopenmp",
                 f"-I{omp_root / 'include'}",
             ]
             link_args += [
-                f"-L{omp_root / 'lib'}",
-                f"-Wl,-rpath,{omp_root / 'lib'}",
+                f"-L{runtime}",
+                f"-Wl,-rpath,{runtime}",
                 "-lomp",
             ]
         else:
