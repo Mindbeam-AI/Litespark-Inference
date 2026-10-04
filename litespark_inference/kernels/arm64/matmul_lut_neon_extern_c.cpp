@@ -757,7 +757,138 @@ static inline float nemotron_grouped_row(const float* x, const uint8_t* codes,
     return tail+vaddvq_f32(vaddq_f32(vaddq_f32(a,b),vaddq_f32(c,d)));
 }
 
+static inline float32x4_t nemotron_bf16_round4(float32x4_t value) {
+    uint32x4_t bits=vreinterpretq_u32_f32(value);
+    const uint32x4_t increment=vaddq_u32(vdupq_n_u32(0x7fff),
+        vandq_u32(vshrq_n_u32(bits,16),vdupq_n_u32(1)));
+    return vreinterpretq_f32_u32(vandq_u32(vaddq_u32(bits,increment),vdupq_n_u32(0xffff0000)));
+}
+
+static inline uint8x16x2_t nemotron_int4_table(float scale) {
+    alignas(16) static const float values[16]={-8,-7,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,7};
+    const uint32x4_t a=vreinterpretq_u32_f32(nemotron_bf16_round4(vmulq_n_f32(vld1q_f32(values),scale)));
+    const uint32x4_t b=vreinterpretq_u32_f32(nemotron_bf16_round4(vmulq_n_f32(vld1q_f32(values+4),scale)));
+    const uint32x4_t c=vreinterpretq_u32_f32(nemotron_bf16_round4(vmulq_n_f32(vld1q_f32(values+8),scale)));
+    const uint32x4_t d=vreinterpretq_u32_f32(nemotron_bf16_round4(vmulq_n_f32(vld1q_f32(values+12),scale)));
+    uint8x16x2_t table;
+    table.val[0]=vreinterpretq_u8_u16(vcombine_u16(vshrn_n_u32(a,16),vshrn_n_u32(b,16)));
+    table.val[1]=vreinterpretq_u8_u16(vcombine_u16(vshrn_n_u32(c,16),vshrn_n_u32(d,16)));
+    return table;
+}
+
+static inline void nemotron_int4_bf16_weights16(const uint8_t* packed, uint8x16x2_t table,
+                                                uint16x8_t* lo, uint16x8_t* hi) {
+    const uint8x8_t bytes=vld1_u8(packed);
+    const uint8x8x2_t codes=vzip_u8(vand_u8(bytes,vdup_n_u8(15)),vshr_n_u8(bytes,4));
+    const uint16x8_t i0=vaddq_u16(vmulq_n_u16(vmovl_u8(codes.val[0]),0x0202),vdupq_n_u16(0x0100));
+    const uint16x8_t i1=vaddq_u16(vmulq_n_u16(vmovl_u8(codes.val[1]),0x0202),vdupq_n_u16(0x0100));
+    *lo=vreinterpretq_u16_u8(vqtbl2q_u8(table,vreinterpretq_u8_u16(i0)));
+    *hi=vreinterpretq_u16_u8(vqtbl2q_u8(table,vreinterpretq_u8_u16(i1)));
+}
+
+static inline void nemotron_int4_weights16(const uint8_t* packed, uint8x16x2_t table,
+                                           float32x4_t* w0, float32x4_t* w1,
+                                           float32x4_t* w2, float32x4_t* w3) {
+    uint16x8_t lo,hi;
+    nemotron_int4_bf16_weights16(packed,table,&lo,&hi);
+    *w0=vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(lo),16));
+    *w1=vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(lo),16));
+    *w2=vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(hi),16));
+    *w3=vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(hi),16));
+}
+
 extern "C" {
+
+// Grouped INT4 with the same BF16 reconstructed weights as the evaluation
+// derivative. Decode reads packed weights directly; prefill expands only the
+// current matrix before using Accelerate's batched multiplication.
+void nemotron_dense_int4_neon(const uint8_t* packed, const uint16_t* scales,
+                              const float* x, float* output, int tokens,
+                              int rows, int cols, int group) {
+    const int groups=(cols+group-1)/group, stride=(cols+1)/2;
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    std::vector<uint16_t> x_bf16;
+    bool exact_bf16=tokens==1;
+    if(exact_bf16) {
+        x_bf16.resize(cols);
+        for(int col=0;col<cols;++col) {
+            uint32_t bits;
+            std::memcpy(&bits,x+col,4);
+            exact_bf16=exact_bf16 && (bits&0xffffu)==0;
+            x_bf16[col]=bits>>16;
+        }
+    }
+#endif
+#if defined(__APPLE__)
+    std::vector<float> expanded;
+    if(tokens>1) expanded.resize(static_cast<size_t>(rows)*cols);
+#endif
+#pragma omp parallel for schedule(static)
+    for(int row=0;row<rows;++row) {
+        const uint8_t* codes=packed+static_cast<size_t>(row)*stride;
+#if defined(__APPLE__)
+        if(tokens>1) {
+            float* target=expanded.data()+static_cast<size_t>(row)*cols;
+            for(int g=0;g<groups;++g) {
+                float16_t half;
+                std::memcpy(&half,scales+static_cast<size_t>(row)*groups+g,2);
+                const float scale=static_cast<float>(half);
+                const uint8x16x2_t table=nemotron_int4_table(scale);
+                int col=g*group;
+                const int end=std::min(cols,col+group);
+                for(;col+16<=end;col+=16) {
+                    float32x4_t w0,w1,w2,w3;
+                    nemotron_int4_weights16(codes+col/2,table,&w0,&w1,&w2,&w3);
+                    vst1q_f32(target+col,w0); vst1q_f32(target+col+4,w1);
+                    vst1q_f32(target+col+8,w2); vst1q_f32(target+col+12,w3);
+                }
+                for(;col<end;++col)
+                    target[col]=nemotron_bf16_round((int((codes[col/2]>>(4*(col%2)))&15)-8)*scale);
+            }
+            continue;
+        }
+#endif
+        for(int token=0;token<tokens;++token) {
+            const float* input=x+static_cast<size_t>(token)*cols;
+            float32x4_t a=vdupq_n_f32(0),b=a,c=a,d=a;
+            float tail=0;
+            for(int g=0;g<groups;++g) {
+                float16_t half;
+                std::memcpy(&half,scales+static_cast<size_t>(row)*groups+g,2);
+                const float scale=static_cast<float>(half);
+                const uint8x16x2_t table=nemotron_int4_table(scale);
+                int col=g*group;
+                const int end=std::min(cols,col+group);
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+                if(exact_bf16) {
+                    for(;col+16<=end;col+=16) {
+                        uint16x8_t lo,hi;
+                        nemotron_int4_bf16_weights16(codes+col/2,table,&lo,&hi);
+                        a=vbfdotq_f32(a,vreinterpretq_bf16_u16(lo),vreinterpretq_bf16_u16(vld1q_u16(x_bf16.data()+col)));
+                        b=vbfdotq_f32(b,vreinterpretq_bf16_u16(hi),vreinterpretq_bf16_u16(vld1q_u16(x_bf16.data()+col+8)));
+                    }
+                }
+#endif
+                for(;col+16<=end;col+=16) {
+                    float32x4_t w0,w1,w2,w3;
+                    nemotron_int4_weights16(codes+col/2,table,&w0,&w1,&w2,&w3);
+                    a=vfmaq_f32(a,w0,vld1q_f32(input+col));
+                    b=vfmaq_f32(b,w1,vld1q_f32(input+col+4));
+                    c=vfmaq_f32(c,w2,vld1q_f32(input+col+8));
+                    d=vfmaq_f32(d,w3,vld1q_f32(input+col+12));
+                }
+                for(;col<end;++col)
+                    tail+=nemotron_bf16_round((int((codes[col/2]>>(4*(col%2)))&15)-8)*scale)*input[col];
+            }
+            output[static_cast<size_t>(token)*rows+row]=tail+vaddvq_f32(vaddq_f32(vaddq_f32(a,b),vaddq_f32(c,d)));
+        }
+    }
+#if defined(__APPLE__)
+    if(tokens>1)
+        cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,tokens,rows,cols,
+                     1.f,x,cols,expanded.data(),cols,0.f,output,rows);
+#endif
+}
 
 void nemotron_set_threads_neon(int threads) {
 #if defined(_OPENMP)

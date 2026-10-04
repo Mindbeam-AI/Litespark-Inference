@@ -31,6 +31,7 @@ class NativeKernels:
         array = np.ctypeslib.ndpointer
         f32 = array(dtype=np.float32, flags="C_CONTIGUOUS")
         u16 = array(dtype=np.uint16, flags="C_CONTIGUOUS")
+        u8 = array(dtype=np.uint8, flags="C_CONTIGUOUS")
         i64 = array(dtype=np.int64, flags="C_CONTIGUOUS")
         ptrs = array(dtype=np.uintp, flags="C_CONTIGUOUS")
         integer = ctypes.c_int
@@ -44,6 +45,8 @@ class NativeKernels:
         self.lib.nemotron_experts_neon.restype = None
         self.lib.nemotron_causal_conv_neon.argtypes = [f32, f32, f32, f32] + [integer]*5
         self.lib.nemotron_causal_conv_neon.restype = None
+        self.lib.nemotron_dense_int4_neon.argtypes = [u8, u16, f32, f32] + [integer]*4
+        self.lib.nemotron_dense_int4_neon.restype = None
 
     def dense(self, weight, x):
         x = np.ascontiguousarray(x, dtype=np.float32)
@@ -53,6 +56,16 @@ class NativeKernels:
         result = np.empty((x.shape[0], weight.shape[0]), dtype=np.float32)
         self.lib.nemotron_dense_bf16_neon(weight, x, result, x.shape[0], weight.shape[0], weight.shape[1])
         return result
+
+    def dense_int4(self, packed, scales, x, cols, group):
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        if (cols < 1 or group < 2 or group % 2 or packed.ndim != 2 or packed.shape[1] != (cols+1)//2 or
+                scales.shape != (packed.shape[0], (cols+group-1)//group) or
+                x.ndim != 2 or x.shape[1] != cols):
+            raise ValueError("Invalid grouped INT4 matrix dimensions")
+        output = np.empty((x.shape[0], packed.shape[0]), dtype=np.float32)
+        self.lib.nemotron_dense_int4_neon(packed, scales, x, output, x.shape[0], packed.shape[0], cols, group)
+        return output
 
     def causal_conv(self, x, weight, bias, output_tokens):
         values = x.float().contiguous().numpy()
@@ -188,15 +201,46 @@ class NativeExperts(torch.nn.Module):
         return torch.from_numpy(output).to(hidden_states.dtype)
 
 
-def _replace_linears(module, kernels):
+class NativeInt4Linear(torch.nn.Module):
+    def __init__(self, overlay, name, kernels, bias=None):
+        super().__init__()
+        packed, scales = overlay.tensors(name)
+        self.register_buffer("packed", packed)
+        self.register_buffer("scales", scales)
+        self.register_buffer("bias", bias)
+        self.codes = packed.numpy()
+        self.scale_bits = scales.view(torch.uint16).numpy()
+        self.out_features, self.in_features = overlay.manifest["tensors"][name]["shape"]
+        self.group = overlay.manifest["group_size"]
+        self.kernels = kernels
+
+    def forward(self, x):
+        values = x.reshape(-1, self.in_features).float().contiguous().numpy()
+        out = torch.from_numpy(self.kernels.dense_int4(self.codes, self.scale_bits, values,
+                                                       self.in_features, self.group))
+        if self.bias is not None:
+            out += self.bias.float()
+        return out.reshape(x.shape[:-1]+(self.out_features,)).to(x.dtype)
+
+
+def _linear(weight, kernels, bias=None, overlay=None, name=""):
+    if overlay is not None and name in overlay.manifest["tensors"]:
+        if list(weight.shape) != overlay.manifest["tensors"][name]["shape"]:
+            raise ValueError(f"INT4 overlay disagrees with model shape: {name}")
+        overlay.used.add(name)
+        return NativeInt4Linear(overlay, name, kernels, bias)
+    return NativeLinear(weight, kernels, bias)
+
+
+def _replace_linears(module, kernels, overlay=None, prefix=""):
     for name, child in list(module.named_children()):
         if isinstance(child, torch.nn.Linear):
-            setattr(module, name, NativeLinear(child.weight, kernels, child.bias))
+            setattr(module, name, _linear(child.weight, kernels, child.bias, overlay, prefix+name+".weight"))
         else:
-            _replace_linears(child, kernels)
+            _replace_linears(child, kernels, overlay, prefix+name+".")
 
 
-def load_nemotron(directory, threads=10, report=None):
+def load_nemotron(directory, threads=10, report=None, int4_overlay=None):
     try:
         from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
         from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
@@ -208,6 +252,14 @@ def load_nemotron(directory, threads=10, report=None):
         report["openmp"] = kernel.has_omp()
         report["kernel_threads"] = kernel.max_threads()
     checkpoint = Checkpoint(directory)
+    overlay = None
+    if int4_overlay is not None:
+        from .nemotron_int4 import Int4Overlay
+        overlay = Int4Overlay(int4_overlay, source=directory)
+        overlay.used = set()
+        if report is not None:
+            report["dense_int4"] = {key: overlay.manifest[key] for key in
+                                    ("group_size", "source_tensor_bytes", "packed_tensor_bytes")}
     config = NemotronHConfig(**checkpoint.config["llm_config"])
     config._attn_implementation = "sdpa"
     config._experts_implementation = "eager"
@@ -218,7 +270,7 @@ def load_nemotron(directory, threads=10, report=None):
             block.mixer.experts = NativeExperts(checkpoint, i, config, kernels)
         prefix = f"language_model.backbone.layers.{i}."
         block.load_state_dict({k: checkpoint.raw(prefix+k) for k in block.state_dict()}, strict=True, assign=True)
-        _replace_linears(block, kernels)
+        _replace_linears(block, kernels, overlay, prefix)
         if block.block_type == "linear_attention":
             _native_convolution(block.mixer, kernels)
         if report is not None:
@@ -236,8 +288,12 @@ def load_nemotron(directory, threads=10, report=None):
             print(f"mapped layer {i}", flush=True)
     model.model.embeddings.weight = torch.nn.Parameter(checkpoint.raw("language_model.backbone.embeddings.weight"), requires_grad=False)
     model.model.norm_f.weight = torch.nn.Parameter(checkpoint.raw("language_model.backbone.norm_f.weight"), requires_grad=False)
-    model.lm_head = NativeLinear(checkpoint.raw("language_model.lm_head.weight"), kernels)
+    model.lm_head = _linear(checkpoint.raw("language_model.lm_head.weight"), kernels,
+                            overlay=overlay, name="language_model.lm_head.weight")
     model._nemotron_checkpoint = checkpoint
+    model._nemotron_int4 = overlay
+    if overlay is not None and overlay.used != set(overlay.manifest["tensors"]):
+        raise ValueError("INT4 overlay contains tensors unused by the text model")
     if any(t.is_meta for t in list(model.parameters()) + list(model.buffers())):
         raise ValueError("Uninitialized model tensor")
     return model.eval().requires_grad_(False)
@@ -251,12 +307,13 @@ def main():
     parser.add_argument("--expect", default=None)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--threads", type=int, default=10)
+    parser.add_argument("--dense-int4", help="Path to a grouped INT4 dense-weight overlay")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     report = {"backend": "public Litespark ARM/NEON + Accelerate; CPU recurrent reference",
               "prompt": args.prompt, "threads": args.threads, "platform": platform.platform()}
     started = time.monotonic()
-    model = load_nemotron(args.model, args.threads, report)
+    model = load_nemotron(args.model, args.threads, report, args.dense_int4)
     report["load_seconds"] = time.monotonic()-started
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True, trust_remote_code=True)
     prompt = tokenizer.apply_chat_template([{"role": "user", "content": args.prompt}],

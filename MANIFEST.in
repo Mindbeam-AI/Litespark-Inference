@@ -14,3 +14,5 @@ include setup.py
 # install host.
 recursive-include litespark_inference/kernels *.cpp *.h *.hpp
 include README.txt
+include benchmarks/bench_nemotron.py
+include tools/expand_nemotron_int4_eval.py

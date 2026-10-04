@@ -64,6 +64,7 @@ dev = [
 
 [project.scripts]
 litespark-nemotron = "litespark_inference.nemotron_cpu:main"
+litespark-nemotron-int4 = "litespark_inference.nemotron_int4:main"
 litespark-inference = "litespark_inference.cli:main"
 litespark-benchmark = "litespark_inference.benchmark_kernel:main"
 
