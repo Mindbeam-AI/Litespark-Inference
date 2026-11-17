@@ -664,9 +664,18 @@ def _rerun_in_subprocess(
         env = dict(_os.environ)
         ext_dir = env.get("TORCH_EXTENSIONS_DIR")
         if not ext_dir:
-            ext_dir = _os.path.join(_tf.gettempdir(), "litespark_torch_extensions")
+            from pathlib import Path as _Path
+            cache_override = env.get("LITESPARK_CACHE_DIR")
+            if cache_override:
+                base_cache = _Path(cache_override).expanduser()
+            elif platform.system() == "Darwin":
+                base_cache = _Path.home() / "Library" / "Caches" / "litespark"
+            else:
+                xdg = env.get("XDG_CACHE_HOME")
+                base_cache = (_Path(xdg).expanduser() if xdg else _Path.home() / ".cache") / "litespark"
+            ext_dir = str(base_cache / "torch_extensions")
             env["TORCH_EXTENSIONS_DIR"] = ext_dir
-        _os.makedirs(ext_dir, exist_ok=True)
+        _os.makedirs(ext_dir, mode=0o700, exist_ok=True)
 
         benchmark_threads = args.threads if args.threads is not None else 1
         cmd = [

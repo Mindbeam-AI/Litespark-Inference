@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import platform
 import os
-import tempfile
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 from torch.utils.cpp_extension import load
@@ -229,9 +228,9 @@ def get_kernel():
     if _kernel is None:
         ext_dir = os.environ.get("TORCH_EXTENSIONS_DIR")
         if not ext_dir:
-            ext_dir = os.path.join(tempfile.gettempdir(), "litespark_torch_extensions")
+            ext_dir = str(_get_litespark_cache_dir() / "torch_extensions")
             os.environ["TORCH_EXTENSIONS_DIR"] = ext_dir
-        os.makedirs(ext_dir, exist_ok=True)
+        os.makedirs(ext_dir, mode=0o700, exist_ok=True)
 
         arch_info = get_arch_info()
         machine = arch_info['machine']
