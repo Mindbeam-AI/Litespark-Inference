@@ -15,11 +15,15 @@ need the fp32 value must reinterpret the bits with
 from __future__ import annotations
 
 import json
+import math
 import mmap
 import os
 from dataclasses import dataclass
 
 import numpy as np
+
+
+_MAX_HEADER_SIZE = 100 * 1024 * 1024  # 100 MB, matching safetensors spec
 
 
 _NP_STORE = {
@@ -38,6 +42,7 @@ class SafetensorsFile:
     header: dict
     data_start: int
     path: str = ""
+    file_size: int = 0
 
     def close_mmap(self) -> bool:
         """Drop the mmap only, keep the fd (so pread-based get() still works).
@@ -79,9 +84,40 @@ class SafetensorsFile:
         return [k for k in self.header.keys() if k != "__metadata__"]
 
     def _meta(self, name: str) -> tuple[list, str, int, int]:
+        if name == "__metadata__":
+            raise KeyError(name)
         meta = self.header[name]
-        off0, off1 = meta["data_offsets"]
-        return meta["shape"], meta["dtype"], off0, off1
+        if not isinstance(meta, dict):
+            raise ValueError(f"Invalid metadata entry for {name!r}")
+        shape = meta.get("shape")
+        dtype = meta.get("dtype")
+        offsets = meta.get("data_offsets")
+        if dtype not in _NP_STORE:
+            raise ValueError(f"Unsupported safetensors dtype {dtype!r} for {name!r}")
+        if not isinstance(shape, list) or not all(
+            isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape
+        ):
+            raise ValueError(f"Invalid shape {shape!r} for {name!r}")
+        if not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
+            raise ValueError(f"Invalid data_offsets {offsets!r} for {name!r}")
+        off0, off1 = offsets
+        if (
+            not isinstance(off0, int) or isinstance(off0, bool)
+            or not isinstance(off1, int) or isinstance(off1, bool)
+            or off0 < 0 or off1 < off0
+        ):
+            raise ValueError(f"Invalid data_offsets {offsets!r} for {name!r}")
+        if self.file_size > 0 and self.data_start + off1 > self.file_size:
+            raise ValueError(
+                f"Tensor {name!r} data_offsets [{off0}, {off1}] exceed file size {self.file_size}"
+            )
+        expected_nbytes = math.prod(shape) * np.dtype(_NP_STORE[dtype]).itemsize
+        if (off1 - off0) != expected_nbytes:
+            raise ValueError(
+                f"Tensor {name!r} byte length {off1 - off0} does not match "
+                f"shape {shape} * dtype {dtype} ({expected_nbytes} bytes)"
+            )
+        return shape, dtype, off0, off1
 
     def get(self, name: str) -> tuple[np.ndarray, str]:
         """
@@ -134,15 +170,31 @@ class SafetensorsFile:
 
 def open_safetensors(path: str) -> SafetensorsFile:
     fd = os.open(path, os.O_RDONLY)
-    size = os.fstat(fd).st_size
-    # POSIX uses prot=PROT_READ; Windows uses access=ACCESS_READ. Pick the
-    # right keyword so the mmap is read-only on both platforms.
-    if hasattr(mmap, "PROT_READ"):
-        mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
-    else:
-        mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
-    header_len = int.from_bytes(mm[:8], "little")
-    header = json.loads(bytes(mm[8:8 + header_len]).decode())
-    return SafetensorsFile(
-        fd=fd, mm=mm, header=header, data_start=8 + header_len, path=path,
-    )
+    mm = None
+    try:
+        size = os.fstat(fd).st_size
+        if size < 8:
+            raise ValueError(f"Safetensors file too small ({size} bytes): {path}")
+        # POSIX uses prot=PROT_READ; Windows uses access=ACCESS_READ. Pick the
+        # right keyword so the mmap is read-only on both platforms.
+        if hasattr(mmap, "PROT_READ"):
+            mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
+        else:
+            mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+        header_len = int.from_bytes(mm[:8], "little")
+        if header_len <= 0 or header_len > _MAX_HEADER_SIZE or 8 + header_len > size:
+            raise ValueError(
+                f"Invalid safetensors header length {header_len} for file size {size}"
+            )
+        header = json.loads(bytes(mm[8:8 + header_len]).decode("utf-8"))
+        if not isinstance(header, dict):
+            raise ValueError("Safetensors header must be a JSON object")
+        return SafetensorsFile(
+            fd=fd, mm=mm, header=header, data_start=8 + header_len,
+            path=path, file_size=size,
+        )
+    except Exception:
+        if mm is not None:
+            mm.close()
+        os.close(fd)
+        raise
