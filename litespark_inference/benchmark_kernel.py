@@ -1258,9 +1258,15 @@ def _elevate_for_power_on_linux(args) -> None:
         "re-executing under sudo (you may be prompted for your password)...",
         file=_sys.stderr, flush=True,
     )
+    safe_env = [f"HOME={_os.path.expanduser('~')}"]
+    for key in ("PATH", "HF_HOME", "HF_HUB_OFFLINE", "LITESPARK_CACHE_DIR", "OMP_NUM_THREADS"):
+        val = _os.environ.get(key)
+        if val is not None:
+            safe_env.append(f"{key}={val}")
     _os.execvp("sudo", [
-        "sudo", "-E",
-        f"HOME={_os.path.expanduser('~')}",
+        "sudo",
+        "env",
+        *safe_env,
         _sys.executable, *_sys.argv,
     ])
 
@@ -1275,7 +1281,8 @@ def _chown_back_if_sudo(path: str) -> None:
 
     Best-effort: skips entries we can't stat/chown; never raises. Only
     flips files that root actually wrote (st_uid == 0), so pre-existing
-    user-owned files stay untouched.
+    user-owned files stay untouched. Uses lstat/lchown so symlinks are
+    never followed.
     """
     import os as _os
     uid_str = _os.environ.get("SUDO_UID")
@@ -1285,28 +1292,35 @@ def _chown_back_if_sudo(path: str) -> None:
     uid, gid = int(uid_str), int(gid_str)
 
     def _try_chown(p):
+        if _os.path.islink(p):
+            return
         try:
-            _os.chown(p, uid, gid)
+            _os.lchown(p, uid, gid)
         except OSError:
             pass
 
     # 1. Benchmark output JSON.
-    if path and _os.path.exists(path):
-        _try_chown(path)
+    if path and _os.path.lexists(path) and not _os.path.islink(path):
+        try:
+            if _os.lstat(path).st_uid == 0:
+                _try_chown(path)
+        except OSError:
+            pass
 
-    # 2. HF hub cache: walk once, flip only root-owned entries.
+    # 2. HF hub cache: walk once, flip only root-owned non-symlink entries.
     hub = _os.path.expanduser("~/.cache/huggingface/hub")
-    if _os.path.isdir(hub):
-        for current, _dirs, files in _os.walk(hub):
+    if _os.path.isdir(hub) and not _os.path.islink(hub):
+        for current, _dirs, files in _os.walk(hub, followlinks=False):
             try:
-                if _os.stat(current).st_uid == 0:
+                if _os.lstat(current).st_uid == 0:
                     _try_chown(current)
             except OSError:
                 pass
             for name in files:
                 fp = _os.path.join(current, name)
                 try:
-                    if _os.stat(fp).st_uid == 0:
+                    st = _os.lstat(fp)
+                    if not _os.path.islink(fp) and st.st_uid == 0:
                         _try_chown(fp)
                 except OSError:
                     pass
@@ -1549,6 +1563,13 @@ def main():
 
     # Save results if output file specified
     if args.output:
+        if os.environ.get("SUDO_UID") is not None:
+            if os.path.islink(args.output):
+                raise RuntimeError("Refusing to write output to a symlink")
+            if os.path.lexists(args.output) and os.lstat(args.output).st_uid == 0:
+                raise RuntimeError(
+                    f"Refusing to overwrite existing root-owned file under sudo: {args.output}"
+                )
         with open(args.output, 'w') as f:
             json.dump(all_results, f, indent=2)
         print(f"\nResults saved to: {args.output}")
