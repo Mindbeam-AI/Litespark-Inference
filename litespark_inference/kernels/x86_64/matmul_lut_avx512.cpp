@@ -16,11 +16,21 @@
 
 #include <immintrin.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <new>
 #include <omp.h>
 #include <torch/extension.h>
+
+static inline void* lspk_aligned_alloc(size_t alignment, size_t size) {
+    size_t rounded = ((size + alignment - 1) / alignment) * alignment;
+    if (rounded == 0) rounded = alignment;
+    void* p = std::aligned_alloc(alignment, rounded);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
 
 // For 2 ternary weights: 3^2 = 9 combinations
 // LUT index = (w0+1)*3 + (w1+1) where w in {-1,0,1}
@@ -174,7 +184,7 @@ void matmul_lut_m1(
     const int K_pairs = K / 2;
 
     // Allocate LUT: [K/2][16] int16
-    int16_t* lut = (int16_t*)aligned_alloc(64, K_pairs * 16 * sizeof(int16_t));
+    int16_t* lut = (int16_t*)lspk_aligned_alloc(64, static_cast<size_t>(K_pairs) * 16 * sizeof(int16_t));
 
     // Build LUT from activations (single-threaded, fast)
     build_lut_2weight_avx512(x, lut, K);
@@ -244,7 +254,7 @@ void matmul_lut_m1_avx512(
 
     // Build transposed LUT: [16][K_pairs_padded] int8 (saturate to int8 range)
     // For efficiency, we use int8 LUT values (saturated)
-    int8_t* lut_t = (int8_t*)aligned_alloc(64, 16 * K_pairs_padded);
+    int8_t* lut_t = (int8_t*)lspk_aligned_alloc(64, static_cast<size_t>(16) * K_pairs_padded);
     memset(lut_t, 0, 16 * K_pairs_padded);
 
     // Build LUT entries

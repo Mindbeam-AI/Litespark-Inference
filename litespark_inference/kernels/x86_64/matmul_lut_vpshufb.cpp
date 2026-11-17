@@ -70,7 +70,10 @@ void matmul_vpshufb_m1(
     const int K2_pad = ((K2 + 63) / 64) * 64;
     
     // Build LUT: [K/2][16] int8
-    int8_t* lut = (int8_t*)aligned_alloc(64, K2 * 16);
+    size_t lut_bytes = ((static_cast<size_t>(K2) * 16 + 63) / 64) * 64;
+    if (lut_bytes == 0) lut_bytes = 64;
+    int8_t* lut = (int8_t*)std::aligned_alloc(64, lut_bytes);
+    if (!lut) return;
     build_lut_vpshufb(x, lut, K);
     
     omp_set_num_threads(num_threads);
@@ -121,10 +124,19 @@ void matmul_vpshufb_m1(
 int main() {
     const int N = 8192, K = 8192, num_threads = 8;
     
-    int8_t* x = (int8_t*)aligned_alloc(64, K);
-    int8_t* w = (int8_t*)aligned_alloc(64, N * K);
-    uint8_t* packed_w = (uint8_t*)aligned_alloc(64, N * (K/2));
-    float* y = (float*)aligned_alloc(64, N * sizeof(float));
+    auto alloc_64 = [](size_t bytes) -> void* {
+        size_t rounded = ((bytes + 63) / 64) * 64;
+        if (rounded == 0) rounded = 64;
+        return std::aligned_alloc(64, rounded);
+    };
+    int8_t* x = (int8_t*)alloc_64(static_cast<size_t>(K));
+    int8_t* w = (int8_t*)alloc_64(static_cast<size_t>(N) * K);
+    uint8_t* packed_w = (uint8_t*)alloc_64(static_cast<size_t>(N) * (K / 2));
+    float* y = (float*)alloc_64(static_cast<size_t>(N) * sizeof(float));
+    if (!x || !w || !packed_w || !y) {
+        free(x); free(w); free(packed_w); free(y);
+        return 1;
+    }
     
     for (int i = 0; i < K; i++) x[i] = (rand() % 256) - 128;
     for (int i = 0; i < N * K; i++) w[i] = (rand() % 3) - 1;

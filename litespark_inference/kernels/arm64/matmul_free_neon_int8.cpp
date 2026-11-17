@@ -1348,13 +1348,13 @@ void fused_attention_neon(
 
             // Apply RoPE to Q (in-place for this head)
             // Note: We make a copy to avoid modifying the original
-            float q_rope[256];  // Assume head_dim <= 256
-            memcpy(q_rope, q_head, head_dim * sizeof(float));
-            apply_rope_single_neon(q_rope, cos_ptr, sin_ptr, head_dim);
+            std::vector<float> q_rope(head_dim);
+            memcpy(q_rope.data(), q_head, head_dim * sizeof(float));
+            apply_rope_single_neon(q_rope.data(), cos_ptr, sin_ptr, head_dim);
 
             // Compute attention scores: Q @ K^T
             // scores[i] = dot(q_rope, k[i]) * scale
-            float scores[4096];  // Assume kv_len <= 4096
+            std::vector<float> scores(kv_len);
             float max_score = -1e9f;
 
             for (int i = 0; i < kv_len; i++) {
@@ -1364,7 +1364,7 @@ void fused_attention_neon(
                 float32x4_t sum_vec = vdupq_n_f32(0.0f);
                 int d = 0;
                 for (; d + 3 < head_dim; d += 4) {
-                    float32x4_t q_v = vld1q_f32(q_rope + d);
+                    float32x4_t q_v = vld1q_f32(q_rope.data() + d);
                     float32x4_t k_v = vld1q_f32(k_vec + d);
                     sum_vec = vmlaq_f32(sum_vec, q_v, k_v);
                 }
@@ -1460,7 +1460,7 @@ void fused_attention_neon_tiled(
                 const float* v_head = v + b * num_kv_heads * kv_len * head_dim + kv_h * kv_len * head_dim;
 
                 // Compute attention scores
-                float scores[4096];
+                std::vector<float> scores(kv_len);
                 float max_score = -1e9f;
 
                 for (int i = 0; i < kv_len; i++) {
@@ -1966,7 +1966,7 @@ void transformer_forward_single_neon(
                                        kv_h * v_cache_tensor.size(2) * head_dim;
 
             // Compute attention scores
-            float scores[4096];
+            std::vector<float> scores(kv_len);
             float max_score = -1e9f;
 
             for (int i = 0; i < kv_len; i++) {

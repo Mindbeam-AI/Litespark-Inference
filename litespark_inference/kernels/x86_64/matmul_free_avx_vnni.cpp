@@ -21,10 +21,20 @@
 #include <immintrin.h>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <new>
 #include <omp.h>
 #include <torch/extension.h>
+
+static inline void* lspk_aligned_alloc(size_t alignment, size_t size) {
+    size_t rounded = ((size + alignment - 1) / alignment) * alignment;
+    if (rounded == 0) rounded = alignment;
+    void* p = std::aligned_alloc(alignment, rounded);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
 
 // K padding for 256-bit (32 bytes = 32 int8 elements)
 constexpr int K_PAD_AVX = 32;
@@ -203,7 +213,7 @@ void matmul_free_avx_vnni_v3(
         const int m_tile_size = m_end - m_tile;
 
         // Allocate activation buffer for this M tile
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(32, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(32, static_cast<size_t>(m_tile_size) * K_padded);
 
         // Convert int8 -> uint8 (add 128)
         #pragma omp parallel for schedule(static)
@@ -322,7 +332,7 @@ void matmul_free_avx_vnni_v4_large_n(
     omp_set_num_threads(num_threads);
 
     // Precompute uint8 activations
-    uint8_t* x_uint8_all = (uint8_t*)aligned_alloc(32, M * K_padded);
+    uint8_t* x_uint8_all = (uint8_t*)lspk_aligned_alloc(32, static_cast<size_t>(M) * K_padded);
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -427,7 +437,7 @@ void matmul_free_avx_vnni_v4_fused(
     #pragma omp parallel
     {
         // Thread-local buffer for quantized activations
-        uint8_t* x_uint8_local = (uint8_t*)aligned_alloc(32, K_padded);
+        uint8_t* x_uint8_local = (uint8_t*)lspk_aligned_alloc(32, static_cast<size_t>(K_padded));
 
         #pragma omp for schedule(static)
         for (int m = 0; m < M; m++) {
