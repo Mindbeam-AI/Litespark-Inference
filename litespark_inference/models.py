@@ -265,16 +265,16 @@ def get_kernel():
         elif arch_info['is_arm64']:
             if arch_info['is_graviton']:
                 # AWS Graviton with NEON SDOT
-                kernel_path = Path(__file__).parent / 'kernels/arm64/matmul_free_graviton.cpp'
+                kernel_path = Path(__file__).parent / 'kernels/arm64/matmul_free_neon_int8.cpp'
 
                 _kernel = load(
-                    name='matmul_free_graviton',
+                    name='matmul_free_neon',
                     sources=[str(kernel_path)],
                     extra_cflags=['-O3', '-march=armv8.2-a+dotprod', '-fopenmp'],
                     extra_ldflags=['-fopenmp'],
                     verbose=False
                 )
-                _kernel_type = 'graviton'
+                _kernel_type = 'neon'
             else:
                 # Apple Silicon or other ARM64 with NEON SDOT
                 kernel_path = Path(__file__).parent / 'kernels/arm64/matmul_free_neon_int8.cpp'
