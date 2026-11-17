@@ -1082,14 +1082,12 @@ def run_pytorch_baseline(model_name: str = 'bitnet-2b', num_threads: Optional[in
 
     try:
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                hf_name, trust_remote_code=True
-            )
+            model = AutoModelForCausalLM.from_pretrained(hf_name)
         except (ValueError, OSError, EnvironmentError):
             from transformers import LlamaForCausalLM
             model = LlamaForCausalLM.from_pretrained(hf_name)
         model.eval()
-        tokenizer = AutoTokenizer.from_pretrained(hf_name, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(hf_name)
     except Exception as e:
         print(f"  Failed to load PyTorch model: {e}")
         print("  Skipping PyTorch baseline.")
