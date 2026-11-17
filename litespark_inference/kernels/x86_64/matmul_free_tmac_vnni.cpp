@@ -17,10 +17,20 @@
 #include <immintrin.h>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <new>
 #include <omp.h>
 #include <torch/extension.h>
+
+static inline void* lspk_aligned_alloc(size_t alignment, size_t size) {
+    size_t rounded = ((size + alignment - 1) / alignment) * alignment;
+    if (rounded == 0) rounded = alignment;
+    void* p = std::aligned_alloc(alignment, rounded);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
 
 // Cache tile sizes
 constexpr int TILE_M = 4;    // Process 4 rows at a time for register reuse
@@ -297,7 +307,7 @@ void matmul_free_vnni_tiled(
         float* y_row = y + m * N;
 
         // Convert activation row to uint8 (add 128)
-        alignas(64) uint8_t x_uint8[K_padded];
+        uint8_t* x_uint8 = static_cast<uint8_t*>(lspk_aligned_alloc(64, static_cast<size_t>(K_padded)));
         for (int k = 0; k < K; k++) {
             x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
         }
@@ -360,6 +370,7 @@ void matmul_free_vnni_tiled(
 
             y_row[n] = static_cast<float>(sum) * scale + (bias ? bias[n] : 0.0f);
         }
+        free(x_uint8);
     }
 }
 
@@ -397,7 +408,7 @@ void matmul_free_vnni_simple(
         float* y_row = y + m * N;
 
         // Convert activation row to uint8 (add 128) and pad
-        alignas(64) uint8_t x_uint8[K_padded];
+        uint8_t* x_uint8 = static_cast<uint8_t*>(lspk_aligned_alloc(64, static_cast<size_t>(K_padded)));
         for (int k = 0; k < K; k++) {
             x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
         }
@@ -429,6 +440,7 @@ void matmul_free_vnni_simple(
 
             y_row[n] = static_cast<float>(sum) * scale + (bias ? bias[n] : 0.0f);
         }
+        free(x_uint8);
     }
 }
 
@@ -501,10 +513,11 @@ void matmul_free_vnni_v2(
     const int K_padded = ((K + 63) / 64) * 64;
     constexpr int N_BLOCK = 4;  // Register blocking
 
+    num_threads = std::max(1, num_threads);
     omp_set_num_threads(num_threads);
 
     // Allocate per-thread uint8 activation buffers
-    uint8_t* x_uint8_buffers = (uint8_t*)aligned_alloc(64, num_threads * K_padded);
+    uint8_t* x_uint8_buffers = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(num_threads) * K_padded);
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -631,7 +644,7 @@ void matmul_free_vnni_v3(
         const int m_tile_size = m_end - m_tile;
 
         // Allocate activation buffer for this M tile
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * K_padded);
 
         // Step 1: Convert all activations in this M tile to uint8 (parallelized)
         #pragma omp parallel for schedule(static)
@@ -760,7 +773,7 @@ void matmul_free_vnni_v3_int32_out(
         const int m_end = std::min(m_tile + M_TILE, M);
         const int m_tile_size = m_end - m_tile;
 
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * K_padded);
 
         #pragma omp parallel for schedule(static)
         for (int m = m_tile; m < m_end; m++) {
@@ -886,10 +899,10 @@ void matmul_free_vnni_v3_fused_softmax(
         const int m_tile_size = m_end - m_tile;
 
         // Allocate activation buffer for this M tile
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * K_padded);
 
         // Allocate row buffers for all rows in this M tile
-        float* row_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
+        float* row_buffers = (float*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * N_padded * sizeof(float));
 
         // Step 1: Convert all activations in this M tile to uint8 (parallelized)
         #pragma omp parallel for schedule(static)
@@ -1148,7 +1161,7 @@ void matmul_free_vnni_v3_fused_quantize(
         const int m_end = std::min(m_tile + M_TILE, M);
         const int m_tile_size = m_end - m_tile;
 
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * K_padded);
 
         #pragma omp parallel for schedule(static)
         for (int m = m_tile; m < m_end; m++) {
@@ -1172,7 +1185,7 @@ void matmul_free_vnni_v3_fused_quantize(
         }
 
         // Allocate row buffers for all rows in this M tile
-        float* row_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
+        float* row_buffers = (float*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * N_padded * sizeof(float));
 
         // Compute matmul with N_TILE loop OUTSIDE parallel region
         // This keeps weight tiles in L2 cache across all M rows
@@ -1485,12 +1498,12 @@ void matmul_free_vnni_v3_fused_qkv_softmax(
         const int m_tile_size = m_end - m_tile;
 
         // Allocate activation buffer for this M tile (shared across Q, K, V)
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * K_padded);
 
         // Allocate shared row buffers for all rows in this M tile
-        float* q_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
-        float* k_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
-        float* v_buffers = (float*)aligned_alloc(64, m_tile_size * N_padded * sizeof(float));
+        float* q_buffers = (float*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * N_padded * sizeof(float));
+        float* k_buffers = (float*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * N_padded * sizeof(float));
+        float* v_buffers = (float*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * N_padded * sizeof(float));
 
         // Convert activations once
         #pragma omp parallel for schedule(static)
@@ -1723,7 +1736,7 @@ void matmul_free_vnni_v4_large_n(
     omp_set_num_threads(num_threads);
 
     // Precompute all uint8 activations (small cost for small M)
-    uint8_t* x_uint8_all = (uint8_t*)aligned_alloc(64, M * K_padded);
+    uint8_t* x_uint8_all = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(M) * K_padded);
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -1886,7 +1899,7 @@ void matmul_free_vnni_v5_large_m(
     omp_set_num_threads(num_threads);
 
     // Precompute all uint8 activations first (parallelize this)
-    uint8_t* x_uint8_all = (uint8_t*)aligned_alloc(64, M * K_padded);
+    uint8_t* x_uint8_all = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(M) * K_padded);
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -2025,7 +2038,7 @@ void matmul_free_vnni_v6_large_n_tiled(
     omp_set_num_threads(num_threads);
 
     // Pre-convert all activations to uint8
-    uint8_t* x_uint8_all = (uint8_t*)aligned_alloc(64, M * K_padded);
+    uint8_t* x_uint8_all = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(M) * K_padded);
 
     #pragma omp parallel for schedule(static)
     for (int m = 0; m < M; m++) {
@@ -2195,11 +2208,11 @@ void fused_mlp_int8(
     #pragma omp parallel
     {
         // Thread-local buffers (heap allocated)
-        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_up_padded);
-        float* up_float = (float*)aligned_alloc(64, mlp_hidden * sizeof(float));
-        float* swiglu_float = (float*)aligned_alloc(64, mlp_intermediate * sizeof(float));
-        uint8_t* swiglu_uint8 = (uint8_t*)aligned_alloc(64, K_down_padded);
-        float* down_float = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
+        uint8_t* x_uint8 = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(K_up_padded));
+        float* up_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(mlp_hidden) * sizeof(float));
+        float* swiglu_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(mlp_intermediate) * sizeof(float));
+        uint8_t* swiglu_uint8 = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(K_down_padded));
+        float* down_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(hidden_dim) * sizeof(float));
 
         #pragma omp for schedule(static)
         for (int m = 0; m < M; m++) {
@@ -2451,7 +2464,7 @@ void softmax_int8(
         __m512 scale_vec = _mm512_set1_ps(x_scale);
 
         // Allocate aligned buffer for float values
-        float* float_vals = (float*)aligned_alloc(64, N_padded * sizeof(float));
+        float* float_vals = (float*)lspk_aligned_alloc(64, static_cast<size_t>(N_padded) * sizeof(float));
 
         // Step 1: Convert int32 to float and find max (vectorized)
         __m512 max_vec = _mm512_set1_ps(-INFINITY);
@@ -2557,8 +2570,8 @@ void matmul_softmax_int8(
     #pragma omp parallel
     {
         // Thread-local buffers
-        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_padded);
-        float* matmul_out = (float*)aligned_alloc(64, N_padded * sizeof(float));
+        uint8_t* x_uint8 = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(K_padded));
+        float* matmul_out = (float*)lspk_aligned_alloc(64, static_cast<size_t>(N_padded) * sizeof(float));
 
         #pragma omp for schedule(static)
         for (int m = 0; m < M; m++) {
@@ -2735,10 +2748,10 @@ void matmul_qkv_softmax_int8(
     #pragma omp parallel
     {
         // Thread-local buffers
-        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_padded);
-        float* q_float = (float*)aligned_alloc(64, N_padded * sizeof(float));
-        float* k_float = (float*)aligned_alloc(64, N_padded * sizeof(float));
-        float* v_float = (float*)aligned_alloc(64, N_padded * sizeof(float));
+        uint8_t* x_uint8 = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(K_padded));
+        float* q_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(N_padded) * sizeof(float));
+        float* k_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(N_padded) * sizeof(float));
+        float* v_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(N_padded) * sizeof(float));
 
         #pragma omp for schedule(static)
         for (int m = 0; m < M; m++) {
@@ -2882,8 +2895,8 @@ void matmul_quantize_int8(
 
     #pragma omp parallel
     {
-        uint8_t* x_uint8 = (uint8_t*)aligned_alloc(64, K_padded);
-        float* matmul_out = (float*)aligned_alloc(64, ((N + 15) / 16) * 16 * sizeof(float));
+        uint8_t* x_uint8 = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(K_padded));
+        float* matmul_out = (float*)lspk_aligned_alloc(64, static_cast<size_t>((N + 15) / 16) * 16 * sizeof(float));
 
         #pragma omp for schedule(static)
         for (int m = 0; m < M; m++) {
@@ -3044,7 +3057,7 @@ void swiglu_int8(
         __m512 scale_vec = _mm512_set1_ps(x_scale);
 
         // Allocate aligned buffer for results
-        float* result = (float*)aligned_alloc(64, half_N_padded * sizeof(float));
+        float* result = (float*)lspk_aligned_alloc(64, static_cast<size_t>(half_N_padded) * sizeof(float));
 
         // First pass: compute SwiGLU and find max for quantization (vectorized)
         __m512 max_abs_vec = _mm512_setzero_ps();
@@ -3173,7 +3186,7 @@ void matmul_free_vnni_v3_fused_swiglu_optimized(
         const int m_tile_size = m_end - m_tile;
 
         // Allocate activation buffer for this M tile (only once)
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * K_padded);
 
         // Convert activations to uint8 (parallelized)
         #pragma omp parallel for schedule(static)
@@ -3210,7 +3223,7 @@ void matmul_free_vnni_v3_fused_swiglu_optimized(
 
                 // Allocate small per-thread buffer for SwiGLU results
                 const int tile_size = n_end_tile - n_tile;
-                float* swiglu_results = (float*)aligned_alloc(64, tile_size * sizeof(float));
+                float* swiglu_results = (float*)lspk_aligned_alloc(64, static_cast<size_t>(tile_size) * sizeof(float));
                 float max_abs = 0.0f;
 
                 // Process pairs [gate_i, up_i] in this tile
@@ -3319,13 +3332,13 @@ void matmul_free_vnni_v3_fused_swiglu(
         const int m_tile_size = m_end - m_tile;
 
         // Allocate activation buffer for this M tile
-        uint8_t* x_uint8_tile = (uint8_t*)aligned_alloc(64, m_tile_size * K_padded);
+        uint8_t* x_uint8_tile = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * K_padded);
 
         // Allocate first-half buffer for all rows in this M tile (stores gate values)
-        float* first_half_buffers = (float*)aligned_alloc(64, m_tile_size * half_N_padded * sizeof(float));
+        float* first_half_buffers = (float*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * half_N_padded * sizeof(float));
 
         // Allocate swiglu result buffer for all rows
-        float* swiglu_buffers = (float*)aligned_alloc(64, m_tile_size * half_N_padded * sizeof(float));
+        float* swiglu_buffers = (float*)lspk_aligned_alloc(64, static_cast<size_t>(m_tile_size) * half_N_padded * sizeof(float));
 
         // Step 1: Convert all activations in this M tile to uint8
         #pragma omp parallel for schedule(static)
@@ -3654,9 +3667,9 @@ void attention_int8(
         int8_t* out_row = out + m * hidden_dim;
 
         // Allocate per-thread buffers (aligned for AVX-512)
-        float* attn_scores = (float*)aligned_alloc(64, ((M * num_heads + 15) / 16) * 16 * sizeof(float));
-        float* attn_probs = (float*)aligned_alloc(64, ((M * num_heads + 15) / 16) * 16 * sizeof(float));
-        float* attn_out = (float*)aligned_alloc(64, ((hidden_dim + 15) / 16) * 16 * sizeof(float));
+        float* attn_scores = (float*)lspk_aligned_alloc(64, ((static_cast<size_t>(M) * num_heads + 15) / 16) * 16 * sizeof(float));
+        float* attn_probs = (float*)lspk_aligned_alloc(64, ((static_cast<size_t>(M) * num_heads + 15) / 16) * 16 * sizeof(float));
+        float* attn_out = (float*)lspk_aligned_alloc(64, static_cast<size_t>((hidden_dim + 15) / 16) * 16 * sizeof(float));
 
         // For each head
         for (int h = 0; h < num_heads; h++) {
@@ -3914,7 +3927,7 @@ void attention_int8_flash(
         int8_t* out_row = out + m * hidden_dim;
 
         // Per-head output accumulator (float)
-        float* attn_out = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
+        float* attn_out = (float*)lspk_aligned_alloc(64, static_cast<size_t>(hidden_dim) * sizeof(float));
         memset(attn_out, 0, hidden_dim * sizeof(float));
 
         // Process each head
@@ -4092,7 +4105,7 @@ void attention_int8_v2(
     omp_set_num_threads(num_threads);
 
     // Allocate intermediate float output buffer (we'll quantize at the end per row)
-    float* attn_out_all = (float*)aligned_alloc(64, M * hidden_dim * sizeof(float));
+    float* attn_out_all = (float*)lspk_aligned_alloc(64, static_cast<size_t>(M) * hidden_dim * sizeof(float));
     memset(attn_out_all, 0, M * hidden_dim * sizeof(float));
 
     // Parallelize over M×heads
@@ -4320,9 +4333,9 @@ void fused_qkv_attention(
 
     // Precompute all Q, K, V projections in parallel first
     // This is more cache-friendly than computing on-the-fly
-    float* Q_float = (float*)aligned_alloc(64, M * hidden_dim * sizeof(float));
-    float* K_float = (float*)aligned_alloc(64, M * hidden_dim * sizeof(float));
-    float* V_float = (float*)aligned_alloc(64, M * hidden_dim * sizeof(float));
+    float* Q_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(M) * hidden_dim * sizeof(float));
+    float* K_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(M) * hidden_dim * sizeof(float));
+    float* V_float = (float*)lspk_aligned_alloc(64, static_cast<size_t>(M) * hidden_dim * sizeof(float));
 
     // Compute Q, K, V projections
     #pragma omp parallel for schedule(static)
@@ -4331,7 +4344,7 @@ void fused_qkv_attention(
         float x_scale = x_scales[m];
 
         // Convert x to uint8 for VNNI
-        alignas(64) uint8_t x_uint8[K_padded];
+        uint8_t* x_uint8 = static_cast<uint8_t*>(lspk_aligned_alloc(64, static_cast<size_t>(K_padded)));
         for (int k = 0; k < hidden_dim; k++) {
             x_uint8[k] = static_cast<uint8_t>(static_cast<int16_t>(x_row[k]) + 128);
         }
@@ -4377,6 +4390,7 @@ void fused_qkv_attention(
             int32_t sum = _mm512_reduce_add_epi32(acc) - 128 * wv_sum[n];
             V_float[m * hidden_dim + n] = static_cast<float>(sum) * x_scale;
         }
+        free(x_uint8);
     }
 
     // Now compute attention using the float Q, K, V
@@ -4384,7 +4398,7 @@ void fused_qkv_attention(
     for (int m = 0; m < M; m++) {
         const float* q_row = Q_float + m * hidden_dim;
         int8_t* out_row = out + m * hidden_dim;
-        float* attn_out = (float*)aligned_alloc(64, hidden_dim * sizeof(float));
+        float* attn_out = (float*)lspk_aligned_alloc(64, static_cast<size_t>(hidden_dim) * sizeof(float));
 
         for (int h = 0; h < num_heads; h++) {
             const float* q_head = q_row + h * head_dim;
@@ -4523,7 +4537,7 @@ void fused_residual_quantize(
         __m512 x2_scale_vec = _mm512_set1_ps(x2_scale);
 
         // First pass: compute sum and find max (vectorized)
-        float* temp = (float*)aligned_alloc(64, N_padded * sizeof(float));
+        float* temp = (float*)lspk_aligned_alloc(64, static_cast<size_t>(N_padded) * sizeof(float));
         __m512 max_abs_vec = _mm512_setzero_ps();
 
         int n = 0;
@@ -4673,8 +4687,8 @@ void matmul_free_vnni_v4_fused_wp(
 
     // Quantize all M rows (small cost for small M)
     // Allocate aligned buffers for quantized activations and scales
-    uint8_t* x_uint8_all = (uint8_t*)aligned_alloc(64, M * K_padded);
-    float* x_scales = (float*)aligned_alloc(64, M * sizeof(float));
+    uint8_t* x_uint8_all = (uint8_t*)lspk_aligned_alloc(64, static_cast<size_t>(M) * K_padded);
+    float* x_scales = (float*)lspk_aligned_alloc(64, static_cast<size_t>(M) * sizeof(float));
 
     // Quantize activations (parallel over M for M > 1)
     #pragma omp parallel for schedule(static) if(M > 1)
