@@ -1496,7 +1496,7 @@ def load_ternary_model(model_key: str, num_threads: int = None, mode: str = 'neo
     # BitNet uses a custom tokenizer class that may not load with AutoTokenizer
     # Use LlamaTokenizer directly with the tokenizer.model file
     try:
-        tokenizer = AutoTokenizer.from_pretrained(hf_name, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(hf_name)
     except (ValueError, OSError, ImportError) as e:
         print(f"  AutoTokenizer failed: {e}")
         print("  Loading tokenizer.model directly with LlamaTokenizer...")
