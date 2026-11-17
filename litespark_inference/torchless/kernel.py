@@ -558,7 +558,12 @@ def matmul_amx_mT(
     """AMX TMUL ternary matmul for M=T (T <= 16)."""
     T, K = x_int8.shape
     Kg, N, four = w_amx.shape
-    assert four == 4 and Kg == K // 4
+    if four != 4 or K % 4 != 0 or Kg != K // 4:
+        raise ValueError(f"w_amx shape mismatch: {w_amx.shape} for K={K}")
+    if T <= 0 or T > 16:
+        raise ValueError(f"matmul_amx_mT requires 1 <= T <= 16, got T={T}")
+    if (K & 0x3F) != 0 or (N & 0x0F) != 0:
+        raise ValueError(f"matmul_amx_mT requires K % 64 == 0 and N % 16 == 0, got K={K}, N={N}")
     if out is None:
         out = np.empty((T, N), dtype=np.float32)
     _load().matmul_amx_int8_mT(x_int8, x_scales, w_amx, w_scale, out, T, N, K)
@@ -575,8 +580,12 @@ def matmul_amx_mT_padded(
     """Phase 10 AMX kernel: T must be 16-multiple. Caller pads."""
     T_padded, K = x_int8_padded.shape
     Kg, N, four = w_amx.shape
-    assert four == 4 and Kg == K // 4
-    assert T_padded % 16 == 0 and 0 < T_padded <= 64
+    if four != 4 or K % 4 != 0 or Kg != K // 4:
+        raise ValueError(f"w_amx shape mismatch: {w_amx.shape} for K={K}")
+    if T_padded % 16 != 0 or not (0 < T_padded <= 64):
+        raise ValueError(f"matmul_amx_mT_padded requires T_padded in {{16, 32, 48, 64}}, got {T_padded}")
+    if (K & 0x3F) != 0 or (N & 0x0F) != 0:
+        raise ValueError(f"matmul_amx_mT_padded requires K % 64 == 0 and N % 16 == 0, got K={K}, N={N}")
     if out is None:
         out = np.empty((T_padded, N), dtype=np.float32)
     _load().matmul_amx_int8_mT_v2(
@@ -643,7 +652,15 @@ def matmul_packed_mT(
         out = np.empty((T, N), dtype=np.float32)
     lib = _load()
     if hasattr(lib, "matmul_lut_mT"):
-        lib.matmul_lut_mT(x_int8, x_scales, packed_w, w_scale, out, T, N, K)
+        # x86_64 C++ kernels cap each call at LSPK_MAX_T = 64 rows and return
+        # early if T > 64; chunk larger batches here so `out` is never left
+        # uninitialized.
+        for t0 in range(0, T, 64):
+            t1 = min(t0 + 64, T)
+            lib.matmul_lut_mT(
+                x_int8[t0:t1], x_scales[t0:t1], packed_w, w_scale,
+                out[t0:t1], t1 - t0, N, K,
+            )
     elif hasattr(lib, "matmul_lut_prefill"):
         lib.matmul_lut_prefill(x_int8, packed_w, w_scale, x_scales, out, T, N, K)
     else:
