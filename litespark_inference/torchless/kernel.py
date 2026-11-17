@@ -345,6 +345,16 @@ def has_accelerate() -> bool:
 # ~5% of forward-pass time).
 
 
+def _require_ndim(name: str, arr: np.ndarray, ndim: int) -> None:
+    if arr.ndim != ndim:
+        raise ValueError(f"{name} must be {ndim}-D, got shape {arr.shape}")
+
+
+def _require_shape(name: str, arr: np.ndarray, expected: tuple[int, ...]) -> None:
+    if arr.shape != expected:
+        raise ValueError(f"{name} must have shape {expected}, got {arr.shape}")
+
+
 def lm_head_int4(
     emb_packed: np.ndarray,
     emb_scale: np.ndarray,
@@ -353,7 +363,14 @@ def lm_head_int4(
     H: int,
 ) -> np.ndarray:
     """Tied LM head via int4xfp32 matmul (2 nibbles/byte; H must be even)."""
+    if H <= 0 or H % 2 != 0:
+        raise ValueError(f"H must be a positive even integer, got {H}")
+    _require_ndim("emb_packed", emb_packed, 2)
     V = emb_packed.shape[0]
+    _require_shape("emb_packed", emb_packed, (V, H // 2))
+    _require_shape("emb_scale", emb_scale, (V,))
+    _require_shape("x_fp32", x_fp32, (H,))
+    _require_shape("out_fp32", out_fp32, (V,))
     _load().lm_head_int4_fp32(emb_packed, emb_scale, x_fp32, out_fp32, V, H)
     return out_fp32
 
@@ -365,7 +382,11 @@ def lm_head_int8(
     out_fp32: np.ndarray,
 ) -> np.ndarray:
     """Tied LM head via int8xfp32 matmul with per-row fp32 scale."""
+    _require_ndim("emb_int8", emb_int8, 2)
     V, H = emb_int8.shape
+    _require_shape("emb_scale", emb_scale, (V,))
+    _require_shape("x_fp32", x_fp32, (H,))
+    _require_shape("out_fp32", out_fp32, (V,))
     _load().lm_head_int8_fp32(emb_int8, emb_scale, x_fp32, out_fp32, V, H)
     return out_fp32
 
@@ -376,7 +397,10 @@ def lm_head_bf16(
     out_fp32: np.ndarray,
 ) -> np.ndarray:
     """Tied LM head via bf16xfp32 matmul (emb_u16 holds bf16 bits)."""
+    _require_ndim("emb_u16", emb_u16, 2)
     V, H = emb_u16.shape
+    _require_shape("x_fp32", x_fp32, (H,))
+    _require_shape("out_fp32", out_fp32, (V,))
     _load().lm_head_bf16_fp32(emb_u16, x_fp32, out_fp32, V, H)
     return out_fp32
 
@@ -388,7 +412,10 @@ def rmsnorm_into(
     eps: float = 1e-5,
 ) -> np.ndarray:
     """RMSNorm x -> out (caller-owned). gamma may be uint16 (bf16) or fp32."""
+    _require_ndim("x_fp32", x_fp32, 1)
     K = x_fp32.shape[0]
+    _require_shape("gamma", gamma, (K,))
+    _require_shape("out_fp32", out_fp32, (K,))
     lib = _load()
     if gamma.dtype == np.uint16:
         lib.rmsnorm_bf16gamma_fp32(x_fp32, gamma, out_fp32, K, eps)
@@ -405,19 +432,29 @@ def relu2_mul_into(
     out_fp32: np.ndarray,
 ) -> np.ndarray:
     """out = max(gate, 0)^2 * up (caller-owned out)."""
-    _load().relu2_mul_fp32(gate_fp32, up_fp32, out_fp32, gate_fp32.shape[0])
+    _require_ndim("gate_fp32", gate_fp32, 1)
+    K = gate_fp32.shape[0]
+    _require_shape("up_fp32", up_fp32, (K,))
+    _require_shape("out_fp32", out_fp32, (K,))
+    _load().relu2_mul_fp32(gate_fp32, up_fp32, out_fp32, K)
     return out_fp32
 
 
 def add_inplace(a_fp32: np.ndarray, b_fp32: np.ndarray) -> np.ndarray:
     """a += b in-place (both fp32 1-D)."""
-    _load().add_inplace_fp32(a_fp32, b_fp32, a_fp32.shape[0])
+    _require_ndim("a_fp32", a_fp32, 1)
+    K = a_fp32.shape[0]
+    _require_shape("b_fp32", b_fp32, (K,))
+    _load().add_inplace_fp32(a_fp32, b_fp32, K)
     return a_fp32
 
 
 def quantize_activation(x_fp32: np.ndarray, out_int8: np.ndarray) -> float:
     """Per-tensor absmax int8 quantization in-place. Returns the scale."""
-    return float(_load().quantize_activation(x_fp32, out_int8, x_fp32.shape[0]))
+    _require_ndim("x_fp32", x_fp32, 1)
+    K = x_fp32.shape[0]
+    _require_shape("out_int8", out_int8, (K,))
+    return float(_load().quantize_activation(x_fp32, out_int8, K))
 
 
 def matmul_packed_m1(
@@ -440,19 +477,27 @@ def matmul_packed_m1(
     Returns:
         [N] float32 output.
     """
+    _require_ndim("packed_w", packed_w, 2)
     N, Kb = packed_w.shape
     K = Kb * 4
+    _require_shape("x_int8", x_int8, (K,))
     if out is None:
         out = np.empty(N, dtype=np.float32)
+    else:
+        _require_shape("out", out, (N,))
     _load().matmul_lut_m1(x_int8, packed_w, w_scale, x_scale, out, N, K)
     return out
 
 
 def matmul_accelerate_f32_m1(x_fp32: np.ndarray, w_float32: np.ndarray, out: Optional[np.ndarray] = None) -> np.ndarray:
+    _require_ndim("w_float32", w_float32, 2)
+    N, K = w_float32.shape
+    _require_shape("x_fp32", x_fp32, (K,))
+    if out is not None:
+        _require_shape("out", out, (N,))
     lib = _load()
     if not hasattr(lib, "matmul_accelerate_f32_m1") or not has_accelerate():
         raise RuntimeError("mode='accelerate' requires Apple Accelerate")
-    N, K = w_float32.shape
     if out is None:
         out = np.empty(N, dtype=np.float32)
     lib.matmul_accelerate_f32_m1(x_fp32, w_float32, out, N, K)
@@ -492,7 +537,13 @@ def rmsnorm_quantize_into(
     eps: float = 1e-5,
 ) -> float:
     """Fused RMSNorm + per-tensor absmax int8 quantize. bf16 gamma only."""
+    _require_ndim("x_fp32", x_fp32, 1)
     K = x_fp32.shape[0]
+    _require_shape("gamma", gamma, (K,))
+    _require_shape("x_int8_out", x_int8_out, (K,))
+    _require_shape("tmp_fp32", tmp_fp32, (K,))
+    if gamma.dtype != np.uint16:
+        raise TypeError(f"gamma dtype must be uint16, got {gamma.dtype}")
     return float(_load().rmsnorm_quantize_bf16gamma(
         x_fp32, gamma, x_int8_out, tmp_fp32, K, eps,
     ))
@@ -506,7 +557,14 @@ def rmsnorm_quantize_batched(
     tmp_fp32: np.ndarray,  # [T, K] scratch
     eps: float = 1e-5,
 ) -> np.ndarray:
+    _require_ndim("x_fp32", x_fp32, 2)
     T, K = x_fp32.shape
+    _require_shape("gamma", gamma, (K,))
+    _require_shape("x_int8_out", x_int8_out, (T, K))
+    _require_shape("scales_out", scales_out, (T,))
+    _require_shape("tmp_fp32", tmp_fp32, (T, K))
+    if gamma.dtype != np.uint16:
+        raise TypeError(f"gamma dtype must be uint16, got {gamma.dtype}")
     _load().rmsnorm_quantize_bf16gamma_batched(
         x_fp32, gamma, x_int8_out, scales_out, tmp_fp32, T, K, eps,
     )
@@ -591,7 +649,10 @@ def rmsnorm_into_batched(
     out_fp32: np.ndarray,  # [T, K]
     eps: float = 1e-5,
 ) -> np.ndarray:
+    _require_ndim("x_fp32", x_fp32, 2)
     T, K = x_fp32.shape
+    _require_shape("gamma", gamma, (K,))
+    _require_shape("out_fp32", out_fp32, (T, K))
     lib = _load()
     if gamma.dtype == np.uint16:
         lib.rmsnorm_bf16gamma_fp32_batched(x_fp32, gamma, out_fp32, T, K, eps)
@@ -607,7 +668,10 @@ def quantize_activation_batched(
     out_int8: np.ndarray, # [T, K]
     out_scales: np.ndarray,  # [T]
 ) -> np.ndarray:
+    _require_ndim("x_fp32", x_fp32, 2)
     T, K = x_fp32.shape
+    _require_shape("out_int8", out_int8, (T, K))
+    _require_shape("out_scales", out_scales, (T,))
     _load().quantize_activation_batched(x_fp32, out_int8, out_scales, T, K)
     return out_scales
 
@@ -617,7 +681,10 @@ def relu2_mul_into_batched(
     up_fp32: np.ndarray,    # [T, K]
     out_fp32: np.ndarray,   # [T, K]
 ) -> np.ndarray:
+    _require_ndim("gate_fp32", gate_fp32, 2)
     T, K = gate_fp32.shape
+    _require_shape("up_fp32", up_fp32, (T, K))
+    _require_shape("out_fp32", out_fp32, (T, K))
     _load().relu2_mul_fp32_batched(gate_fp32, up_fp32, out_fp32, T, K)
     return out_fp32
 
@@ -636,11 +703,17 @@ def matmul_packed_mT(
     once and reuses it across the T tokens, amortizing both the unpack
     cost and the weight memory read.
     """
+    _require_ndim("x_int8", x_int8, 2)
+    _require_ndim("packed_w", packed_w, 2)
     T, K = x_int8.shape
     N, Kb = packed_w.shape
-    assert Kb * 4 == K, f"K mismatch: {K} vs Kb*4={Kb*4}"
+    if Kb * 4 != K:
+        raise ValueError(f"K mismatch: {K} vs Kb*4={Kb*4}")
+    _require_shape("x_scales", x_scales, (T,))
     if out is None:
         out = np.empty((T, N), dtype=np.float32)
+    else:
+        _require_shape("out", out, (T, N))
     lib = _load()
     if hasattr(lib, "matmul_lut_mT"):
         lib.matmul_lut_mT(x_int8, x_scales, packed_w, w_scale, out, T, N, K)
@@ -668,9 +741,13 @@ def matmul_unpacked_m1(
         x_scale:  scalar activation scale.
         out:      Optional [N] float32 buffer.
     """
+    _require_ndim("w_u8", w_u8, 2)
     N, K = w_u8.shape
+    _require_shape("x_int8", x_int8, (K,))
     if out is None:
         out = np.empty(N, dtype=np.float32)
+    else:
+        _require_shape("out", out, (N,))
     _load().matmul_unpacked_m1(x_int8, w_u8, w_scale, x_scale, out, N, K)
     return out
 
