@@ -150,6 +150,10 @@ def _lm_head(
 
 def _embed_lookup(model: PackedBitNetModel, token_id: int) -> np.ndarray:
     """Return the fp32 embedding row for `token_id`, regardless of storage."""
+    if token_id < 0 or token_id >= model.config.vocab_size:
+        raise IndexError(
+            f"token_id {token_id} out of range [0, {model.config.vocab_size})"
+        )
     if model.embed_int4 is not None:
         # Unpack the 2-nibble row into int8 {-7..7}, then dequantize.
         H_half = model.embed_int4.shape[1]
@@ -706,6 +710,10 @@ def _falcon_lm_head(model: PackedFalconModel, x_fp32: np.ndarray, out_logits: np
 
 
 def _falcon_embed_lookup(model: PackedFalconModel, token_id: int) -> np.ndarray:
+    if token_id < 0 or token_id >= model.config.vocab_size:
+        raise IndexError(
+            f"token_id {token_id} out of range [0, {model.config.vocab_size})"
+        )
     if model.embed_int4 is not None:
         H_half = model.embed_int4.shape[1]
         packed = model.embed_int4[token_id].astype(np.int8)
