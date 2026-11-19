@@ -34,6 +34,8 @@ from typing import Optional
 
 import numpy as np
 
+from ..cache import private_dir
+
 
 _HERE = Path(__file__).resolve().parent
 
@@ -96,8 +98,7 @@ def _jit_target_dir() -> Path:
     if os.access(_HERE, os.W_OK | os.X_OK):
         return _HERE
     cache_dir = _cache_native_dir()
-    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(cache_dir, 0o700)
+    private_dir(cache_dir)
     return cache_dir
 
 
@@ -116,7 +117,8 @@ def _find_built_extension() -> Optional[Path]:
     """
     search_dirs = [_HERE]
     cache_dir = _cache_native_dir()
-    if cache_dir != _HERE and cache_dir.is_dir():
+    if cache_dir != _HERE and os.path.lexists(cache_dir):
+        private_dir(cache_dir)
         search_dirs.append(cache_dir)
     candidates: list[Path] = []
     for d in search_dirs:
