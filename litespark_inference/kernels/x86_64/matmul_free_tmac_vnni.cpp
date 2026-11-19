@@ -4700,7 +4700,7 @@ void matmul_free_vnni_v4_fused_wp(
         float scale = max_abs / 127.0f;
         if (scale < 1e-10f) scale = 1e-10f;
         x_scales[m] = scale;
-        float inv_scale = 127.0f / max_abs;
+        float inv_scale = 1.0f / scale;
 
         // Quantize to uint8 (int8 + 128 offset for unsigned dpbusd)
         const __m512 scale_vec = _mm512_set1_ps(inv_scale);
@@ -4714,8 +4714,8 @@ void matmul_free_vnni_v4_fused_wp(
             rounded = _mm512_min_epi32(rounded, _mm512_set1_epi32(127));
             rounded = _mm512_add_epi32(rounded, offset_vec);
 
-            // Pack to bytes (only lower 8 bits of each 32-bit element)
-            __m128i packed = _mm512_cvtsepi32_epi8(rounded);
+            //the +128 offset requires unsigned bytes, including values above 127
+            __m128i packed = _mm512_cvtusepi32_epi8(rounded);
             _mm_store_si128((__m128i*)(x_uint8 + k), packed);
         }
         for (; k < K; k++) {
