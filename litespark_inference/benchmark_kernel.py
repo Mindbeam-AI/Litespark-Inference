@@ -664,6 +664,7 @@ def _rerun_in_subprocess(
         env = dict(_os.environ)
         ext_dir = env.get("TORCH_EXTENSIONS_DIR")
         if not ext_dir:
+            from litespark_inference.cache import private_dir
             from pathlib import Path as _Path
             cache_override = env.get("LITESPARK_CACHE_DIR")
             if cache_override:
@@ -674,8 +675,10 @@ def _rerun_in_subprocess(
                 xdg = env.get("XDG_CACHE_HOME")
                 base_cache = (_Path(xdg).expanduser() if xdg else _Path.home() / ".cache") / "litespark"
             ext_dir = str(base_cache / "torch_extensions")
+            private_dir(ext_dir)
             env["TORCH_EXTENSIONS_DIR"] = ext_dir
-        _os.makedirs(ext_dir, mode=0o700, exist_ok=True)
+        else:
+            _os.makedirs(ext_dir, mode=0o700, exist_ok=True)
 
         benchmark_threads = args.threads if args.threads is not None else 1
         cmd = [

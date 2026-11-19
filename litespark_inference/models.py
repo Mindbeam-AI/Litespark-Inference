@@ -228,9 +228,13 @@ def get_kernel():
     if _kernel is None:
         ext_dir = os.environ.get("TORCH_EXTENSIONS_DIR")
         if not ext_dir:
+            from .cache import private_dir
+
             ext_dir = str(_get_litespark_cache_dir() / "torch_extensions")
+            private_dir(ext_dir)
             os.environ["TORCH_EXTENSIONS_DIR"] = ext_dir
-        os.makedirs(ext_dir, mode=0o700, exist_ok=True)
+        else:
+            os.makedirs(ext_dir, mode=0o700, exist_ok=True)
 
         arch_info = get_arch_info()
         machine = arch_info['machine']
