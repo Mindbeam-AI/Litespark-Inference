@@ -28,10 +28,13 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from ..cache import private_dir
 
 
 _HERE = Path(__file__).resolve().parent
@@ -78,10 +81,29 @@ else:
 _LIB_PREFIX = f"_matmul_lut_{_ARCH_TAG}"
 
 _lib: Optional[ctypes.CDLL] = None
+_loaded_path: Optional[Path] = None
 
 
 class KernelBuildError(RuntimeError):
     pass
+
+
+def _cache_native_dir() -> Path:
+    raw = os.environ.get("LITESPARK_CACHE_DIR", "").strip()
+    base = Path(os.path.expanduser(raw)) if raw else Path.home() / ".cache" / "litespark"
+    return base / "native"
+
+
+def _jit_target_dir() -> Path:
+    if os.access(_HERE, os.W_OK | os.X_OK):
+        return _HERE
+    cache_dir = _cache_native_dir()
+    private_dir(cache_dir)
+    return cache_dir
+
+
+def _jit_target_path() -> Path:
+    return _jit_target_dir() / f"{_LIB_PREFIX}{_LIB_SUFFIX}"
 
 
 def _find_built_extension() -> Optional[Path]:
@@ -93,14 +115,29 @@ def _find_built_extension() -> Optional[Path]:
     file matching the per-arch prefix, falling back to a legacy bare-name
     dylib that the JIT path produces.
     """
+    search_dirs = [_HERE]
+    cache_dir = _cache_native_dir()
+    if cache_dir != _HERE and os.path.lexists(cache_dir):
+        private_dir(cache_dir)
+        search_dirs.append(cache_dir)
     candidates: list[Path] = []
-    for pattern in (f"{_LIB_PREFIX}*.so", f"{_LIB_PREFIX}*.dylib", f"{_LIB_PREFIX}*.pyd"):
-        candidates.extend(_HERE.glob(pattern))
+    for d in search_dirs:
+        for pattern in (f"{_LIB_PREFIX}*.so", f"{_LIB_PREFIX}*.dylib", f"{_LIB_PREFIX}*.pyd"):
+            candidates.extend(d.glob(pattern))
     if not candidates:
         return None
-    # Prefer the Python-ABI-tagged one (setup.py output) over a bare dylib
-    # (legacy JIT output) if both exist.
-    candidates.sort(key=lambda p: ("cpython" not in p.name, p.name))
+    src_exists = _SRC.exists()
+    src_mtime = _SRC.stat().st_mtime if src_exists else 0.0
+    # Prefer up-to-date Python-ABI-tagged artefacts next to this file before
+    # JIT outputs or fallback cache artefacts.
+    candidates.sort(
+        key=lambda p: (
+            src_exists and p.stat().st_mtime < src_mtime,
+            "cpython" not in p.name,
+            p.parent != _HERE,
+            p.name,
+        )
+    )
     return candidates[0]
 
 
@@ -138,7 +175,7 @@ def _omp_flags() -> list[str]:
     return []
 
 
-def _compile() -> None:
+def _compile() -> Path:
     """Compile the extern "C" kernel into a shared library via clang/gcc."""
     compiler = os.environ.get("CXX", "clang++")
     base = [
@@ -170,25 +207,42 @@ def _compile() -> None:
         else:
             base += ["-mavx2", "-mfma"]
 
+    target_path = _jit_target_path()
+    target_dir = target_path.parent
     omp = _omp_flags()
-    cmd_omp = base + omp + [str(_SRC), "-o", str(_LIB_PATH)]
-    cmd_noomp = base + [str(_SRC), "-o", str(_LIB_PATH)]
 
-    for cmd in (cmd_omp, cmd_noomp) if omp else (cmd_noomp,):
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{_LIB_PREFIX}.", suffix=_LIB_SUFFIX, dir=target_dir
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+
+    cmd_omp = base + omp + [str(_SRC), "-o", str(tmp_path)]
+    cmd_noomp = base + [str(_SRC), "-o", str(tmp_path)]
+
+    try:
+        for cmd in (cmd_omp, cmd_noomp) if omp else (cmd_noomp,):
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                os.replace(tmp_path, target_path)
+                return target_path
+            except subprocess.CalledProcessError as e:
+                last_err = e
+                continue
+        raise KernelBuildError(
+            f"kernel build failed:\n  cmd: {' '.join(cmd_noomp)}\n"
+            f"  stderr: {last_err.stderr}\n  stdout: {last_err.stdout}"
+        ) from last_err
+    except BaseException:
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            return
-        except subprocess.CalledProcessError as e:
-            last_err = e
-            continue
-    raise KernelBuildError(
-        f"kernel build failed:\n  cmd: {' '.join(cmd_noomp)}\n"
-        f"  stderr: {last_err.stderr}\n  stdout: {last_err.stdout}"
-    ) from last_err
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _load() -> ctypes.CDLL:
-    global _lib
+    global _lib, _loaded_path
     if _lib is not None:
         return _lib
     built = _find_built_extension()
@@ -209,8 +263,7 @@ def _load() -> ctypes.CDLL:
                 "extension once and avoid this every import.",
                 file=sys.stderr,
             )
-        _compile()
-        lib_path = _LIB_PATH
+        lib_path = _compile()
     lib = ctypes.CDLL(str(lib_path))
 
     # Resolve arch-tagged C symbols and re-attach under arch-neutral names.
@@ -321,6 +374,7 @@ def _load() -> ctypes.CDLL:
     if hasattr(lib, f"matmul_lut_{T}_has_accelerate"):
         _alias("has_accelerate_probe", f"matmul_lut_{T}_has_accelerate", [], ctypes.c_int)
 
+    _loaded_path = lib_path
     _lib = lib
     return lib
 
@@ -737,5 +791,7 @@ def matmul_packed_prefill(
 def ensure_built() -> Path:
     """Make sure the kernel is loadable; return the path that was loaded."""
     _load()
+    if _loaded_path is not None:
+        return _loaded_path
     built = _find_built_extension()
-    return built if built is not None else _LIB_PATH
+    return built if built is not None else _jit_target_path()
